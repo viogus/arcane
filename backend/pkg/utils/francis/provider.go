@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +39,11 @@ var legacyDrops = []string{
 	"DROP TABLE IF EXISTS " + TablePrefix + "_metadata",
 }
 
+// actorWALSizeLimit is the ceiling SQLite truncates the actor store's write-ahead log to after each
+// checkpoint. The store is written by every dispatch pass, so a log that is never truncated keeps the
+// size of its busiest window instead of the frames actually pending.
+const actorWALSizeLimit = 4 << 20
+
 // StorePath names the dedicated Francis SQLite file beside the Arcane database.
 func StorePath(databasePath string) string {
 	extension := filepath.Ext(databasePath)
@@ -65,9 +71,7 @@ func StoreURL(databaseURL string) (string, error) {
 		query := sqliteutil.NormalizeQuery(parsed.Query())
 		// The sibling file must be creatable and writable whatever mode opens arcane.db.
 		query.Del("mode")
-		if !sqliteutil.HasPragma(query, "busy_timeout") {
-			query.Add("_pragma", "busy_timeout(10000)")
-		}
+		raiseBusyTimeout(query)
 		// NORMAL stops WAL commits from holding the write lock through an fsync.
 		if !sqliteutil.HasPragma(query, "synchronous") {
 			query.Add("_pragma", "synchronous(NORMAL)")
@@ -75,12 +79,70 @@ func StoreURL(databaseURL string) (string, error) {
 		if !sqliteutil.HasPragma(query, "journal_mode") {
 			query.Add("_pragma", "journal_mode(WAL)")
 		}
+		// Cap the WAL after each checkpoint. SQLite otherwise only recycles the log, so the file keeps
+		// the size of its busiest window: measured 21.5 MB on a 22-hour-old instance while the pending
+		// frames were negligible. The limit rides on the checkpoints that already happen, so it never
+		// waits for readers the way a forced TRUNCATE checkpoint would.
+		if !sqliteutil.HasPragma(query, "journal_size_limit") {
+			query.Add("_pragma", "journal_size_limit("+strconv.Itoa(actorWALSizeLimit)+")")
+		}
 		return "file:" + (&url.URL{Path: StorePath(databasePath)}).EscapedPath() + "?" + query.Encode(), nil
 	case strings.HasPrefix(databaseURL, "postgres"):
 		return databaseURL, nil
 	default:
 		return "", errors.New("unsupported actor database URL")
 	}
+}
+
+// actorBusyTimeoutMillis is the lock wait the actor store opens with. It is higher than the Arcane
+// default because job activity writes actor state in bursts: four "database is locked (5)" failures
+// landed in a four-second window while four image scans ran, with the 2500 ms inherited from
+// arcane.db. The store has its own file, so a longer wait only delays this process, never the main
+// database.
+const actorBusyTimeoutMillis = 10_000
+
+// raiseBusyTimeout keeps a configured busy_timeout when it is already at least the actor store
+// floor, raises a smaller one, and adds the floor when none is set.
+func raiseBusyTimeout(query url.Values) {
+	pragmas := query["_pragma"]
+	for index, pragma := range pragmas {
+		if !strings.EqualFold(pragmaNameInternal(pragma), "busy_timeout") {
+			continue
+		}
+		if timeout, ok := pragmaArgumentInternal(pragma); ok && timeout >= actorBusyTimeoutMillis {
+			return
+		}
+		pragmas[index] = "busy_timeout(" + strconv.Itoa(actorBusyTimeoutMillis) + ")"
+		query["_pragma"] = pragmas
+		return
+	}
+	query.Add("_pragma", "busy_timeout("+strconv.Itoa(actorBusyTimeoutMillis)+")")
+}
+
+// pragmaArgumentInternal returns the integer argument of a "name(value)" pragma.
+func pragmaArgumentInternal(pragma string) (int, bool) {
+	opening := strings.IndexByte(pragma, '(')
+	closing := strings.LastIndexByte(pragma, ')')
+	if opening < 0 || closing <= opening+1 {
+		return 0, false
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(pragma[opening+1 : closing]))
+	if err != nil {
+		return 0, false
+	}
+	return value, true
+}
+
+// pragmaNameInternal strips arguments, schema qualifiers, and quotes from a _pragma value.
+func pragmaNameInternal(pragma string) string {
+	name := strings.TrimSpace(pragma)
+	if end := strings.IndexAny(name, "=( \t\r\n"); end >= 0 {
+		name = name[:end]
+	}
+	if _, unqualified, found := strings.Cut(name, "."); found {
+		return unqualified
+	}
+	return name
 }
 
 func providerOption(storeURL string) local.HostOption {
