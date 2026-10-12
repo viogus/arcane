@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
@@ -57,16 +58,28 @@ func NewPathMapper(containerDir, hostDir string) *PathMapper {
 // container→host prefix. This is used for Docker-in-Docker auto-discovery so that an
 // independently bind-mounted project directory maps to its real host path.
 func NewPathMapperFromMounts(mounts []HostMount) *PathMapper {
+	// The mapper is part of the parsed-compose cache key, so its mount table has to
+	// be canonical: Docker reports a container's mounts in map order, and an unstable
+	// order would change the key on every lookup and defeat the cache. Resolution
+	// below is a longest-prefix match, so the order does not affect the result.
+	canonical := slices.Clone(mounts)
+	slices.SortFunc(canonical, func(a, b HostMount) int {
+		if byDestination := cmp.Compare(a.Destination, b.Destination); byDestination != 0 {
+			return byDestination
+		}
+		return cmp.Compare(a.Source, b.Source)
+	})
+
 	nonMatching := false
-	for i := range mounts {
-		if filepath.Clean(mounts[i].Source) != filepath.Clean(mounts[i].Destination) {
+	for i := range canonical {
+		if filepath.Clean(canonical[i].Source) != filepath.Clean(canonical[i].Destination) {
 			nonMatching = true
 			break
 		}
 	}
 
 	return &PathMapper{
-		mounts:        mounts,
+		mounts:        canonical,
 		isNonMatching: nonMatching,
 	}
 }

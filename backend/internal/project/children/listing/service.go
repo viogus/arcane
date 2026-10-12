@@ -176,25 +176,34 @@ func ProjectStatus(services []project.RuntimeService) string {
 }
 
 // StatusCounts totals archived, running and stopped projects from live
-// containers, falling back to stored status when Docker is unavailable.
-func (s *Service) StatusCounts(ctx context.Context, records []project.Record) project.StatusCounts {
+// containers, falling back to stored status when Docker is unavailable. With
+// deployedOnly, records without a container in the current environment are
+// skipped so the counts describe the same set as a deployed-filtered list.
+func (s *Service) StatusCounts(ctx context.Context, records []project.Record, deployedOnly bool) project.StatusCounts {
 	containers, err := s.containers(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to list global compose containers for counts", "error", err)
 	}
 	containersByProject := GroupComposeContainersByProject(containers)
 	var archived, running, stopped int
+	total := len(records)
 	for _, p := range records {
 		if p.IsArchived {
 			archived++
 			continue
 		}
+		skipped := false
 		switch func() string {
 			if err != nil || p.Status == project.StatusDeploying || p.Status == project.StatusRestarting {
 				return p.Status
 			}
+			projectContainers := ProjectContainers(p, containersByProject)
+			if deployedOnly && len(projectContainers) == 0 {
+				skipped = true
+				return ""
+			}
 			var services []project.RuntimeService
-			for _, c := range ProjectContainers(p, containersByProject) {
+			for _, c := range projectContainers {
 				services = append(services, project.RuntimeService{Status: string(c.State)})
 			}
 			return kit.Ternary(len(services) > 0, ProjectStatus(services), project.StatusStopped)
@@ -204,9 +213,12 @@ func (s *Service) StatusCounts(ctx context.Context, records []project.Record) pr
 		case project.StatusStopped, project.StatusStopping:
 			stopped++
 		}
+		if skipped {
+			total--
+		}
 	}
 	return project.StatusCounts{
-		TotalProjects:    len(records),
+		TotalProjects:    total,
 		RunningProjects:  running,
 		StoppedProjects:  stopped,
 		ArchivedProjects: archived,
@@ -226,7 +238,9 @@ func RelativePath(projectsDir, projectPath string) string {
 // columns and the container snapshot; compose metadata is left for ApplyPresentation.
 func row(projectsDir, catalog string, p project.Record, snapshot Snapshot, tags []project.Tag) project.Details {
 	var services []project.RuntimeService
-	for _, c := range ProjectContainers(p, snapshot.byProject) {
+	projectContainers := ProjectContainers(p, snapshot.byProject)
+	deployedHere := len(projectContainers) > 0
+	for _, c := range projectContainers {
 		services = append(services, RuntimeServiceFromContainer(catalog, c, projects.ArcaneComposeMetadata{}, snapshot.currentContainerID, snapshot.currentContainerErr))
 	}
 	_, runningCount := ServiceCounts(services)
@@ -259,6 +273,7 @@ func row(projectsDir, catalog string, p project.Record, snapshot Snapshot, tags 
 		// Newly discovered projects have no persisted count yet; infer it from live containers so the parent can persist it.
 		ServiceCount:      cmp.Or(p.ServiceCount, len(services)),
 		IsArchived:        p.IsArchived,
+		DeployedHere:      deployedHere,
 		HasBuildDirective: len(projects.ParseImageRefsJSON(kit.FromPtr(p.BuildImageRefsJSON))) > 0,
 		RedeployDisabled:  slices.ContainsFunc(services, func(service project.RuntimeService) bool { return service.RedeployDisabled }),
 	}
@@ -573,6 +588,15 @@ func PaginationConfig() pagination.Config[project.Details] {
 						actual, ok := service.ContainerLabels[strings.TrimSpace(key)]
 						return ok && (!hasValue || actual == value)
 					})
+				},
+			},
+			{
+				// deployed=true narrows the global project list to the projects
+				// that own a container in the environment being queried.
+				Key: "deployed",
+				Fn: func(p project.Details, filterValue string) bool {
+					deployed, _ := kit.ParseBool(filterValue)
+					return !deployed || p.DeployedHere
 				},
 			},
 		},

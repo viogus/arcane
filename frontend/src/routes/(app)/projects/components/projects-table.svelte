@@ -58,7 +58,9 @@
 		requestOptions = $bindable(),
 		withoutFilters = false,
 		showArchived = false,
+		showAllEnvironments = false,
 		onToggleArchived,
+		onToggleAllEnvironments,
 		onRefreshData,
 		availableTags = [],
 		emptyState
@@ -68,7 +70,9 @@
 		requestOptions: SearchPaginationSortRequest;
 		withoutFilters?: boolean;
 		showArchived?: boolean;
+		showAllEnvironments?: boolean;
 		onToggleArchived?: (checked: boolean) => void | Promise<void>;
+		onToggleAllEnvironments?: (checked: boolean) => void | Promise<void>;
 		onRefreshData?: (options: SearchPaginationSortRequest) => Promise<void>;
 		availableTags?: ProjectTagOption[];
 		emptyState?: Snippet;
@@ -589,7 +593,7 @@
 
 {#snippet ArchivedToolbarAction()}
 	<div
-		class="flex min-h-9 w-full items-center gap-2 rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 md:w-auto md:border-0 md:bg-transparent md:px-1 md:py-0"
+		class="flex min-h-9 w-full flex-wrap items-center gap-2 rounded-md border border-border/60 bg-muted/30 px-2.5 py-1.5 md:w-auto md:border-0 md:bg-transparent md:px-1 md:py-0"
 	>
 		<Switch
 			id="projects-show-archived"
@@ -601,6 +605,18 @@
 		<Label for="projects-show-archived" variant="muted" class="mb-0 min-w-0">
 			{m.projects_show_archived()}
 		</Label>
+		<div class="flex items-center gap-2 md:ml-2 md:border-l md:border-border/60 md:pl-3">
+			<Switch
+				id="projects-show-all-environments"
+				checked={showAllEnvironments}
+				onCheckedChange={(checked) => {
+					void onToggleAllEnvironments?.(checked === true);
+				}}
+			/>
+			<Label for="projects-show-all-environments" variant="muted" class="mb-0 min-w-0">
+				{m.projects_show_all_environments()}
+			</Label>
+		</div>
 	</div>
 {/snippet}
 
