@@ -26,6 +26,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/timeouts"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
@@ -305,6 +306,21 @@ func (s *ActivityService) checkInitInternal() error {
 	return nil
 }
 
+// activityEnvironmentIDInternal attributes an activity to the environment whose work produced it,
+// matching event attribution: a caller that names a real environment keeps it, a request served for a
+// docker-host environment falls back to that environment's target, and only then to the manager's own
+// namespace.
+func activityEnvironmentIDInternal(ctx context.Context, requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested != "" && requested != "0" {
+		return requested
+	}
+	if environmentID := envcontext.EnvironmentIDFromContext(ctx); environmentID != "" {
+		return environmentID
+	}
+	return cmp.Or(requested, "0")
+}
+
 func (s *ActivityService) StartActivity(ctx context.Context, req StartActivityRequest) (*activity.Activity, error) {
 	if err := s.checkInitInternal(); err != nil {
 		return nil, err
@@ -323,7 +339,7 @@ func (s *ActivityService) StartActivity(ctx context.Context, req StartActivityRe
 	}
 
 	now := time.Now()
-	environmentID := cmp.Or(strings.TrimSpace(req.EnvironmentID), "0")
+	environmentID := activityEnvironmentIDInternal(ctx, req.EnvironmentID)
 
 	var startedByUserID, startedByUsername, startedByDisplayName *string
 	if req.StartedBy != nil {

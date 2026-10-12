@@ -1,6 +1,7 @@
 package image
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -414,8 +415,8 @@ func TestImageServicePullImageRetriesAnonymouslyAfterAuthRejectedInternal(t *tes
 			http.NotFound(w, r)
 			return
 		}
-		assert.True(t, eventService.ShouldSuppressDaemonEvent("image", "", "registry.example.com/team/app:latest", ""))
-		assert.False(t, eventService.ShouldSuppressDaemonEvent("image", "", "registry.example.com/team/other:latest", ""))
+		assert.True(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "image", "", "registry.example.com/team/app:latest", ""))
+		assert.False(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "image", "", "registry.example.com/team/other:latest", ""))
 		authHeaders = append(authHeaders, r.Header.Get(dockerregistry.AuthHeader))
 		if len(authHeaders) == 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -446,7 +447,7 @@ func TestImageServiceTagImageCallsDockerAPIInternal(t *testing.T) {
 			http.NotFound(w, r)
 			return
 		}
-		assert.True(t, eventService.ShouldSuppressDaemonEvent("image", "new-image-id", "registry.example.com/team/app:v2", ""))
+		assert.True(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "image", "new-image-id", "registry.example.com/team/app:v2", ""))
 		gotRepo = r.URL.Query().Get("repo")
 		gotTag = r.URL.Query().Get("tag")
 		w.WriteHeader(http.StatusCreated)

@@ -192,7 +192,26 @@ func (s *Service) RegisterWorkflows(engine *flow.Engine, environments *environme
 }
 
 // CanUpgrade checks if self-upgrade is possible.
+// errDockerHostUpgrade reports an upgrade attempt scoped to a "docker-host" environment. Those
+// environments are served straight over the Docker API: there is no Arcane component on the other
+// side to upgrade, and the manager's own upgrader must never run against a remote daemon.
+var errDockerHostUpgrade = errors.New("this environment is served directly over the Docker API, so it has no Arcane component to upgrade")
+
+// rejectDockerHostTarget refuses upgrade operations that were scoped to a docker-host environment.
+func (s *Service) rejectDockerHostTarget(ctx context.Context) error {
+	if host := s.dockerService.HostForContext(ctx); host != "" {
+		return fmt.Errorf("%w (docker host %s)", errDockerHostUpgrade, host)
+	}
+	return nil
+}
+
 func (s *Service) CanUpgrade(ctx context.Context) (bool, error) {
+	if s.dockerService.HostForContext(ctx) != "" {
+		// Nothing to upgrade on a plain Docker daemon, and inspecting it would make the
+		// manager's own container the subject of the check.
+		return false, nil
+	}
+
 	dockerClient, err := s.dockerService.GetClient(ctx)
 	if err != nil {
 		return false, errors.New("docker socket is not accessible")
@@ -222,6 +241,10 @@ func (s *Service) TriggerUpgradeViaCLI(ctx context.Context, user usertypes.Actor
 // TriggerUpgradeAsync validates synchronously, then pulls and spawns the upgrader in the background (#3628).
 // The run follows the app lifecycle with a deadline so a stalled daemon cannot hold the upgrading guard forever.
 func (s *Service) TriggerUpgradeAsync(ctx context.Context, user usertypes.Actor, targetVersion string) error {
+	if err := s.rejectDockerHostTarget(ctx); err != nil {
+		return err
+	}
+
 	prepared, err := s.prepareUpgrade(ctx, user, updater.SelfUpdateTarget{}, targetVersion)
 	if err != nil {
 		return err
@@ -556,6 +579,10 @@ func resolveSelfUpgradeTargetImage(currentImageRef string, info *versiontypes.In
 // StartUpdateAll records an update-all job and submits the workflow that upgrades every agent, then the manager.
 // Every environment pulls the latest image, whether or not it reports an update.
 func (s *Service) StartUpdateAll(ctx context.Context, user usertypes.Actor) (*EnvironmentUpdateJob, error) {
+	if err := s.rejectDockerHostTarget(ctx); err != nil {
+		return nil, err
+	}
+
 	// Closes the in-process check-then-create window (e.g. a double-click); the job row is the durable guard.
 	if !s.updatingAll.CompareAndSwap(false, true) {
 		return nil, errUpdateAllInProgress
@@ -592,6 +619,11 @@ func (s *Service) StartUpdateAll(ctx context.Context, user usertypes.Actor) (*En
 		slog.WarnContext(ctx, "update-all: failed to pre-list remote environments for seeding", "error", listErr)
 	} else {
 		for _, remote := range remotes {
+			// Docker-host environments have no Arcane component to update, so they are not part of
+			// the fleet this job rolls.
+			if remote.IsDockerHost() {
+				continue
+			}
 			upsertPendingResult(job, remote.ID, remote.Name)
 		}
 	}
@@ -694,9 +726,14 @@ func (s *Service) discoverAgents(ctx context.Context, t flow.Task) (any, error) 
 		}
 		return nil, err
 	}
-	agents := make([]remoteAgent, len(envs))
-	for i, remote := range envs {
-		agents[i] = remoteAgent{ID: remote.ID, Name: remote.Name}
+	agents := make([]remoteAgent, 0, len(envs))
+	for _, remote := range envs {
+		// Docker-host environments are served straight over the Docker API, so there is no Arcane
+		// component on the other side to upgrade.
+		if remote.IsDockerHost() {
+			continue
+		}
+		agents = append(agents, remoteAgent{ID: remote.ID, Name: remote.Name})
 	}
 	return agents, nil
 }

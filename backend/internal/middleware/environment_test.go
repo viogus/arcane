@@ -18,15 +18,16 @@ import (
 
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/edge"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 )
 
 func newTestEnvironmentMiddleware() *EnvironmentMiddleware {
 	return &EnvironmentMiddleware{
 		localID:   "0",
 		paramName: "id",
-		resolver: func(ctx context.Context, id string) (string, *string, bool, error) {
+		resolver: func(ctx context.Context, id string) (EnvironmentTarget, error) {
 			_ = ctx
-			return "edge://oracle-1", nil, true, nil
+			return EnvironmentTarget{ApiURL: "edge://oracle-1", Enabled: true}, nil
 		},
 		authValidator: func(ctx context.Context, c *echo.Context) (*authz.PermissionSet, *user.Actor, bool) {
 			_ = ctx
@@ -279,9 +280,9 @@ func TestEnvironmentMiddleware_LocalEnvironmentSkipsProxyPermissionCheck(t *test
 
 func TestEnvironmentMiddleware_RejectsInvalidProxyTarget(t *testing.T) {
 	middleware := newTestEnvironmentMiddleware()
-	middleware.resolver = func(ctx context.Context, id string) (string, *string, bool, error) {
+	middleware.resolver = func(ctx context.Context, id string) (EnvironmentTarget, error) {
 		_, _ = ctx, id
-		return "ftp://example.com", nil, true, nil
+		return EnvironmentTarget{ApiURL: "ftp://example.com", Enabled: true}, nil
 	}
 	router := echo.New()
 	attachMiddleware(router, middleware)
@@ -344,9 +345,9 @@ func TestEnvironmentMiddleware_ForwardsResolvedIconCatalogHeaderOnly(t *testing.
 			mw := &EnvironmentMiddleware{
 				localID:   "0",
 				paramName: "id",
-				resolver: func(ctx context.Context, id string) (string, *string, bool, error) {
+				resolver: func(ctx context.Context, id string) (EnvironmentTarget, error) {
 					_, _ = ctx, id
-					return backend.URL, nil, true, nil
+					return EnvironmentTarget{ApiURL: backend.URL, Enabled: true}, nil
 				},
 				authValidator: func(ctx context.Context, c *echo.Context) (*authz.PermissionSet, *user.Actor, bool) {
 					_, _ = ctx, c
@@ -626,4 +627,131 @@ func TestProxyPermissionDeniedResourceSortRequiresRead(t *testing.T) {
 	c = newProxyRequestContext(http.MethodGet, "/api/environments/"+proxyTestEnvID+"/containers?sort=memoryUsage&order=desc")
 	require.False(t, m.proxyPermissionDenied(c, withRead, proxyTestEnvID, "/containers"),
 		"expected resource sort to be allowed with containers:list and containers:read")
+}
+
+func TestEnvironmentMiddleware_ServesDockerHostEnvironmentsLocally(t *testing.T) {
+	middleware := newTestEnvironmentMiddleware()
+	middleware.resolver = func(ctx context.Context, id string) (EnvironmentTarget, error) {
+		_ = ctx
+		return EnvironmentTarget{Enabled: true, DockerHost: "tcp://192.168.2.33:" + id}, nil
+	}
+	router := echo.New()
+	api := attachMiddleware(router, middleware)
+
+	var target envcontext.Target
+	handlerHit := false
+	api.GET("/environments/:id/containers", func(c *echo.Context) error {
+		handlerHit = true
+		target, _ = envcontext.TargetFromContext(c.Request().Context())
+		return c.JSON(http.StatusOK, map[string]any{"success": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/environments/6001/containers", http.NoBody)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, handlerHit, "docker-host environments are served by the in-process handler")
+	assert.Equal(t, "6001", target.EnvironmentID)
+	assert.Equal(t, "tcp://192.168.2.33:6001", target.DockerHost)
+}
+
+func TestEnvironmentMiddleware_DockerHostEnvironmentStillRequiresAuth(t *testing.T) {
+	middleware := newTestEnvironmentMiddleware()
+	middleware.resolver = func(ctx context.Context, id string) (EnvironmentTarget, error) {
+		_ = ctx
+		return EnvironmentTarget{Enabled: true, DockerHost: "tcp://192.168.2.33:6001"}, nil
+	}
+	middleware.authValidator = func(ctx context.Context, c *echo.Context) (*authz.PermissionSet, *user.Actor, bool) {
+		_ = ctx
+		_ = c
+		return nil, nil, false
+	}
+	router := echo.New()
+	api := attachMiddleware(router, middleware)
+
+	handlerHit := false
+	api.GET("/environments/:id/containers", func(c *echo.Context) error {
+		handlerHit = true
+		return c.JSON(http.StatusOK, map[string]any{"success": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/environments/env-direct/containers", http.NoBody)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusUnauthorized, recorder.Code)
+	assert.False(t, handlerHit)
+}
+
+func TestEnvironmentMiddleware_RejectsDisabledDockerHostEnvironment(t *testing.T) {
+	middleware := newTestEnvironmentMiddleware()
+	middleware.resolver = func(ctx context.Context, id string) (EnvironmentTarget, error) {
+		_ = ctx
+		return EnvironmentTarget{Enabled: false, DockerHost: "tcp://192.168.2.33:6001"}, nil
+	}
+	router := echo.New()
+	api := attachMiddleware(router, middleware)
+
+	handlerHit := false
+	api.GET("/environments/:id/containers", func(c *echo.Context) error {
+		handlerHit = true
+		return c.JSON(http.StatusOK, map[string]any{"success": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/environments/env-direct/containers", http.NoBody)
+	recorder := httptest.NewRecorder()
+
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusBadRequest, recorder.Code)
+	assert.False(t, handlerHit)
+}
+
+func TestEnvironmentMiddleware_AttachesDockerHostTargetForManagerLocalPaths(t *testing.T) {
+	// Manager-local paths are served in-process even for remote environments, so they are never
+	// proxied. A docker-host environment still has to be resolvable from the request context,
+	// otherwise handlers fall back to forwarding to an agent that does not exist.
+	middleware := newTestEnvironmentMiddleware()
+	middleware.resolver = func(ctx context.Context, id string) (EnvironmentTarget, error) {
+		_ = ctx
+		_ = id
+		return EnvironmentTarget{DockerHost: "tcp://192.168.2.33:6001", Enabled: true}, nil
+	}
+	router := echo.New()
+	api := attachMiddleware(router, middleware)
+
+	var seenDockerHost string
+	api.GET("/environments/:id/settings", func(c *echo.Context) error {
+		seenDockerHost = envcontext.DockerHostFromContext(c.Request().Context())
+		return c.JSON(http.StatusOK, map[string]any{"success": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/environments/env-docker/settings", http.NoBody)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Equal(t, "tcp://192.168.2.33:6001", seenDockerHost)
+}
+
+func TestEnvironmentMiddleware_LeavesManagerLocalPathsUnscopedForAgentEnvironments(t *testing.T) {
+	middleware := newTestEnvironmentMiddleware()
+	router := echo.New()
+	api := attachMiddleware(router, middleware)
+
+	var seenDockerHost string
+	api.GET("/environments/:id/settings", func(c *echo.Context) error {
+		seenDockerHost = envcontext.DockerHostFromContext(c.Request().Context())
+		return c.JSON(http.StatusOK, map[string]any{"success": true})
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/environments/env-edge/settings", http.NoBody)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	assert.Empty(t, seenDockerHost)
 }

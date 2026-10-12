@@ -33,6 +33,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/gitops"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/project"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/updater"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 )
 
@@ -327,6 +328,15 @@ func (s *WebhookService) ListWebhookSummaries(ctx context.Context, environmentID
 		return nil, err
 	}
 
+	// Target names must resolve against the environment the webhooks belong to. A docker-host
+	// environment is served in-process by this manager, so scope the context to its daemon before
+	// any name lookup; agent environments keep their proxied names below.
+	if s.environmentService != nil {
+		if scopedCtx, ok := s.environmentService.InProcessTargetContext(ctx, environmentID); ok {
+			ctx = scopedCtx
+		}
+	}
+
 	remoteNames := s.remoteWebhookTargetNamesInternal(ctx, environmentID, webhooks)
 	summaries := make([]webhook.Summary, len(webhooks))
 	for i := range webhooks {
@@ -359,6 +369,11 @@ func (s *WebhookService) remoteWebhookTargetNamesInternal(ctx context.Context, e
 	if !isRemoteWebhookEnvironmentInternal(environmentID) {
 		return names
 	}
+	// A docker-host environment has no agent to proxy to; the caller scopes the context to its
+	// daemon instead, so its names are resolved in-process and there is nothing to fetch here.
+	if envcontext.IsDockerHostTarget(ctx) {
+		return names
+	}
 
 	for targetType, path := range remoteWebhookTargetListPaths {
 		if !slices.ContainsFunc(webhooks, func(wh Webhook) bool { return wh.TargetType == targetType }) {
@@ -380,28 +395,32 @@ func (s *WebhookService) remoteWebhookTargetNamesInternal(ctx context.Context, e
 func (s *WebhookService) resolveWebhookTargetNameInternal(ctx context.Context, wh *Webhook) string {
 	switch wh.TargetType {
 	case WebhookTargetTypeContainer:
-		// Remote containers cannot be resolved against the local Docker daemon.
-		if isRemoteWebhookEnvironmentInternal(wh.EnvironmentID) {
-			if strings.TrimSpace(wh.TargetRef) != "" {
-				return wh.TargetRef
+		// Agent environments are proxied and their names fetched by remoteWebhookTargetNamesInternal;
+		// resolving here would hit the manager's own daemon, so fall back to the stored reference.
+		// A docker-host environment is served in-process against its own daemon (scoped into ctx by
+		// ListWebhookSummaries), so it resolves like a local one.
+		if isRemoteWebhookEnvironmentInternal(wh.EnvironmentID) && !envcontext.IsDockerHostTarget(ctx) {
+			if ref := strings.TrimSpace(wh.TargetRef); ref != "" {
+				return ref
 			}
 			return wh.TargetID
 		}
-		if strings.TrimSpace(wh.TargetRef) != "" {
+		if ref := strings.TrimSpace(wh.TargetRef); ref != "" {
 			if s.containerService == nil {
-				return wh.TargetRef
+				return ref
 			}
-			name, err := s.containerService.GetContainerNameByReference(ctx, wh.TargetRef)
-			if err == nil {
+			if name, err := s.containerService.GetContainerNameByReference(ctx, ref); err == nil {
 				return name
 			}
-			return wh.TargetRef
+			return ref
 		}
 		if s.containerService == nil {
-			return ""
+			return wh.TargetID
 		}
-		name, err := s.containerService.GetContainerNameByID(ctx, wh.TargetID)
-		return kit.Ternary(err != nil, "", name)
+		if name, err := s.containerService.GetContainerNameByID(ctx, wh.TargetID); err == nil {
+			return name
+		}
+		return wh.TargetID
 	case WebhookTargetTypeProject:
 		var localProject project.Project
 		if err := s.db.WithContext(ctx).
@@ -585,12 +604,23 @@ func (s *WebhookService) DrainActions(ctx context.Context) error {
 }
 
 func (s *WebhookService) executeWebhookActionInternal(ctx context.Context, wh *Webhook, actionType string) (*updatertypes.Result, error) {
-	// Webhooks are stored and triggered on the manager; actions against remote
-	// environments are forwarded through the environment proxy.
+	// Webhooks are stored and triggered on the manager; actions against agent
+	// environments are forwarded through the environment proxy. A docker-host
+	// environment has no agent, so its actions run in-process against its daemon.
 	if isRemoteWebhookEnvironmentInternal(wh.EnvironmentID) {
+		if dockerHostCtx, ok := s.dockerHostActionContextInternal(ctx, wh.EnvironmentID); ok {
+			return s.executeInProcessWebhookActionInternal(dockerHostCtx, wh, actionType)
+		}
 		return s.executeRemoteWebhookActionInternal(ctx, wh, actionType)
 	}
 
+	return s.executeInProcessWebhookActionInternal(ctx, wh, actionType)
+}
+
+// executeInProcessWebhookActionInternal runs a webhook action against the daemon the context is
+// scoped to: the manager's own daemon for local work, or a docker-host environment's daemon when
+// the context carries that target.
+func (s *WebhookService) executeInProcessWebhookActionInternal(ctx context.Context, wh *Webhook, actionType string) (*updatertypes.Result, error) {
 	switch wh.TargetType {
 	case WebhookTargetTypeContainer:
 		return s.executeContainerWebhookActionInternal(ctx, wh, actionType)
@@ -603,6 +633,32 @@ func (s *WebhookService) executeWebhookActionInternal(ctx context.Context, wh *W
 	default:
 		return nil, ErrWebhookInvalidType
 	}
+}
+
+// dockerHostActionContextInternal scopes ctx to a docker-host environment's daemon so its webhook
+// actions can run in-process. It reports false for agent environments (which keep going through the
+// environment proxy) and when the environment cannot be resolved.
+func (s *WebhookService) dockerHostActionContextInternal(ctx context.Context, environmentID string) (context.Context, bool) {
+	if environmentID == "" {
+		return ctx, false
+	}
+	// A trigger that already carries this environment's target (for example a request through the
+	// env-scoped route) needs no lookup.
+	if target, ok := envcontext.TargetFromContext(ctx); ok && target.DockerHost != "" && target.EnvironmentID == environmentID {
+		return ctx, true
+	}
+	if s.environmentService == nil {
+		return ctx, false
+	}
+
+	env, err := s.environmentService.GetEnvironmentByIDCached(ctx, environmentID)
+	if err != nil || env == nil || !env.IsDockerHost() {
+		return ctx, false
+	}
+	return envcontext.WithTarget(ctx, envcontext.Target{
+		EnvironmentID: env.ID,
+		DockerHost:    env.DockerHostURL(),
+	}), true
 }
 
 // remoteWebhookRequestInternal maps a webhook action to the env-scoped API

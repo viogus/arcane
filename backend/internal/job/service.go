@@ -37,6 +37,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 	scheduleutil "github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/schedule"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/tracing"
@@ -73,6 +74,11 @@ type JobService struct {
 	// the manager only.
 	OnEnvironmentHealthReschedule func(ctx context.Context)
 	RunEnvironmentHealthNow       func(ctx context.Context) error
+
+	// busWatcherScheduleRefresh reinstalls the schedules owned by bus watchers (image polling) for
+	// every docker-host environment. Those records live in the watcher, so syncing an environment
+	// has to ask it to refresh instead of writing the record here. Set during bootstrap.
+	busWatcherScheduleRefresh func()
 }
 
 func NewJobService(
@@ -251,6 +257,37 @@ func (s *JobService) jobRescheduleContextInternal(ctx context.Context) context.C
 	return ctx
 }
 
+// jobRescheduleContextForEnvironmentInternal keeps the request's environment target while still
+// preferring the app lifecycle context, so an environment-scoped change lands on that
+// environment's own scheduler record instead of the manager's.
+func (s *JobService) jobRescheduleContextForEnvironmentInternal(ctx context.Context) context.Context {
+	base := s.jobRescheduleContextInternal(ctx)
+	target, ok := envcontext.TargetFromContext(ctx)
+	if !ok || target.EnvironmentID == "" {
+		return base
+	}
+	return envcontext.WithTarget(base, target)
+}
+
+// environmentIDOrLocalInternal names the environment a request context is scoped to, defaulting to
+// the manager's own environment when the context carries no target.
+func environmentIDOrLocalInternal(ctx context.Context) string {
+	if environmentID := envcontext.EnvironmentIDFromContext(ctx); environmentID != "" {
+		return environmentID
+	}
+	return environment.LocalEnvironmentID
+}
+
+// environmentScopedContextInternal returns a context scoped to environmentID when this process
+// serves that environment's daemon, so per-environment settings overrides and that environment's
+// scheduler records are used. Agent environments keep the caller's context unchanged.
+func (s *JobService) environmentScopedContextInternal(ctx context.Context, environmentID string) (context.Context, bool) {
+	if environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return ctx, true
+	}
+	return s.inProcessTargetContextInternal(ctx, environmentID)
+}
+
 // rescheduleAffectedJobInternal applies a settings change to one job:
 // delegated fan-out jobs and continuous bus watchers are notified, cron jobs
 // are rescheduled and their runtime schedule verified.
@@ -261,7 +298,7 @@ func (s *JobService) rescheduleAffectedJobInternal(ctx context.Context, jobID st
 		if s.OnEnvironmentHealthReschedule == nil {
 			return errors.New("environment-health rescheduler not initialized")
 		}
-		s.OnEnvironmentHealthReschedule(s.jobRescheduleContextInternal(ctx))
+		s.OnEnvironmentHealthReschedule(s.jobRescheduleContextForEnvironmentInternal(ctx))
 		return nil
 	}
 
@@ -269,7 +306,7 @@ func (s *JobService) rescheduleAffectedJobInternal(ctx context.Context, jobID st
 	// watcher so it re-reads its poll schedule instead.
 	if jobMeta.IsContinuous {
 		if jobID == "image-polling" && s.settings != nil {
-			return s.settings.NotifySettingsChanges(s.jobRescheduleContextInternal(ctx), "pollingInterval")
+			return s.settings.NotifySettingsChanges(s.jobRescheduleContextForEnvironmentInternal(ctx), "pollingInterval")
 		}
 		return nil
 	}
@@ -280,12 +317,13 @@ func (s *JobService) rescheduleAffectedJobInternal(ctx context.Context, jobID st
 	}
 
 	slog.DebugContext(ctx, "Processing job setting change", "job", jobID, "settingsKey", jobMeta.SettingsKey, "enabledKey", jobMeta.EnabledKey)
-	rescheduleCtx := s.jobRescheduleContextInternal(ctx)
+	rescheduleCtx := s.jobRescheduleContextForEnvironmentInternal(ctx)
 	if err := s.scheduler.RescheduleJob(rescheduleCtx, job); err != nil {
 		return fmt.Errorf("reschedule job %s: %w", jobID, err)
 	}
 
-	runtimeState, ok := s.scheduler.GetJobRuntimeState(jobID)
+	environmentID := environmentIDOrLocalInternal(rescheduleCtx)
+	runtimeState, ok := s.scheduler.GetJobRuntimeStateFor(rescheduleCtx, environmentID, jobID)
 	if !ok {
 		return fmt.Errorf("job %s has no runtime scheduler state", jobID)
 	}
@@ -334,9 +372,24 @@ func jobMetadataAffectedBySettingInternal(jobMeta meta.JobMetadata, changed map[
 	return false
 }
 
+// ListJobs describes this manager's scheduled jobs and their run status for its own daemon.
 func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse, error) {
+	return s.ListJobsForEnvironment(ctx, environment.LocalEnvironmentID)
+}
+
+// ListJobsForEnvironment describes this manager's scheduled jobs, with run status taken from the
+// given environment's runs. It exists because a docker-host environment is served by this process:
+// its job list is the manager's own catalog, but its run history belongs to that environment's
+// daemon.
+func (s *JobService) ListJobsForEnvironment(ctx context.Context, environmentID string) (*jobschedule.JobListResponse, error) {
 	if s == nil || s.settings == nil {
 		return nil, errors.New("job service not initialized")
+	}
+	environmentID = cmp.Or(environmentID, environment.LocalEnvironmentID)
+	// Read the environment's own schedule overrides and scheduler records when this process serves
+	// that environment's daemon.
+	if scopedCtx, inProcess := s.environmentScopedContextInternal(ctx, environmentID); inProcess {
+		ctx = scopedCtx
 	}
 
 	allMetadata := meta.GetAllJobMetadata()
@@ -349,7 +402,7 @@ func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse
 		prerequisites := s.evaluatePrerequisitesInternal(ctx, jobMeta)
 
 		if s.scheduler != nil && (jobMeta.SettingsKey != "" || jobMeta.ID == "upgrade-log-cleanup") && jobMeta.ID != "environment-health" {
-			if runtimeState, ok := s.scheduler.GetJobRuntimeState(jobMeta.ID); ok {
+			if runtimeState, ok := s.scheduler.GetJobRuntimeStateFor(ctx, environmentID, jobMeta.ID); ok {
 				schedule = cmp.Or(runtimeState.Schedule, schedule)
 				nextRun = runtimeState.NextRun
 			}
@@ -359,7 +412,7 @@ func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse
 		jobs = append(jobs, jobStatus)
 	}
 
-	if err := runtime.ApplyStatuses(ctx, s.runs, s.scheduler, "0", &jobs); err != nil {
+	if err := runtime.ApplyStatuses(ctx, s.runs, s.scheduler, environmentID, &jobs); err != nil {
 		return nil, err
 	}
 
@@ -375,6 +428,84 @@ func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse
 		IsAgent:     isAgent,
 		DurableRuns: true, ObservedAt: time.Now().UTC(),
 	}, nil
+}
+
+// environmentCronJobIDsInternal lists the cron jobs that act on an environment's own Docker daemon
+// and therefore need one scheduler record per docker-host environment. Manager housekeeping (event
+// cleanup, session cleanup, analytics, upgrade-log cleanup) stays on the manager. Image polling is
+// not a cron entry but a continuous bus watcher, so its per-environment records are installed by the
+// watcher and cleared explicitly in ForgetEnvironmentJobs.
+func environmentCronJobIDsInternal() []string {
+	return []string{"auto-update", "auto-patch", "auto-heal", "scheduled-prune", "vulnerability-scan", "docker-client-refresh"}
+}
+
+// SyncEnvironmentJobs installs this environment's own scheduler records for the daemon-facing cron
+// jobs, reading that environment's schedule and enabled overrides. It is a no-op for agent
+// environments, whose jobs run inside the agent.
+func (s *JobService) SyncEnvironmentJobs(ctx context.Context, environmentID string) error {
+	if s == nil || s.scheduler == nil || environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return nil
+	}
+	scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID)
+	if !inProcess {
+		return nil
+	}
+	var errs []error
+	for _, jobID := range environmentCronJobIDsInternal() {
+		job, ok := s.scheduler.GetJob(jobID)
+		if !ok {
+			continue
+		}
+		if err := s.scheduler.RescheduleJob(scopedCtx, job); err != nil {
+			errs = append(errs, fmt.Errorf("schedule %s for environment %s: %w", jobID, environmentID, err))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	// Image polling is a bus watcher: a newly enabled docker-host environment must start polling
+	// immediately, so ask the watcher to install its own per-environment records.
+	if s.busWatcherScheduleRefresh != nil {
+		s.busWatcherScheduleRefresh()
+	}
+	return nil
+}
+
+// SetBusWatcherScheduleRefresh registers the callback that reinstalls bus-watcher schedules
+// (image polling) whenever a docker-host environment is synced. Called during bootstrap.
+func (s *JobService) SetBusWatcherScheduleRefresh(refresh func()) {
+	if s == nil {
+		return
+	}
+	s.busWatcherScheduleRefresh = refresh
+}
+
+// ForgetEnvironmentJobs clears the scheduler records this environment owns when it is disabled or
+// deleted, without unregistering jobs that the other environments still use.
+func (s *JobService) ForgetEnvironmentJobs(ctx context.Context, environmentID string) error {
+	if s == nil || s.scheduler == nil || environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return nil
+	}
+	var errs []error
+	for _, jobID := range environmentCronJobIDsInternal() {
+		if err := s.scheduler.ClearJobScheduleFor(ctx, environmentID, jobID); err != nil {
+			errs = append(errs, fmt.Errorf("unschedule %s for environment %s: %w", jobID, environmentID, err))
+		}
+	}
+	// Image polling is a bus watcher: it owns no registry entry but still checkpoints one schedule per
+	// docker-host environment, so its record must be cleared here too.
+	if err := s.scheduler.ClearJobScheduleFor(ctx, environmentID, "image-polling"); err != nil {
+		errs = append(errs, fmt.Errorf("unschedule %s for environment %s: %w", "image-polling", environmentID, err))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	// The watcher also holds a live event subscription per served environment; ask it to reconcile so
+	// a disabled environment stops feeding events immediately.
+	if s.busWatcherScheduleRefresh != nil {
+		s.busWatcherScheduleRefresh()
+	}
+	return nil
 }
 
 func (s *JobService) getJobScheduleInternal(ctx context.Context, localMeta meta.JobMetadata) string {
@@ -557,7 +688,14 @@ func (s *JobService) Submit(ctx context.Context, request scheduler.Request) (sch
 		}
 		metadata, ok := meta.GetJobMetadata(request.JobID)
 		dynamicRemote := strings.HasPrefix(request.JobID, "gitops-sync:") || strings.HasPrefix(request.JobID, "volume-backup:")
-		if !dynamicRemote && (!ok || metadata.ManagerOnly || !metadata.CanRunManually) {
+		switch {
+		// A docker-host environment is served by this process, so its jobs are validated and
+		// executed like local work instead of being handed to an agent.
+		case env.IsDockerHost():
+			if err := s.validateLocalJobInternal(ctx, request.JobID); err != nil {
+				return scheduler.Run{}, err
+			}
+		case !dynamicRemote && (!ok || metadata.ManagerOnly || !metadata.CanRunManually):
 			return scheduler.Run{}, errors.New("job is not remotely runnable")
 		}
 	} else if err := s.validateLocalJobInternal(ctx, request.JobID); err != nil {
@@ -575,6 +713,30 @@ func (s *JobService) Submit(ctx context.Context, request scheduler.Request) (sch
 		return scheduler.Run{}, err
 	}
 	return s.runs.Submit(ctx, request)
+}
+
+// inProcessTargetContextInternal reports whether this process serves the environment's Docker
+// daemon itself and, if so, returns a context scoped to that daemon.
+//
+// The manager serves its own daemon ("0") in-process. A "docker-host" environment is also served
+// in-process — it has no agent to hand work to — so its runs must execute here with the target in
+// context instead of being delivered over the remote job protocol.
+func (s *JobService) inProcessTargetContextInternal(ctx context.Context, environmentID string) (context.Context, bool) {
+	if environmentID == "" || environmentID == "0" {
+		return ctx, true
+	}
+	// A request that already carries this environment's target needs no lookup.
+	if target, ok := envcontext.TargetFromContext(ctx); ok && target.EnvironmentID == environmentID && target.DockerHost != "" {
+		return ctx, true
+	}
+	if s.environment == nil {
+		return ctx, false
+	}
+	env, err := s.environment.GetEnvironmentByIDCached(ctx, environmentID)
+	if err != nil || env == nil || !env.IsDockerHost() {
+		return ctx, false
+	}
+	return envcontext.WithTarget(ctx, envcontext.Target{EnvironmentID: env.ID, DockerHost: env.DockerHostURL()}), true
 }
 
 func (s *JobService) validateLocalJobInternal(ctx context.Context, jobID string) error {
@@ -660,16 +822,17 @@ func (s *JobService) executeRunInternal(ctx context.Context, run scheduler.Run) 
 	if err := s.authorizeRunInternal(ctx, run); err != nil {
 		return scheduler.Outcome{Status: scheduler.Failed}, err
 	}
-	if run.EnvironmentID != "0" {
+	runCtx, inProcess := s.inProcessTargetContextInternal(ctx, run.EnvironmentID)
+	if !inProcess {
 		return s.remote.Deliver(ctx, run)
 	}
 	if requiresDockerInternal(run.JobID) && s.environment != nil {
-		status, err := s.environment.TestConnection(ctx, "0", nil)
+		status, err := s.environment.TestConnection(runCtx, run.EnvironmentID, nil)
 		if err != nil || status != "online" {
 			return scheduler.Outcome{Status: scheduler.Waiting, Message: "Waiting for Docker"}, err
 		}
 	}
-	ctx = s.runs.ExecutionContext(ctx, run, "")
+	ctx = s.runs.ExecutionContext(runCtx, run, "")
 	if run.JobID == "environment-health" && s.RunEnvironmentHealthNow != nil {
 		err := s.RunEnvironmentHealthNow(ctx)
 		return classifyOutcomeInternal(run.JobID, scheduler.Outcome{}, err)
@@ -733,9 +896,11 @@ func (s *JobService) reconcileRunInternal(ctx context.Context, run scheduler.Run
 	if err := s.authorizeRunInternal(ctx, run); err != nil {
 		return scheduler.Outcome{Status: scheduler.Failed}, err
 	}
-	if run.EnvironmentID != "0" {
+	runCtx, inProcess := s.inProcessTargetContextInternal(ctx, run.EnvironmentID)
+	if !inProcess {
 		return s.executeRunInternal(ctx, run)
 	}
+	ctx = runCtx
 	if safeJobInternal(run.JobID) {
 		return s.executeRunInternal(ctx, run)
 	}
@@ -796,7 +961,7 @@ func (s *JobService) ResolveRun(ctx context.Context, environmentID, jobID, runID
 	if actor == "" {
 		return scheduler.Run{}, errors.New("resolving operator identity is required")
 	}
-	if environmentID != "0" {
+	if _, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); !inProcess {
 		return s.remote.ResolveRun(ctx, environmentID, jobID, runID, actor)
 	}
 	return s.runs.Resolve(ctx, environmentID, jobID, runID, actor)
@@ -805,13 +970,11 @@ func (s *JobService) ResolveRun(ctx context.Context, environmentID, jobID, runID
 // RetryRun revalidates local job eligibility before requeuing the existing run.
 // Remote retries follow the delivery protocol and retain confirmed target progress.
 func (s *JobService) RetryRun(ctx context.Context, environmentID, jobID, runID string) (scheduler.Run, error) {
-	if environmentID != "0" {
+	if _, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); !inProcess {
 		return s.retryRemoteRunInternal(ctx, environmentID, jobID, runID)
 	}
-	if environmentID == "0" {
-		if err := s.validateLocalJobInternal(ctx, jobID); err != nil {
-			return scheduler.Run{}, err
-		}
+	if err := s.validateLocalJobInternal(ctx, jobID); err != nil {
+		return scheduler.Run{}, err
 	}
 	run, err := s.runs.Get(ctx, environmentID, jobID, runID)
 	if err != nil {
@@ -831,6 +994,10 @@ func (s *JobService) RetryRun(ctx context.Context, environmentID, jobID, runID s
 
 // ListRemoteJobs returns an agent's catalog with manager-side run status.
 func (s *JobService) ListRemoteJobs(ctx context.Context, environmentID string) (*jobschedule.JobListResponse, error) {
+	// A docker-host environment has no agent to ask, so its catalog is this manager's own.
+	if _, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); inProcess {
+		return s.ListJobsForEnvironment(ctx, environmentID)
+	}
 	catalog, err := s.remote.Catalog(ctx, environmentID)
 	if err != nil {
 		return nil, err
@@ -859,7 +1026,7 @@ func (s *JobService) retryRemoteRunInternal(ctx context.Context, environmentID, 
 
 // ListRuns merges agent history with requests accepted by this manager.
 func (s *JobService) ListRuns(ctx context.Context, environmentID, jobID string, page, limit int) (scheduler.RunList, error) {
-	if environmentID == "0" {
+	if _, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); inProcess {
 		return s.runs.List(ctx, environmentID, jobID, page, limit)
 	}
 	merged, err := s.remote.Runs(ctx, environmentID, jobID)
@@ -887,8 +1054,9 @@ func (s *JobService) ListRuns(ctx context.Context, environmentID, jobID string, 
 
 // GetRun prefers the manager's durable delivery record, then queries agent-owned history.
 func (s *JobService) GetRun(ctx context.Context, environmentID, jobID, runID string) (scheduler.Run, error) {
+	_, inProcess := s.inProcessTargetContextInternal(ctx, environmentID)
 	run, err := s.runs.Get(ctx, environmentID, jobID, runID)
-	if environmentID == "0" || !errors.Is(err, runs.ErrRunNotFound) {
+	if inProcess || !errors.Is(err, runs.ErrRunNotFound) {
 		return runtime.ProjectRunOutcome(run), err
 	}
 	run, err = s.remote.AgentRun(ctx, environmentID, jobID, runID)
@@ -900,8 +1068,9 @@ func (s *JobService) GetRun(ctx context.Context, environmentID, jobID, runID str
 
 // CancelRun cancels manager admission or explicitly forwards an agent-owned cancellation.
 func (s *JobService) CancelRun(ctx context.Context, environmentID, jobID, runID string) (scheduler.Run, error) {
+	_, inProcess := s.inProcessTargetContextInternal(ctx, environmentID)
 	_, err := s.runs.Get(ctx, environmentID, jobID, runID)
-	if environmentID != "0" && errors.Is(err, runs.ErrRunNotFound) {
+	if !inProcess && errors.Is(err, runs.ErrRunNotFound) {
 		return s.remote.MutateAgentRun(ctx, environmentID, jobID, runID, "cancel")
 	}
 	if err != nil {

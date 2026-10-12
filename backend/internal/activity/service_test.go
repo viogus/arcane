@@ -27,6 +27,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 )
@@ -1081,4 +1082,33 @@ func TestActivityService_StartActivityWithIDIsIdempotent(t *testing.T) {
 	var count int64
 	require.NoError(t, db.Model(&Activity{}).Where("id = ?", "workflow-activity").Count(&count).Error)
 	require.Equal(t, int64(1), count)
+}
+
+// TestActivityAttributionIsScopedToEnvironmentInternal is the regression guard for the reported gap:
+// work served for a docker-host environment runs in this process, so the activities it starts must
+// name that environment instead of appearing on the manager's own stream.
+func TestActivityAttributionIsScopedToEnvironmentInternal(t *testing.T) {
+	const environmentID = "env-docker-host"
+	db := setupActivityServiceTestDBInternal(t)
+	service := NewActivityService(db, nil)
+	scoped := envcontext.WithTarget(t.Context(), envcontext.Target{
+		EnvironmentID: environmentID,
+		DockerHost:    "tcp://192.168.2.33:6002",
+	})
+
+	started, err := service.StartActivity(scoped, StartActivityRequest{EnvironmentID: "0", Type: activity.TypeImagePull, LatestMessage: "pull"})
+	require.NoError(t, err)
+	require.Equal(t, environmentID, started.EnvironmentID)
+
+	// A caller that names a real environment keeps it, and a request without a target stays local.
+	attributed, err := service.StartActivity(scoped, StartActivityRequest{EnvironmentID: "env-agent", Type: activity.TypeImagePull, LatestMessage: "pull"})
+	require.NoError(t, err)
+	require.Equal(t, "env-agent", attributed.EnvironmentID)
+	local, err := service.StartActivity(t.Context(), StartActivityRequest{Type: activity.TypeImagePull, LatestMessage: "pull"})
+	require.NoError(t, err)
+	require.Equal(t, "0", local.EnvironmentID)
+
+	var rows []Activity
+	require.NoError(t, db.Order("started_at asc").Where("id IN ?", []string{started.ID, attributed.ID, local.ID}).Find(&rows).Error)
+	require.Len(t, rows, 3)
 }

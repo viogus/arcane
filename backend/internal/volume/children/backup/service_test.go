@@ -30,7 +30,7 @@ import (
 
 func applyVolumeBackupMigrations(t *testing.T, gormDB *gorm.DB) {
 	t.Helper()
-	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql"} {
+	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql", "095_add_volume_backup_policy_environment.sql", "097_add_volume_backup_environment.sql"} {
 		migration, err := os.ReadFile("../../../../resources/migrations/sqlite/" + name)
 		require.NoError(t, err)
 		require.NoError(t, gormDB.Exec(strings.Split(string(migration), "-- +goose Down")[0]).Error)

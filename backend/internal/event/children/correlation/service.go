@@ -14,13 +14,17 @@ const (
 	suppressionWindowGrace = 10 * time.Second
 )
 
+// Correlation is keyed by environment as well as resource: two daemons can each have a container,
+// image or volume with the same name, and a mutation on one must not hide the other's activity.
 type expectation struct {
+	environmentID                          string
 	resourceType, resourceID, resourceName string
 }
 
 type windowKey struct {
-	kind, name string
-	resource   expectation
+	environmentID string
+	kind, name    string
+	resource      expectation
 }
 
 type window struct {
@@ -68,8 +72,9 @@ func (c *Service) Prune() {
 	c.pruneInternal(c.timeInternal())
 }
 
-// MarkExpectation correlates subsequent daemon observations with a local Arcane action.
-func (c *Service) MarkExpectation(resourceType, resourceID, resourceName string) {
+// MarkExpectation correlates subsequent daemon observations with a local Arcane action. environmentID
+// names the daemon the action ran against; a daemon event is only correlated with its own environment.
+func (c *Service) MarkExpectation(environmentID, resourceType, resourceID, resourceName string) {
 	switch resourceType {
 	case "container", "image", "volume", "network":
 	default:
@@ -88,35 +93,39 @@ func (c *Service) MarkExpectation(resourceType, resourceID, resourceName string)
 	if c.expectations == nil {
 		c.expectations = make(map[expectation]time.Time)
 	}
-	c.expectations[expectation{resourceType, resourceID, resourceName}] = now.Add(expectationTTL)
+	c.expectations[expectation{environmentID, resourceType, resourceID, resourceName}] = now.Add(expectationTTL)
 }
 
 // BeginComposeWindow covers daemon events labeled with the Compose project.
 // Unlabeled resources require an explicit resource expectation to avoid hiding unrelated activity.
-func (c *Service) BeginComposeWindow(composeProject string) func() {
+func (c *Service) BeginComposeWindow(environmentID, composeProject string) func() {
 	if composeProject == "" {
 		return func() {}
 	}
-	return c.beginWindowsInternal([]windowKey{{kind: "compose", name: composeProject}})
+	return c.beginWindowsInternal([]windowKey{{environmentID: environmentID, kind: "compose", name: composeProject}})
 }
 
 // BeginResourceWindow covers a mutation for its full duration and cleanup grace.
-func (c *Service) BeginResourceWindow(resourceType, resourceID, resourceName string) func() {
+func (c *Service) BeginResourceWindow(environmentID, resourceType, resourceID, resourceName string) func() {
 	if resourceName == "name" {
 		resourceName = ""
 	}
 	if resourceID == "" && resourceName == "" {
 		return func() {}
 	}
-	return c.beginWindowsInternal([]windowKey{{kind: "resource", resource: expectation{resourceType, resourceID, resourceName}}})
+	return c.beginWindowsInternal([]windowKey{{
+		environmentID: environmentID,
+		kind:          "resource",
+		resource:      expectation{environmentID, resourceType, resourceID, resourceName},
+	}})
 }
 
 // BeginTypeWindow covers bulk daemon operations whose per-item IDs are unknown until they finish.
-func (c *Service) BeginTypeWindow(resourceType string) func() {
+func (c *Service) BeginTypeWindow(environmentID, resourceType string) func() {
 	if resourceType == "" {
 		return func() {}
 	}
-	return c.beginWindowsInternal([]windowKey{{kind: "type", name: resourceType}})
+	return c.beginWindowsInternal([]windowKey{{environmentID: environmentID, kind: "type", name: resourceType}})
 }
 
 func (c *Service) beginWindowsInternal(keys []windowKey) func() {
@@ -150,8 +159,9 @@ func (c *Service) SetUpdatingContainers(source func() []string) {
 	c.updatingContainers = source
 }
 
-// ShouldSuppress reports whether a daemon observation matches a recent local action.
-func (c *Service) ShouldSuppress(resourceType, actorID, actorName, composeProject string) bool {
+// ShouldSuppress reports whether a daemon observation matches a recent local action against the same
+// environment's daemon.
+func (c *Service) ShouldSuppress(environmentID, resourceType, actorID, actorName, composeProject string) bool {
 	c.mu.Lock()
 	updating := c.updatingContainers
 	c.mu.Unlock()
@@ -168,11 +178,14 @@ func (c *Service) ShouldSuppress(resourceType, actorID, actorName, composeProjec
 	c.pruneInternal(c.timeInternal())
 
 	for exp := range c.expectations {
-		if exp.matchesInternal(resourceType, actorID, actorName) {
+		if exp.environmentID == environmentID && exp.matchesInternal(resourceType, actorID, actorName) {
 			return true
 		}
 	}
 	for key := range c.windows {
+		if key.environmentID != environmentID {
+			continue
+		}
 		switch key.kind {
 		case "resource":
 			if key.resource.matchesInternal(resourceType, actorID, actorName) {

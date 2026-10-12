@@ -1114,8 +1114,8 @@ func TestProjectService_UpdateProjectServicesForcesRecreate(t *testing.T) {
 		_ map[string]dockerregistry.AuthConfig,
 		_ time.Duration,
 	) error {
-		assert.True(t, eventService.ShouldSuppressDaemonEvent("container", "replacement", "app", selected.Name))
-		assert.False(t, eventService.ShouldSuppressDaemonEvent("image", "pulled-image", "", ""))
+		assert.True(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "container", "replacement", "app", selected.Name))
+		assert.False(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "image", "pulled-image", "", ""))
 		upCalled = true
 		assert.Equal(t, []string{"app", "dormant", "sidecar"}, selected.ServiceNames(), "stopped dependents stay in the model for recreation")
 		forceRecreate = force
@@ -1127,8 +1127,8 @@ func TestProjectService_UpdateProjectServicesForcesRecreate(t *testing.T) {
 	svc := NewProjectService(db, settingsService, eventService, imageService, dockerService, nil, nil, nil, config.Load(), nil, nil)
 	err = svc.UpdateProjectServices(ctx, projectRecord.ID, []string{"app"}, usertypes.SystemUser, true)
 	require.Error(t, err)
-	assert.True(t, eventService.ShouldSuppressDaemonEvent("container", "replacement", "app", "compose-update-force"), "failed updates retain correlation through rollback grace")
-	assert.False(t, eventService.ShouldSuppressDaemonEvent("container", "unrelated", "unrelated", "other-project"))
+	assert.True(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "container", "replacement", "app", "compose-update-force"), "failed updates retain correlation through rollback grace")
+	assert.False(t, eventService.ShouldSuppressDaemonEvent(context.Background(), "container", "unrelated", "unrelated", "other-project"))
 	assert.True(t, upCalled)
 	assert.Equal(t, []string{"app", "sidecar"}, stopped)
 	assert.True(t, forceRecreate, "service updates must force recreate after pulling the updated image")

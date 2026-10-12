@@ -108,6 +108,44 @@ export function getCapacityLabel(used: number | undefined, total: number | undef
 	return `${bytes.format(used, { unitSeparator: ' ' }) ?? '-'} / ${bytes.format(total, { unitSeparator: ' ' }) ?? '-'}`;
 }
 
+export interface CapacityMetric {
+	value: string;
+	label: string;
+	meterValue: number | null;
+}
+
+// A docker-host environment is read straight through the remote Docker API, which reports the
+// containers' memory usage and the host's memory capacity but no host disk capacity. The tiles
+// therefore show what the API can actually answer instead of a full-host agent reading.
+export function getMemoryMetricDisplay(stats: SystemStats | null, isDockerHostEnvironment: boolean): CapacityMetric {
+	const metric = getMemoryMetric(stats);
+	const capacity = getCapacityLabel(stats?.memoryUsage, stats?.memoryTotal);
+
+	return {
+		value: formatPercent(metric),
+		label: isDockerHostEnvironment && capacity !== '--' ? `${m.dashboard_meter_containers()} · ${capacity}` : capacity,
+		meterValue: metric
+	};
+}
+
+export function getDiskMetricDisplay(stats: SystemStats | null, isDockerHostEnvironment: boolean): CapacityMetric {
+	if (isDockerHostEnvironment) {
+		return {
+			value: stats?.diskUsage ? (bytes.format(stats.diskUsage, { unitSeparator: ' ' }) ?? '--') : '--',
+			label: m.dashboard_meter_docker_data(),
+			meterValue: null
+		};
+	}
+
+	const metric = getDiskMetric(stats);
+
+	return {
+		value: formatPercent(metric),
+		label: getCapacityLabel(stats?.diskUsage, stats?.diskTotal),
+		meterValue: metric
+	};
+}
+
 export function getGpuMetric(stats: SystemStats | null): number | null {
 	const gpus = stats?.gpus?.filter((gpu) => gpu.memoryTotal > 0) ?? [];
 	if (gpus.length === 0) return null;

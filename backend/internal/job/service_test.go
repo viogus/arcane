@@ -40,7 +40,7 @@ func setupSettingsTestDBInternal(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &kv.KVEntry{}))
+	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &settings.EnvironmentSetting{}, &kv.KVEntry{}))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
@@ -479,6 +479,8 @@ type fakeJobSchedulerInternal struct {
 	rescheduleErr      error
 	busWatcherRuns     []string
 	busWatcherContexts []context.Context
+	cleared            []string
+	clearErr           error
 }
 
 func newFakeJobSchedulerInternal(jobIDs ...string) *fakeJobSchedulerInternal {
@@ -501,6 +503,16 @@ func (s *fakeJobSchedulerInternal) GetJob(jobID string) (scheduler.Job, bool) {
 func (s *fakeJobSchedulerInternal) GetJobRuntimeState(jobID string) (scheduler.JobRuntimeState, bool) {
 	state, ok := s.runtimeStates[jobID]
 	return state, ok
+}
+
+func (s *fakeJobSchedulerInternal) GetJobRuntimeStateFor(_ context.Context, _ string, jobID string) (scheduler.JobRuntimeState, bool) {
+	state, ok := s.runtimeStates[jobID]
+	return state, ok
+}
+
+func (s *fakeJobSchedulerInternal) ClearJobScheduleFor(_ context.Context, environmentID, jobID string) error {
+	s.cleared = append(s.cleared, environmentID+"|"+jobID)
+	return s.clearErr
 }
 
 func (s *fakeJobSchedulerInternal) RescheduleJob(ctx context.Context, job scheduler.Job) error {

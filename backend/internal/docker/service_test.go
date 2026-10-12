@@ -330,3 +330,56 @@ func newDockerPingTestServerWithHandler(t *testing.T, handler http.HandlerFunc) 
 
 	return server
 }
+
+// TestDockerClientService_HostEventBusIsolatesEndpoints proves events can be attributed to the daemon
+// that produced them: the manager's own endpoint keeps the shared bus, while every other endpoint gets
+// its own bus (reused across stream restarts) so one environment's events cannot be read as another's.
+func TestDockerClientService_HostEventBusIsolatesEndpoints(t *testing.T) {
+	managerServer := newDockerPingTestServer(t, func() string { return client.MinAPIVersion })
+	remoteServer := newDockerEventStreamServerForTestInternal(t)
+
+	service := newDockerClientServiceForTest(t, managerServer.URL)
+	t.Cleanup(service.Close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	assert.Same(t, service.EventBus(), service.HostEventBus(ctx, managerServer.URL),
+		"the manager's own daemon must keep the shared bus")
+	assert.Same(t, service.EventBus(), service.HostEventBus(ctx, ""),
+		"an empty endpoint means the manager's own daemon")
+
+	first := service.HostEventBus(ctx, remoteServer.URL)
+	require.NotNil(t, first)
+	assert.NotSame(t, service.EventBus(), first, "another daemon must not publish on the shared bus")
+	assert.Same(t, first, service.HostEventBus(ctx, remoteServer.URL),
+		"one endpoint keeps one bus when its stream is replaced")
+
+	other := service.HostEventBus(ctx, "tcp://127.0.0.1:1")
+	assert.NotSame(t, first, other, "each endpoint must be told apart")
+	assert.NotSame(t, service.EventBus(), other)
+}
+
+// newDockerEventStreamServerForTestInternal serves a Docker endpoint well enough for the event stream
+// to open and stay open until the client stops: an API version for the negotiation ping, then an empty
+// event stream that ends with the request.
+func newDockerEventStreamServerForTestInternal(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	return newDockerPingTestServerWithHandler(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/_ping":
+			w.Header().Set("Api-Version", client.MinAPIVersion)
+			w.WriteHeader(http.StatusOK)
+		case "/events":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	})
+}

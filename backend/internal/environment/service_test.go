@@ -1304,6 +1304,13 @@ func TestEnvironmentService_ListEnvironmentsPaginated_FiltersByRuntimeType(t *te
 			IsEdge:            true,
 			LastEdgeTransport: new("websocket"),
 		},
+		{
+			ID: "env-dockerhost", CreatedAt: now, UpdatedAt: &now,
+			Name:       "Remote Docker",
+			DockerHost: new("tcp://192.168.2.33:6001"),
+			Status:     string(EnvironmentStatusOnline),
+			Enabled:    true,
+		},
 	}
 	require.NoError(t, db.WithContext(ctx).Create(&envs).Error)
 
@@ -1331,6 +1338,9 @@ func TestEnvironmentService_ListEnvironmentsPaginated_FiltersByRuntimeType(t *te
 		wantIDs    []string
 	}{
 		{name: "http", typeFilter: "http", wantIDs: []string{"0"}},
+		// Docker-host environments point at a remote Docker API and are not agents,
+		// so they are their own type and never classify as http.
+		{name: "dockerhost", typeFilter: "dockerhost", wantIDs: []string{"env-dockerhost"}},
 		// Poll-only edge environments (no tunnel transport) classify as plain edge.
 		{name: "edge", typeFilter: "edge", wantIDs: []string{"env-edge", "env-polling"}},
 		{name: "grpc", typeFilter: "grpc", wantIDs: []string{"env-grpc"}},

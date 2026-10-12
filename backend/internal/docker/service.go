@@ -27,6 +27,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/timeouts"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 )
@@ -49,6 +50,18 @@ type DockerClientService struct {
 	clientLastProbe time.Time
 	mu              sync.Mutex
 	eventBus        *bus.DockerEventBus
+
+	// hostEventBuses holds one event bus per "docker-host" environment endpoint so an event can be
+	// attributed to the daemon that produced it; the manager's own daemon keeps eventBus above.
+	// hostEventStops cancels the stream of an endpoint that is being re-watched.
+	hostEventBuses map[string]*bus.DockerEventBus
+	hostEventStops map[string]context.CancelFunc
+	hostEventMu    sync.Mutex
+
+	// hostClients caches one client per "docker-host" environment endpoint. The
+	// embedded Client above keeps serving the manager's own daemon.
+	hostClients map[string]*client.Client
+	hostMu      sync.Mutex
 
 	// Coalesce concurrent full-inventory lists into one Docker response; per-instance
 	// because a WithClient copy talks to a different daemon.
@@ -77,8 +90,103 @@ func (s *DockerClientService) WithClient(dockerClient *client.Client) *DockerCli
 	}
 }
 
+// HostForContext returns the Docker endpoint the request is scoped to, or an
+// empty string when the request belongs to the manager's own daemon.
+func (s *DockerClientService) HostForContext(ctx context.Context) string {
+	host := strings.TrimSpace(envcontext.DockerHostFromContext(ctx))
+	if host == "" || host == s.DockerHost() {
+		return ""
+	}
+	return host
+}
+
+// dockerClientOptionsInternal builds the moby client options for a Docker endpoint. An https://
+// endpoint needs an explicit TLS config: moby derives the request scheme from the client's TLS
+// config rather than from the host, so passing the host alone silently downgrades the connection
+// to cleartext HTTP. Empty certificate paths mean "TLS with the system CA pool and no client
+// certificate".
+func dockerClientOptionsInternal(host string) []client.Opt {
+	opts := []client.Opt{client.WithHost(host)}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(host)), "https://") {
+		opts = append(opts, client.WithTLSClientConfig("", "", ""))
+	}
+	return opts
+}
+
+// GetHostClient returns a cached Docker client for an explicit endpoint.
+func (s *DockerClientService) GetHostClient(ctx context.Context, host string) (*client.Client, error) {
+	host = strings.TrimSpace(host)
+	if host == "" || host == s.DockerHost() {
+		return s.GetClient(ctx)
+	}
+
+	s.hostMu.Lock()
+	if cli, ok := s.hostClients[host]; ok {
+		s.hostMu.Unlock()
+		return cli, nil
+	}
+	s.hostMu.Unlock()
+
+	apiVersion, err := detectDockerAPIVersion(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Docker client: %w", err)
+	}
+	cli, err := client.New(append(dockerClientOptionsInternal(host), client.WithAPIVersion(apiVersion))...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Docker client for %s: failed to configure Docker client API version %s: %w", host, apiVersion, err)
+	}
+
+	s.hostMu.Lock()
+	if s.hostClients == nil {
+		s.hostClients = make(map[string]*client.Client)
+	}
+	if existing, ok := s.hostClients[host]; ok {
+		s.hostMu.Unlock()
+		closeDockerClient(ctx, cli, "unused after concurrent initialization")
+		return existing, nil
+	}
+	s.hostClients[host] = cli
+	s.hostMu.Unlock()
+
+	return cli, nil
+}
+
+// PingHost verifies that a Docker endpoint is reachable.
+func (s *DockerClientService) PingHost(ctx context.Context, host string) error {
+	cli, err := s.GetHostClient(ctx, host)
+	if err != nil {
+		return err
+	}
+
+	pingCtx, cancel := context.WithTimeout(ctx, dockerClientNegotiationTimeout)
+	defer cancel()
+
+	if _, err := cli.Ping(pingCtx, client.PingOptions{}); err != nil {
+		return fmt.Errorf("failed to reach Docker host %s: %w", host, err)
+	}
+	return nil
+}
+
+// CloseHostClient drops the cached client for an endpoint, so the next request
+// reconnects. Used when a docker-host environment changes or is removed.
+func (s *DockerClientService) CloseHostClient(host string) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return
+	}
+
+	s.hostMu.Lock()
+	cli, ok := s.hostClients[host]
+	delete(s.hostClients, host)
+	s.hostMu.Unlock()
+
+	if ok {
+		closeDockerClient(context.Background(), cli, "docker-host environment removed")
+	}
+}
+
 func detectDockerAPIVersion(ctx context.Context, host string) (string, error) {
-	probeClient, err := client.New(client.WithHost(host))
+	probeClient, err := client.New(dockerClientOptionsInternal(host)...)
 	if err != nil {
 		return "", fmt.Errorf("failed to create Docker probe client: %w", err)
 	}
@@ -111,9 +219,17 @@ func closeDockerClient(ctx context.Context, cli *client.Client, purpose string) 
 	}
 }
 
-// GetClient returns a singleton Docker client instance.
-// It initializes the client on the first call.
+// GetClient returns the Docker client for the environment the request is being
+// served for, falling back to the manager's own daemon.
+//
+// Agent environments are proxied to their agent over HTTP and never reach this
+// method; "docker-host" environments are served in-process, so the middleware
+// puts their endpoint in the request context.
 func (s *DockerClientService) GetClient(ctx context.Context) (*client.Client, error) {
+	if host := s.HostForContext(ctx); host != "" {
+		return s.GetHostClient(ctx, host)
+	}
+
 	s.mu.Lock()
 	if s.Client != nil {
 		cli := s.Client
@@ -197,6 +313,24 @@ func (s *DockerClientService) DockerHost() string {
 
 // Close closes the cached Docker client.
 func (s *DockerClientService) Close() {
+	s.hostMu.Lock()
+	hostClients := s.hostClients
+	s.hostClients = nil
+	s.hostMu.Unlock()
+	for host, cli := range hostClients {
+		closeDockerClient(context.Background(), cli, "shutdown "+host)
+	}
+
+	s.hostEventMu.Lock()
+	hostEventStops := s.hostEventStops
+	s.hostEventStops = nil
+	s.hostEventMu.Unlock()
+	for _, stop := range hostEventStops {
+		if stop != nil {
+			stop()
+		}
+	}
+
 	s.mu.Lock()
 	oldClient := s.Client
 	s.Client = nil
@@ -214,14 +348,59 @@ func (s *DockerClientService) EventBus() *bus.DockerEventBus {
 	return s.eventBus
 }
 
+// HostEventBus returns the event bus of an explicit Docker endpoint and makes sure that endpoint is
+// being streamed into it. Each "docker-host" environment gets its own bus so a consumer can tell
+// which daemon produced an event — the manager's own daemon keeps publishing on EventBus().
+//
+// Calling this again for the same endpoint replaces the previous stream, so a caller may use its own
+// lifetime as the stream's lifetime.
+func (s *DockerClientService) HostEventBus(ctx context.Context, host string) *bus.DockerEventBus {
+	host = strings.TrimSpace(host)
+	if host == "" || host == s.DockerHost() {
+		return s.EventBus()
+	}
+
+	s.hostEventMu.Lock()
+	if s.hostEventBuses == nil {
+		s.hostEventBuses = make(map[string]*bus.DockerEventBus)
+	}
+	eventBus, ok := s.hostEventBuses[host]
+	if !ok {
+		eventBus = bus.NewDockerEventBus()
+		s.hostEventBuses[host] = eventBus
+	}
+	streamCtx, cancel := context.WithCancel(ctx)
+	if s.hostEventStops == nil {
+		s.hostEventStops = make(map[string]context.CancelFunc)
+	}
+	if previous := s.hostEventStops[host]; previous != nil {
+		previous()
+	}
+	s.hostEventStops[host] = cancel
+	s.hostEventMu.Unlock()
+
+	go s.watchEventsInternal(streamCtx, host, eventBus)
+	return eventBus
+}
+
 func (s *DockerClientService) WatchEvents(ctx context.Context) {
+	s.watchEventsInternal(ctx, "", s.EventBus())
+}
+
+// watchEventsInternal streams one daemon's events into eventBus until ctx is done. An empty host
+// means the manager's own daemon.
+func (s *DockerClientService) watchEventsInternal(ctx context.Context, host string, eventBus *bus.DockerEventBus) {
 	eventBackoff := backoff.NewExponentialBackOff()
 	eventBackoff.InitialInterval = 500 * time.Millisecond
 	eventBackoff.MaxInterval = 30 * time.Second
+	logArgs := []any{}
+	if host != "" {
+		logArgs = append(logArgs, "host", host)
+	}
 
 	for ctx.Err() == nil {
-		if dockerClient, err := s.GetClient(ctx); err != nil {
-			slog.WarnContext(ctx, "failed to connect to Docker event stream", "error", err)
+		if dockerClient, err := s.eventStreamClientInternal(ctx, host); err != nil {
+			slog.WarnContext(ctx, "failed to connect to Docker event stream", append(append([]any{}, logArgs...), "error", err)...)
 		} else {
 			result := dockerClient.Events(ctx, client.EventsListOptions{})
 			streamStart := time.Now()
@@ -239,14 +418,14 @@ func (s *DockerClientService) WatchEvents(ctx context.Context) {
 					if msg.TimeNano == 0 {
 						msg.TimeNano = time.Now().UnixNano()
 					}
-					s.EventBus().Publish(msg)
+					eventBus.Publish(msg)
 				case recvErr, ok := <-result.Err:
 					streamErr = kit.Ternary(ok, recvErr, nil)
 					break stream
 				}
 			}
 			if streamErr != nil && !errors.Is(streamErr, context.Canceled) && !errors.Is(streamErr, io.EOF) {
-				slog.WarnContext(ctx, "Docker event stream stopped", "error", streamErr)
+				slog.WarnContext(ctx, "Docker event stream stopped", append(append([]any{}, logArgs...), "error", streamErr)...)
 			}
 			// Only a stream that stayed up counts as recovery, so a daemon that drops connections immediately keeps backing off.
 			if time.Since(streamStart) >= dockerEventStreamHealthyAfter {
@@ -264,12 +443,22 @@ func (s *DockerClientService) WatchEvents(ctx context.Context) {
 	}
 }
 
-// listCoalesced shares one detached op among concurrent callers; each waiter stops on its own
-// context, nothing is cached, and the shared result must be treated as immutable.
-func listCoalesced[T any](ctx context.Context, group *singleflight.Group, op func(context.Context) (T, error)) (T, error) {
+func (s *DockerClientService) eventStreamClientInternal(ctx context.Context, host string) (*client.Client, error) {
+	if host == "" {
+		return s.GetClient(ctx)
+	}
+	return s.GetHostClient(ctx, host)
+}
+
+// listCoalesced shares one detached op among concurrent callers of the same Docker daemon; each
+// waiter stops on its own context, nothing is cached, and the shared result must be treated as
+// immutable. The flight key carries the daemon the caller is scoped to: the detached op resolves
+// its client from the winner's context, so sharing a flight across docker-host environments would
+// hand one environment another daemon's inventory.
+func listCoalesced[T any](ctx context.Context, s *DockerClientService, group *singleflight.Group, op func(context.Context) (T, error)) (T, error) {
 	var zero T
 
-	ch := group.DoChan("list", func() (any, error) {
+	ch := group.DoChan("list\x00"+s.HostForContext(ctx), func() (any, error) {
 		return op(context.WithoutCancel(ctx))
 	})
 
@@ -305,7 +494,7 @@ func callAPI[T any](ctx context.Context, s *DockerClientService, op func(context
 }
 
 func (s *DockerClientService) ListContainers(ctx context.Context) ([]container.Summary, error) {
-	return listCoalesced(ctx, &s.containerListFlight, func(ctx context.Context) ([]container.Summary, error) {
+	return listCoalesced(ctx, s, &s.containerListFlight, func(ctx context.Context) ([]container.Summary, error) {
 		return callAPI(ctx, s, func(ctx context.Context, dockerClient *client.Client) ([]container.Summary, error) {
 			containerList, err := dockerClient.ContainerList(ctx, client.ContainerListOptions{All: true})
 			if err != nil {
@@ -317,7 +506,7 @@ func (s *DockerClientService) ListContainers(ctx context.Context) ([]container.S
 }
 
 func (s *DockerClientService) ListImages(ctx context.Context) ([]image.Summary, error) {
-	return listCoalesced(ctx, &s.imageListFlight, func(ctx context.Context) ([]image.Summary, error) {
+	return listCoalesced(ctx, s, &s.imageListFlight, func(ctx context.Context) ([]image.Summary, error) {
 		return callAPI(ctx, s, func(ctx context.Context, dockerClient *client.Client) ([]image.Summary, error) {
 			imageList, err := dockerClient.ImageList(ctx, client.ImageListOptions{All: true})
 			if err != nil {
@@ -338,7 +527,9 @@ func (s *DockerClientService) listNetworks(ctx context.Context) ([]network.Summa
 	})
 }
 
-func (s *DockerClientService) GetSnapshot(ctx context.Context, envID string) (*dashboard.DockerSnapshot, error) {
+// GetSnapshot builds a Docker snapshot for the environment carried by ctx; the caller selects the
+// environment through the context rather than a separate parameter.
+func (s *DockerClientService) GetSnapshot(ctx context.Context) (*dashboard.DockerSnapshot, error) {
 	g, groupCtx := errgroup.WithContext(ctx)
 
 	var containers []container.Summary

@@ -2,9 +2,12 @@ package patch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/user"
 	"github.com/libtnb/sqlite"
 	"github.com/moby/moby/client"
+	"github.com/project-copacetic/copacetic/pkg/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -24,6 +28,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/vulnerability"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 )
 
@@ -99,7 +104,7 @@ func patchFeatureSettings(t *testing.T) (*settings.SettingsService, *database.DB
 	t.Helper()
 	gdb, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, gdb.AutoMigrate(&settings.SettingVariable{}, &vulnerability.VulnerabilityScanRecord{}, &vulnerability.VulnerabilityReportRecord{}, &ImagePatchRecord{}))
+	require.NoError(t, gdb.AutoMigrate(&settings.SettingVariable{}, &settings.EnvironmentSetting{}, &vulnerability.VulnerabilityScanRecord{}, &vulnerability.VulnerabilityReportRecord{}, &ImagePatchRecord{}))
 	db := &database.DB{DB: gdb}
 	svc, err := settings.NewSettingsService(t.Context(), db)
 	if err == nil {
@@ -139,7 +144,7 @@ func TestQueuedReportPatchStopsWhenFeatureDisabled(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = svc.runPatch(t.Context(), record, imagepatch.PatchOptions{ScanID: "test-image"}, nil, "", "")
+		_ = svc.runPatch(t.Context(), "", record, imagepatch.PatchOptions{ScanID: "test-image"}, nil, "", "")
 	}()
 	require.NoError(t, settingsSvc.SetBoolSetting(t.Context(), features.VulnerabilityManagementSettingKey, false))
 	// The active patch owns its slot until it finishes normally.
@@ -181,4 +186,231 @@ func TestDisabledFeatureSkipsPatchVerificationScan(t *testing.T) {
 		svc.verifyPatchedImage(t.Context(), &ImagePatchRecord{EnvironmentID: "0", PatchedRef: "test:patched"}, "")
 	})
 	require.Equal(t, int32(1), inspected.Load())
+}
+
+// stubDockerServer is a minimal Docker API for patch tests: /_ping for API
+// negotiation, /info for the image-store check, and image inspect.
+type stubDockerServer struct {
+	server     *httptest.Server
+	requests   atomic.Int32
+	containerd bool
+}
+
+func newStubDockerServer(t *testing.T, containerd bool) *stubDockerServer {
+	t.Helper()
+	stub := &stubDockerServer{containerd: containerd}
+	stub.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stub.requests.Add(1)
+		path := r.URL.Path
+		switch {
+		case strings.HasSuffix(path, "/_ping"):
+			w.Header().Set("API-Version", "1.41")
+			_, _ = w.Write([]byte("OK"))
+		case strings.HasSuffix(path, "/info"):
+			driver := "overlay2"
+			if stub.containerd {
+				driver = "io.containerd.snapshotter.v1"
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"DriverStatus":[["driver-type",%q]]}`, driver)
+		case strings.Contains(path, "/images/") && strings.HasSuffix(path, "/json"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"Id":"sha256:test-image","RepoTags":["nginx:latest"],` +
+				`"RepoDigests":["nginx@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],` +
+				`"Os":"linux","Architecture":"amd64"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(stub.server.Close)
+	return stub
+}
+
+// withDockerHostEnv installs a known DOCKER_HOST for a test and restores
+// whatever the process had before it, including "unset".
+func withDockerHostEnv(t *testing.T, value string, set bool) {
+	t.Helper()
+	previous, wasSet := os.LookupEnv("DOCKER_HOST")
+	t.Cleanup(func() {
+		if wasSet {
+			require.NoError(t, os.Setenv("DOCKER_HOST", previous))
+		} else {
+			require.NoError(t, os.Unsetenv("DOCKER_HOST"))
+		}
+	})
+	if set {
+		require.NoError(t, os.Setenv("DOCKER_HOST", value))
+	} else {
+		require.NoError(t, os.Unsetenv("DOCKER_HOST"))
+	}
+}
+
+func assertDockerHostEnv(t *testing.T, wantValue string, wantSet bool) {
+	t.Helper()
+	got, gotSet := os.LookupEnv("DOCKER_HOST")
+	require.Equal(t, wantSet, gotSet, "DOCKER_HOST set-ness must be restored")
+	if wantSet {
+		require.Equal(t, wantValue, got, "DOCKER_HOST value must be restored")
+	}
+}
+
+func TestRunWithDockerHostScopesPatchAndRestoresEnvironment(t *testing.T) {
+	const (
+		managerHost = "tcp://manager.example:2375"
+		targetHost  = "tcp://192.168.2.33:6001"
+	)
+	tests := []struct {
+		name    string
+		initial string
+		wasSet  bool
+		host    string
+		runErr  error
+	}{
+		{name: "restores the previous value", initial: managerHost, wasSet: true, host: targetHost},
+		{name: "restores an unset variable", wasSet: false, host: targetHost},
+		{name: "leaves an already-correct value alone", initial: targetHost, wasSet: true, host: targetHost},
+		{name: "restores after an error", initial: managerHost, wasSet: true, host: targetHost, runErr: errors.New("patch failed")},
+		{name: "manager daemon leaves the variable untouched", initial: managerHost, wasSet: true, host: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withDockerHostEnv(t, tt.initial, tt.wasSet)
+			svc := &Service{}
+			var seenHost string
+			var seenSet bool
+			err := svc.runWithDockerHost(tt.host, func() error {
+				seenHost, seenSet = os.LookupEnv("DOCKER_HOST")
+				return tt.runErr
+			})
+			if tt.runErr != nil {
+				require.ErrorIs(t, err, tt.runErr)
+			} else {
+				require.NoError(t, err)
+			}
+			wantDuring := tt.host
+			if wantDuring == "" {
+				wantDuring = tt.initial
+			}
+			require.True(t, seenSet, "DOCKER_HOST must be visible while the patch runs")
+			require.Equal(t, wantDuring, seenHost)
+			assertDockerHostEnv(t, tt.initial, tt.wasSet)
+		})
+	}
+}
+
+func TestRunWithDockerHostRestoresAfterPanic(t *testing.T) {
+	withDockerHostEnv(t, "tcp://manager.example:2375", true)
+	svc := &Service{}
+	require.Panics(t, func() {
+		_ = svc.runWithDockerHost("tcp://192.168.2.33:6001", func() error { panic("boom") })
+	})
+	assertDockerHostEnv(t, "tcp://manager.example:2375", true)
+}
+
+// newDockerHostPatchService builds a Service whose "manager daemon" is a stub
+// endpoint, with platform pinning disabled so no registry lookup happens.
+func newDockerHostPatchService(t *testing.T, managerHost string) *Service {
+	t.Helper()
+	settingsSvc, db := patchFeatureSettings(t)
+	require.NoError(t, settingsSvc.SetBoolSetting(t.Context(), "imagePatchAllPlatforms", true))
+	return &Service{
+		settingsService: settingsSvc,
+		db:              db,
+		dockerService:   docker.NewDockerClientService(t.Context(), nil, &config.Config{DockerHost: managerHost}, nil),
+		patchSlot:       make(chan struct{}, 1),
+	}
+}
+
+func TestPatchImageRunsAgainstDockerHostEnvironment(t *testing.T) {
+	manager := newStubDockerServer(t, true)
+	target := newStubDockerServer(t, true)
+	svc := newDockerHostPatchService(t, manager.server.URL)
+	withDockerHostEnv(t, manager.server.URL, true)
+
+	var copaCalls atomic.Int32
+	var copaHost string
+	var copaSet bool
+	svc.patchFn = func(context.Context, *types.Options) error {
+		copaCalls.Add(1)
+		copaHost, copaSet = os.LookupEnv("DOCKER_HOST")
+		return nil
+	}
+
+	ctx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-remote", DockerHost: target.server.URL})
+	record, run, err := svc.startPatch(ctx, "env-remote", "test-image", imagepatch.PatchOptions{}, user.Actor{}, "")
+	require.NoError(t, err, "docker-host patching must no longer be rejected")
+	require.NotNil(t, run)
+	require.NoError(t, run())
+
+	require.Equal(t, int32(1), copaCalls.Load())
+	require.True(t, copaSet)
+	require.Equal(t, target.server.URL, copaHost, "copa must see the docker-host daemon in DOCKER_HOST")
+	require.Positive(t, target.requests.Load(), "validation and patching must use the target daemon")
+	require.Zero(t, manager.requests.Load(), "the manager's own daemon must not be touched")
+	require.Equal(t, "env-remote", record.EnvironmentID)
+	assertDockerHostEnv(t, manager.server.URL, true)
+}
+
+func TestDockerHostPatchWithoutContainerdImageStoreStillFails(t *testing.T) {
+	manager := newStubDockerServer(t, true)
+	target := newStubDockerServer(t, false)
+	svc := newDockerHostPatchService(t, manager.server.URL)
+
+	var copaCalls atomic.Int32
+	svc.patchFn = func(context.Context, *types.Options) error {
+		copaCalls.Add(1)
+		return nil
+	}
+
+	ctx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-remote", DockerHost: target.server.URL})
+	_, _, err := svc.startPatch(ctx, "env-remote", "test-image", imagepatch.PatchOptions{}, user.Actor{}, "")
+	require.ErrorIs(t, err, common.ErrPatchRequiresContainerdImageStore)
+	require.ErrorIs(t, err, common.ErrBadRequest, "the client must still receive a 400-class error")
+	require.Zero(t, copaCalls.Load(), "copa must not run against a daemon without the image store")
+	require.Positive(t, target.requests.Load())
+	require.Zero(t, manager.requests.Load())
+}
+
+func TestRunPatchRestoresDockerHostOnEveryOutcome(t *testing.T) {
+	manager := newStubDockerServer(t, true)
+	targetHost := "tcp://192.168.2.33:6001"
+	tests := []struct {
+		name      string
+		patchErr  error
+		cancelCtx bool
+		wantErr   bool
+	}{
+		{name: "success"},
+		{name: "failure", patchErr: errors.New("patch failed"), wantErr: true},
+		{name: "cancellation", cancelCtx: true, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc := newDockerHostPatchService(t, manager.server.URL)
+			withDockerHostEnv(t, manager.server.URL, true)
+			record := &ImagePatchRecord{EnvironmentID: "env-remote", OriginalRef: "nginx:latest", PatchedRef: "nginx:latest-patched", Status: string(imagepatch.PatchStatusPatching)}
+			require.NoError(t, svc.db.Create(record).Error)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			var seenHost string
+			svc.patchFn = func(patchCtx context.Context, _ *types.Options) error {
+				seenHost = os.Getenv("DOCKER_HOST")
+				if tt.cancelCtx {
+					cancel()
+					return patchCtx.Err()
+				}
+				return tt.patchErr
+			}
+
+			err := svc.runPatch(ctx, targetHost, record, imagepatch.PatchOptions{}, nil, "nginx:latest", "")
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, targetHost, seenHost, "the patch must run with the environment's daemon")
+			assertDockerHostEnv(t, manager.server.URL, true)
+		})
+	}
 }

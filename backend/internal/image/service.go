@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/distribution/reference"
-	"github.com/getarcaneapp/arcane/types/v2"
 	activitytypes "github.com/getarcaneapp/arcane/types/v2/activity"
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 	"github.com/getarcaneapp/arcane/types/v2/features"
@@ -46,6 +45,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/vulnerability"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/registryauth"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow"
@@ -124,7 +124,7 @@ func (s *ImageService) RegisterWorkflows(engine *flow.Engine) error {
 				if !s.settingsService.IsFeatureEnabled(ctx, features.VulnerabilityManagement) {
 					return []patch.Target{}, nil
 				}
-				targets, err := s.patch.Targets(ctx, types.LocalDockerEnvironmentID)
+				targets, err := s.patch.Targets(ctx, envcontext.EnvironmentIDOrDefault(ctx))
 				if errors.Is(err, common.ErrPatchRequiresContainerdImageStore) {
 					return nil, err
 				}
@@ -142,7 +142,7 @@ func (s *ImageService) RegisterWorkflows(engine *flow.Engine) error {
 					return patchSlot{Skipped: true}, nil
 				}
 				// The record ID is stable per task, so a redelivery resumes its own patch.
-				return nil, s.patch.PatchTarget(ctx, types.LocalDockerEnvironmentID, target, fmt.Sprintf("%s-%d", t.ActivityID(), t.Index()))
+				return nil, s.patch.PatchTarget(ctx, envcontext.EnvironmentIDOrDefault(ctx), target, fmt.Sprintf("%s-%d", t.ActivityID(), t.Index()))
 			}),
 				workflow.WithItemsFrom("discover"),
 				workflow.WithMaxParallel(1),
@@ -299,9 +299,9 @@ func (s *ImageService) RemoveImage(ctx context.Context, id string, force bool, u
 		PruneChildren: true,
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("image", id, imageName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "image", id, imageName)()
 	if inspectErr == nil {
-		defer s.eventService.BeginDockerResourceSuppressionWindow("image", imageDetails.ID, "")()
+		defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "image", imageDetails.ID, "")()
 		tagReleases := make([]func(), 0, len(imageDetails.RepoTags))
 		defer func() {
 			for _, release := range slices.Backward(tagReleases) {
@@ -309,7 +309,7 @@ func (s *ImageService) RemoveImage(ctx context.Context, id string, force bool, u
 			}
 		}()
 		for _, tag := range imageDetails.RepoTags {
-			tagReleases = append(tagReleases, s.eventService.BeginDockerResourceSuppressionWindow("image", "", tag))
+			tagReleases = append(tagReleases, s.eventService.BeginDockerResourceSuppressionWindow(ctx, "image", "", tag))
 		}
 	}
 	removed, err := dockerClient.ImageRemove(ctx, id, options)
@@ -358,7 +358,7 @@ func (s *ImageService) PullImage(ctx context.Context, imageName string, progress
 	initialHasAuth := pullOptions.RegistryAuth != ""
 	retriedWithoutAuth := false
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("image", "", imageName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "image", "", imageName)()
 	reader, err := dockerClient.ImagePull(ctx, imageName, pullOptions)
 	if err != nil && ShouldRetryAnonymousPull(pullOptions, err) {
 		retriedWithoutAuth = true
@@ -461,7 +461,7 @@ func (s *ImageService) TagImage(ctx context.Context, source string, req imagetyp
 		return fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("image", "", target)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "image", "", target)()
 	_, err = dockerClient.ImageTag(ctx, client.ImageTagOptions{Source: source, Target: target})
 	if err != nil {
 		s.eventService.LogErrorEvent(ctx, event.EventTypeImageError, "image", "", source, user.ID, user.Username, "0", err, database.JSON{"action": "tag", "target": target})

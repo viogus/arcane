@@ -184,7 +184,7 @@ func (s *NetworkService) CreateNetwork(ctx context.Context, name string, options
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("network", "", name)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "network", "", name)()
 	response, err := dockerClient.NetworkCreate(ctx, name, options)
 	if err != nil {
 		s.eventService.LogErrorEvent(ctx, event.EventTypeNetworkError, "network", "", name, user.ID, user.Username, "0", err, database.JSON{"action": "create", "driver": options.Driver})
@@ -223,7 +223,7 @@ func (s *NetworkService) RemoveNetwork(ctx context.Context, id string, user user
 	networkInfo, err := compat.NetworkInspectWithCompatibility(ctx, dockerClient, id, client.NetworkInspectOptions{})
 	networkName := kit.Ternary(err == nil, networkInfo.Network.Name, id)
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("network", id, networkName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "network", id, networkName)()
 	if _, networkRemoveErr := dockerClient.NetworkRemove(ctx, id, client.NetworkRemoveOptions{}); networkRemoveErr != nil {
 		s.eventService.LogErrorEvent(ctx, event.EventTypeNetworkError, "network", id, networkName, user.ID, user.Username, "0", networkRemoveErr, database.JSON{"action": "delete"})
 		return fmt.Errorf("failed to remove network: %w", networkRemoveErr)

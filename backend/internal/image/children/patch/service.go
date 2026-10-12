@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/containerd/platforms"
@@ -80,6 +81,15 @@ type Service struct {
 	// patchSlot serializes patch executions: one BuildKit patch at a time, and
 	// the process-wide logrus mirror only ever carries one run's output.
 	patchSlot chan struct{}
+
+	// dockerHostMu guards process-wide DOCKER_HOST swaps. patchSlot already
+	// serializes patch runs, but the mutex keeps the "one swapped goroutine"
+	// invariant local to the swap helper.
+	dockerHostMu sync.Mutex
+
+	// patchFn runs Copacetic for one patch. It defaults to patch.Patch; tests
+	// substitute it to observe the DOCKER_HOST window without running BuildKit.
+	patchFn func(context.Context, *types.Options) error
 }
 
 func NewService(
@@ -113,6 +123,7 @@ func NewService(
 		registryService:      registryService,
 		vulnerabilityService: vulnerabilityService,
 		patchSlot:            make(chan struct{}, 1),
+		patchFn:              patch.Patch,
 	}
 }
 
@@ -152,6 +163,13 @@ func (s *Service) startPatch(
 	user usertypes.Actor,
 	recordID string,
 ) (*ImagePatchRecord, func() error, error) {
+	// Copa resolves the daemon it patches, loads images from and pushes to from the process-wide
+	// DOCKER_HOST. Validation below already runs against the environment's own daemon; the patch
+	// itself redirects that variable for its duration (see runWithDockerHost), so record the host
+	// the environment resolves to here, while ctx still carries the target.
+	// Empty means the manager's own daemon, whose host the process variable already holds.
+	scopedHost := s.dockerService.HostForContext(ctx)
+
 	var existing ImagePatchRecord
 	if recordID != "" {
 		if err := s.db.WithContext(ctx).Where("id = ?", recordID).Limit(1).Find(&existing).Error; err != nil {
@@ -278,12 +296,51 @@ func (s *Service) startPatch(
 		return nil, nil, saveErr
 	}
 
-	slog.InfoContext(ctx, "image patch queued", "environmentId", envID, "imageRef", imageRef, "patchedRef", patchedRef, "mode", mode, "patchTarget", copaImageRef)
-	return record, func() error { return s.runPatch(runCtx, record, opts, reportData, copaImageRef, activityID) }, nil
+	slog.InfoContext(ctx, "image patch queued", "environmentId", envID, "imageRef", imageRef, "patchedRef", patchedRef, "mode", mode, "patchTarget", copaImageRef, "dockerHost", scopedHost)
+	return record, func() error {
+		return s.runPatch(runCtx, scopedHost, record, opts, reportData, copaImageRef, activityID)
+	}, nil
+}
+
+// runWithDockerHost points the process-wide DOCKER_HOST at host for the duration of fn and restores
+// the previous value (or its absence) afterwards on every path. Copacetic discovers the daemon it
+// patches through that variable, so a docker-host patch must redirect it around the patch call.
+// host == "" means the manager's own daemon, whose address the process variable already holds, so
+// the variable is left untouched. dockerHostMu keeps at most one goroutine swapped at a time.
+func (s *Service) runWithDockerHost(host string, fn func() error) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fn()
+	}
+
+	s.dockerHostMu.Lock()
+	defer s.dockerHostMu.Unlock()
+
+	previous, wasSet := os.LookupEnv("DOCKER_HOST")
+	if wasSet && previous == host {
+		return fn()
+	}
+	if err := os.Setenv("DOCKER_HOST", host); err != nil {
+		// Without the redirect copa would patch the manager's own daemon, so fail instead.
+		return fmt.Errorf("failed to point DOCKER_HOST at docker host %s: %w", host, err)
+	}
+	defer func() {
+		var restoreErr error
+		if wasSet {
+			restoreErr = os.Setenv("DOCKER_HOST", previous)
+		} else {
+			restoreErr = os.Unsetenv("DOCKER_HOST")
+		}
+		if restoreErr != nil {
+			// Nothing else can repair the process variable; make the leak loud.
+			slog.ErrorContext(context.Background(), "failed to restore DOCKER_HOST after image patch", "error", restoreErr) //nolint:forbidigo // Restoration has no request context.
+		}
+	}()
+	return fn()
 }
 
 // runPatch executes one recorded patch with Copacetic and settles its record and activity.
-func (s *Service) runPatch(ctx context.Context, record *ImagePatchRecord, opts imagepatch.PatchOptions, reportData []byte, copaImageRef, activityID string) (runErr error) {
+func (s *Service) runPatch(ctx context.Context, scopedHost string, record *ImagePatchRecord, opts imagepatch.PatchOptions, reportData []byte, copaImageRef, activityID string) (runErr error) {
 	ctx, span := otel.Tracer(tracing.InstrumentationName).Start(ctx, "image.patch", trace.WithAttributes(
 		attribute.String("arcane.environment.id", record.EnvironmentID),
 		attribute.String("arcane.image.patch_id", record.ID),
@@ -375,7 +432,13 @@ func (s *Service) runPatch(ctx context.Context, record *ImagePatchRecord, opts i
 	s.appendPatchActivity(ctx, activityID, 30, "Patching image packages via BuildKit")
 	patchOut := activitylib.NewWriter(ctx, s.activityService, activityID, nil, "Patching image")
 	removeMirror := logging.AddLogrusMirror(patchOut)
-	patchErr := patch.Patch(ctx, copaOpts)
+	patchFn := s.patchFn
+	if patchFn == nil {
+		patchFn = patch.Patch
+	}
+	// Swap DOCKER_HOST only around copa itself: it is process-global, so the window stays as
+	// narrow as the one call and the previous value is restored before any other work resumes.
+	patchErr := s.runWithDockerHost(scopedHost, func() error { return patchFn(ctx, copaOpts) })
 	removeMirror()
 	activitylib.FlushWriter(patchOut)
 	durationMs := time.Since(startTime).Milliseconds()

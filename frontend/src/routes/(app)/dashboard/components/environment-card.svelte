@@ -17,13 +17,12 @@
 	import {
 		formatPercent,
 		getActivityMeta,
-		getCapacityLabel,
 		getCpuMetric,
 		getCpuMetricLabel,
-		getDiskMetric,
+		getDiskMetricDisplay,
 		getGpuMetric,
 		getGpuMetricLabel,
-		getMemoryMetric,
+		getMemoryMetricDisplay,
 		getRoleBadge,
 		shouldLoadEnvironment
 	} from '../overview.helpers';
@@ -66,9 +65,12 @@
 	const activity = $derived(getActivityMeta(environment));
 	const versionInfo = $derived(overview.versionInfo ?? (debugUpgrade ? debugVersionInfo : null));
 	const newestVersionLabel = $derived(versionInfo?.newestVersion ?? versionInfo?.newestDigest?.slice(0, 12));
+	// docker-host environments are read through the Docker API, so their tiles show container
+	// memory against the host's capacity and the daemon's data footprint (see the helpers).
+	const isDockerHostEnvironment = $derived(Boolean(environment.dockerHost));
 	const cpuMetric = $derived(getCpuMetric(systemStats));
-	const memoryMetric = $derived(getMemoryMetric(systemStats));
-	const diskMetric = $derived(getDiskMetric(systemStats));
+	const memoryMetric = $derived(getMemoryMetricDisplay(systemStats, isDockerHostEnvironment));
+	const diskMetric = $derived(getDiskMetricDisplay(systemStats, isDockerHostEnvironment));
 	const gpuMetric = $derived(getGpuMetric(systemStats));
 </script>
 
@@ -133,7 +135,7 @@
 					</div>
 
 					<div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-2xs text-muted-foreground/70">
-						<span class="font-mono">{environment.apiUrl}</span>
+						<span class="font-mono">{environment.dockerHost || environment.apiUrl}</span>
 						<span>•</span>
 						<span title={activity.title}>{activity.label}: {activity.value}</span>
 					</div>
@@ -234,18 +236,18 @@
 								<MetricTile
 									title={m.memory_usage()}
 									icon={MemoryStickIcon}
-									value={formatPercent(memoryMetric)}
-									label={getCapacityLabel(systemStats?.memoryUsage, systemStats?.memoryTotal)}
+									value={memoryMetric.value}
+									label={memoryMetric.label}
 									labelClass="truncate"
-									meterValue={memoryMetric}
+									meterValue={memoryMetric.meterValue}
 								/>
 								<MetricTile
 									title={m.dashboard_meter_disk()}
 									icon={VolumesIcon}
-									value={formatPercent(diskMetric)}
-									label={getCapacityLabel(systemStats?.diskUsage, systemStats?.diskTotal)}
+									value={diskMetric.value}
+									label={diskMetric.label}
 									labelClass="truncate"
-									meterValue={diskMetric}
+									meterValue={diskMetric.meterValue}
 								/>
 								{#if gpuMetric !== null}
 									<MetricTile

@@ -28,6 +28,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm/children/secrets"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm/children/services"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm/children/stacks"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 )
 
@@ -39,8 +40,9 @@ const (
 // SwarmService provides Docker Swarm cluster operations and coordinates its
 // services, nodes, stacks, configs, and secrets features.
 type SwarmService struct {
-	dockerService *docker.DockerClientService
-	kvService     *kv.KVService
+	dockerService      *docker.DockerClientService
+	kvService          *kv.KVService
+	environmentService *environment.EnvironmentService
 
 	services *services.Service
 	nodes    *nodes.Service
@@ -56,7 +58,7 @@ func NewSwarmService(
 	registryService *registry.ContainerRegistryService,
 	environmentService *environment.EnvironmentService,
 ) *SwarmService {
-	s := &SwarmService{dockerService: dockerService, kvService: kvService}
+	s := &SwarmService{dockerService: dockerService, kvService: kvService, environmentService: environmentService}
 
 	var registryAuth func(context.Context, string) (string, error)
 	if registryService != nil {
@@ -64,7 +66,7 @@ func NewSwarmService(
 	}
 
 	s.services = services.NewService(dockerService.GetClient, s.ensureSwarmManagerInternal, s.listTasksPaginatedWithFiltersInternal)
-	s.nodes = nodes.NewService(dockerService.GetClient, s.ensureSwarmManagerInternal, s.listTasksPaginatedWithFiltersInternal, s.GetSwarmJoinTokens, environmentService)
+	s.nodes = nodes.NewService(dockerService.GetClient, s.ensureSwarmManagerInternal, s.listTasksPaginatedWithFiltersInternal, s.GetSwarmJoinTokens, s.joinSwarmInternal, environmentService)
 	s.stacks = stacks.NewService(dockerService.GetClient, s.ensureSwarmManagerInternal, s.listTasksPaginatedWithFiltersInternal, s.services.PaginateSummaries, registryAuth, settingsService)
 	s.configs = configs.NewService(dockerService.GetClient, s.ensureSwarmManagerInternal)
 	s.secrets = secrets.NewService(dockerService.GetClient, s.ensureSwarmManagerInternal)
@@ -92,6 +94,31 @@ func (s *SwarmService) IsEnabled(ctx context.Context) (bool, error) {
 	}
 
 	return enabled, nil
+}
+
+// IsEnabledForContext reports whether the environment the request is scoped to
+// is in a swarm. The manager's own daemon answers for the local environment,
+// while a docker-host environment reports its own daemon's state, so the flag is
+// not shared between environments. When the daemon cannot be inspected it falls
+// back to the persisted manager-wide flag.
+func (s *SwarmService) IsEnabledForContext(ctx context.Context) bool {
+	if s == nil {
+		return false
+	}
+
+	if s.dockerService != nil {
+		if dockerClient, err := s.dockerService.GetClient(ctx); err == nil {
+			if infoResult, infoErr := dockerClient.Info(ctx, client.InfoOptions{}); infoErr == nil {
+				return infoResult.Info.Swarm.LocalNodeState == swarm.LocalNodeStateActive
+			}
+		}
+	}
+
+	enabled, err := s.IsEnabled(ctx)
+	if err != nil {
+		return false
+	}
+	return enabled
 }
 
 func (s *SwarmService) ListTasksPaginated(ctx context.Context, params pagination.QueryParams) ([]swarmtypes.TaskSummary, pagination.Response, error) {
@@ -162,6 +189,19 @@ func (s *SwarmService) InitSwarm(ctx context.Context, req swarmtypes.SwarmInitRe
 }
 
 func (s *SwarmService) JoinSwarm(ctx context.Context, req swarmtypes.SwarmJoinRequest) error {
+	if err := s.joinSwarmInternal(ctx, req); err != nil {
+		return err
+	}
+
+	s.persistSwarmEnabledStateInternal(ctx, true)
+
+	return nil
+}
+
+// joinSwarmInternal joins the swarm cluster the request is scoped to without
+// persisting the manager's global swarm flag. nodes.Service uses it to join a
+// docker-host environment in-process against that environment's own daemon.
+func (s *SwarmService) joinSwarmInternal(ctx context.Context, req swarmtypes.SwarmJoinRequest) error {
 	dockerClient, err := s.dockerService.GetClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to connect to Docker: %w", err)
@@ -177,8 +217,6 @@ func (s *SwarmService) JoinSwarm(ctx context.Context, req swarmtypes.SwarmJoinRe
 	}); swarmJoinErr != nil {
 		return fmt.Errorf("failed to join swarm: %w", swarmJoinErr)
 	}
-
-	s.persistSwarmEnabledStateInternal(ctx, true)
 
 	return nil
 }
@@ -458,14 +496,40 @@ func (s *SwarmService) SyncSwarmEnabledState(ctx context.Context) error {
 	return nil
 }
 
+// persistSwarmEnabledStateInternal records the manager's own swarm flag.
+//
+// A docker-host environment is served in-process by this manager, but its swarm
+// lifecycle applies to that environment's daemon, so it must not move the
+// manager's global flag. The flag is only written for the manager's own
+// environment (and for callers that carry no environment target, such as the
+// startup sync).
 func (s *SwarmService) persistSwarmEnabledStateInternal(ctx context.Context, enabled bool) {
-	if s.kvService == nil {
+	if s == nil || s.kvService == nil {
+		return
+	}
+	if s.servesNonLocalEnvironmentInternal(ctx) {
 		return
 	}
 
 	if err := s.kvService.SetBool(ctx, KVKeySwarmEnabled, enabled); err != nil {
 		slog.WarnContext(ctx, "Failed to persist swarm enabled state", "enabled", enabled, "error", err)
 	}
+}
+
+// servesNonLocalEnvironmentInternal reports whether ctx is scoped to an
+// environment other than the manager's own. Agent environments are proxied and
+// never reach this service, so a non-local request is a docker-host environment
+// served in-process; its daemon state must not be written to the manager flag.
+func (s *SwarmService) servesNonLocalEnvironmentInternal(ctx context.Context) bool {
+	environmentID := envcontext.EnvironmentIDFromContext(ctx)
+	if environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return false
+	}
+	if s == nil || s.environmentService == nil {
+		return true
+	}
+	_, inProcess := s.environmentService.InProcessTargetContext(ctx, environmentID)
+	return inProcess
 }
 
 func (s *SwarmService) buildTaskPaginationConfigInternal() pagination.Config[swarmtypes.TaskSummary] {

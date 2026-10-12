@@ -39,6 +39,7 @@ type Service struct {
 	ensureManager      func(ctx context.Context) error
 	listTasks          func(ctx context.Context, filters client.Filters, params pagination.QueryParams) ([]swarmtypes.TaskSummary, pagination.Response, error)
 	localJoinTokens    func(ctx context.Context) (*swarmtypes.SwarmJoinTokensResponse, error)
+	inProcessJoin      func(ctx context.Context, req swarmtypes.SwarmJoinRequest) error
 	environmentService *environment.EnvironmentService
 	identityCache      *hot.HotCache[string, SwarmNodeIdentity]
 }
@@ -48,6 +49,7 @@ func NewService(
 	ensureManager func(ctx context.Context) error,
 	listTasks func(ctx context.Context, filters client.Filters, params pagination.QueryParams) ([]swarmtypes.TaskSummary, pagination.Response, error),
 	localJoinTokens func(ctx context.Context) (*swarmtypes.SwarmJoinTokensResponse, error),
+	inProcessJoin func(ctx context.Context, req swarmtypes.SwarmJoinRequest) error,
 	environmentService *environment.EnvironmentService,
 ) *Service {
 	return &Service{
@@ -55,6 +57,7 @@ func NewService(
 		ensureManager:      ensureManager,
 		listTasks:          listTasks,
 		localJoinTokens:    localJoinTokens,
+		inProcessJoin:      inProcessJoin,
 		environmentService: environmentService,
 		identityCache: hot.NewHotCache[string, SwarmNodeIdentity](hot.LRU, 512).
 			WithTTL(swarmNodeIdentityCacheTTL).
@@ -83,13 +86,23 @@ type swarmNodeAgentCoverage struct {
 	boundEnvsByNodeID  map[string][]environment.Environment
 	candidatesByNodeID map[string][]environment.Environment
 	localIdentity      *SwarmNodeIdentity
+	// localEnvironmentID identifies the environment this process serves in-process,
+	// so its own swarm node is attributed to that environment rather than to a
+	// hardcoded local ID. It is "" when no environment is served in-process.
+	localEnvironmentID string
 	// Resolved once per request rather than per node: the name is user-editable, and
 	// applyNodeAgentCoverageInternal runs in a loop with no context to look it up.
 	localEnvironmentName string
+	// localEnvironmentType mirrors the display type the UI shows for the environment.
+	localEnvironmentType string
 }
 
 func (s *Service) ListNodesPaginated(ctx context.Context, environmentID string, params pagination.QueryParams) ([]swarmtypes.NodeSummary, pagination.Response, error) {
-	if environmentID != "0" && s.environmentService != nil {
+	scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID)
+	if inProcess {
+		ctx = scopedCtx
+	}
+	if !inProcess && s.environmentService != nil {
 		var remote struct {
 			Success bool                     `json:"success"`
 			Data    []swarmtypes.NodeSummary `json:"data"`
@@ -136,7 +149,11 @@ func (s *Service) ListNodesPaginated(ctx context.Context, environmentID string, 
 }
 
 func (s *Service) GetNode(ctx context.Context, environmentID, nodeID string) (*swarmtypes.NodeSummary, error) {
-	if environmentID != "0" && s.environmentService != nil {
+	scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID)
+	if inProcess {
+		ctx = scopedCtx
+	}
+	if !inProcess && s.environmentService != nil {
 		var remote struct {
 			Success bool                   `json:"success"`
 			Data    swarmtypes.NodeSummary `json:"data"`
@@ -234,6 +251,21 @@ func (s *Service) BindNodeAgent(ctx context.Context, parentEnvironmentID, nodeID
 		return nil, err
 	}
 	return bound, nil
+}
+
+// inProcessTargetContextInternal reports whether this process serves the
+// environment's daemon itself. The manager always serves its own environment;
+// a docker-host environment is served in-process too, because it has no agent
+// to proxy to. Agent environments report false so callers keep using the
+// environment proxy.
+func (s *Service) inProcessTargetContextInternal(ctx context.Context, environmentID string) (context.Context, bool) {
+	if s.environmentService == nil {
+		if environmentID == "" || environmentID == environment.LocalEnvironmentID {
+			return ctx, true
+		}
+		return ctx, false
+	}
+	return s.environmentService.InProcessTargetContext(ctx, environmentID)
 }
 
 func (s *Service) GetLocalNodeIdentity(ctx context.Context) (*SwarmNodeIdentity, error) {
@@ -344,12 +376,15 @@ func (s *Service) resolveNodeAgentCoverageInternal(ctx context.Context, environm
 		boundEnvsByNodeID:  boundEnvsByNodeID,
 		candidatesByNodeID: candidatesByNodeID,
 	}
-	if environmentID == environment.LocalEnvironmentID {
-		identity, identityErr := s.GetLocalNodeIdentity(ctx)
-		if identityErr == nil {
+	// A docker-host environment is served in-process, so its own node is the "self"
+	// node just like the manager's local environment.
+	if scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); inProcess {
+		if identity, identityErr := s.GetLocalNodeIdentity(scopedCtx); identityErr == nil {
 			coverage.localIdentity = identity
 		}
-		coverage.localEnvironmentName = s.environmentService.ResolveEnvironmentName(ctx, environment.LocalEnvironmentID)
+		coverage.localEnvironmentID = environmentID
+		coverage.localEnvironmentType = kit.Ternary(environmentID == environment.LocalEnvironmentID, "local", "direct")
+		coverage.localEnvironmentName = s.environmentService.ResolveEnvironmentName(ctx, environmentID)
 	}
 	return coverage, nil
 }
@@ -359,11 +394,15 @@ func (s *Service) applyNodeAgentCoverageInternal(environmentID string, item *swa
 		return
 	}
 	nodeID := strings.TrimSpace(item.ID)
-	if environmentID == environment.LocalEnvironmentID && coverage.localIdentity != nil && coverage.localIdentity.SwarmActive && strings.TrimSpace(coverage.localIdentity.SwarmNodeID) == nodeID {
+	if coverage.localEnvironmentID == environmentID && coverage.localIdentity != nil && coverage.localIdentity.SwarmActive && strings.TrimSpace(coverage.localIdentity.SwarmNodeID) == nodeID {
 		connected := true
 		bindingKind := swarmtypes.NodeAgentBindingKindLocal
-		localID, localType := environment.LocalEnvironmentID, "local"
-		localName := environment.DisplayName(environment.LocalEnvironmentID, coverage.localEnvironmentName)
+		localType := coverage.localEnvironmentType
+		if localType == "" {
+			localType = "local"
+		}
+		localID := coverage.localEnvironmentID
+		localName := environment.DisplayName(coverage.localEnvironmentID, coverage.localEnvironmentName)
 		item.Agent = swarmtypes.NodeAgentStatus{
 			State:           swarmtypes.NodeAgentStateConnected,
 			BindingKind:     &bindingKind,
@@ -507,8 +546,8 @@ func (s *Service) JoinEnvironments(ctx context.Context, managerEnvironmentID str
 }
 
 func (s *Service) getSwarmJoinTokensForEnvironmentInternal(ctx context.Context, environmentID string) (*swarmtypes.SwarmJoinTokensResponse, error) {
-	if environmentID == "0" {
-		return s.localJoinTokens(ctx)
+	if scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); inProcess {
+		return s.localJoinTokens(scopedCtx)
 	}
 
 	var response struct {
@@ -573,24 +612,39 @@ func (s *Service) joinEnvironmentInternal(
 		JoinToken:     joinToken,
 		Availability:  target.Availability,
 	}
-	body, err := json.Marshal(joinRequest)
-	if err != nil {
-		message := err.Error()
-		result.Error = &message
-		return result
-	}
-	var joinResponse struct {
-		Success bool `json:"success"`
-	}
-	if proxyJSONRequestErr := s.environmentService.ProxyJSONRequest(ctx, target.EnvironmentID, http.MethodPost, "/api/environments/0/swarm/join", body, &joinResponse); proxyJSONRequestErr != nil {
-		message := describeSwarmJoinFailureInternal(proxyJSONRequestErr, joinToken)
-		result.Error = &message
-		return result
-	}
-	if !joinResponse.Success {
-		message := "swarm join failed"
-		result.Error = &message
-		return result
+	// A docker-host target is served in-process, so join its daemon directly
+	// instead of proxying to a non-existent agent.
+	if scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, target.EnvironmentID); inProcess {
+		if s.inProcessJoin == nil {
+			message := "swarm join is unavailable for this environment"
+			result.Error = &message
+			return result
+		}
+		if inProcessJoinErr := s.inProcessJoin(scopedCtx, joinRequest); inProcessJoinErr != nil {
+			message := describeSwarmJoinFailureInternal(inProcessJoinErr, joinToken)
+			result.Error = &message
+			return result
+		}
+	} else {
+		body, err := json.Marshal(joinRequest)
+		if err != nil {
+			message := err.Error()
+			result.Error = &message
+			return result
+		}
+		var joinResponse struct {
+			Success bool `json:"success"`
+		}
+		if proxyJSONRequestErr := s.environmentService.ProxyJSONRequest(ctx, target.EnvironmentID, http.MethodPost, "/api/environments/0/swarm/join", body, &joinResponse); proxyJSONRequestErr != nil {
+			message := describeSwarmJoinFailureInternal(proxyJSONRequestErr, joinToken)
+			result.Error = &message
+			return result
+		}
+		if !joinResponse.Success {
+			message := "swarm join failed"
+			result.Error = &message
+			return result
+		}
 	}
 
 	for range 6 {
@@ -623,6 +677,12 @@ func (s *Service) joinEnvironmentInternal(
 }
 
 func (s *Service) fetchSwarmNodeIdentityViaEdgeInternal(ctx context.Context, environmentID string) (*SwarmNodeIdentity, error) {
+	// A docker-host environment is served in-process: read its identity straight
+	// from its daemon instead of asking a non-existent agent through the edge.
+	if scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID); inProcess {
+		return s.GetLocalNodeIdentity(scopedCtx)
+	}
+
 	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -803,9 +863,13 @@ func (s *Service) buildNodePaginationConfigInternal() pagination.Config[swarmtyp
 
 // GetJoinCandidates lists environments available to join the selected manager.
 func (s *Service) GetJoinCandidates(ctx context.Context, environmentID string) ([]swarmtypes.SwarmJoinCandidate, error) {
+	scopedCtx, inProcess := s.inProcessTargetContextInternal(ctx, environmentID)
+	if inProcess {
+		ctx = scopedCtx
+	}
 	var identity *SwarmNodeIdentity
 	var err error
-	if environmentID == environment.LocalEnvironmentID {
+	if inProcess {
 		identity, err = s.GetLocalNodeIdentity(ctx)
 	} else {
 		identity, err = s.fetchSwarmNodeIdentityViaEdgeInternal(ctx, environmentID)

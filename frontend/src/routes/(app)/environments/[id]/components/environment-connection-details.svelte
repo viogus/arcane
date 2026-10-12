@@ -8,6 +8,7 @@
 		AlertTriangleIcon,
 		ArrowDownIcon,
 		ConnectionIcon,
+		DockerBrandIcon,
 		EnvironmentsIcon,
 		type IconType,
 		LockIcon,
@@ -49,6 +50,8 @@
 	// Edge agents are live while their tunnel is up; direct agents while the manager can reach them.
 	let live = $derived(environment.isEdge ? Boolean(environment.connected) : currentStatus === 'online');
 	let directSecure = $derived(environment.apiUrl.startsWith('https://'));
+	// A docker-host environment has no apiUrl: the manager talks straight to the Docker API.
+	let isDockerHost = $derived(Boolean(environment.dockerHost));
 
 	let status = $derived.by((): { label: string; dot: string; description?: string } => {
 		if (live) {
@@ -161,6 +164,8 @@
 			<div class="flex size-9 items-center justify-center rounded-md border border-border">
 				{#if environment.edgeSecurityMode === 'mtls'}
 					<ShieldCheckIcon class="size-4" />
+				{:else if isDockerHost}
+					<DockerBrandIcon class="size-4" />
 				{:else if environment.isEdge || directSecure}
 					<LockIcon class="size-4" />
 				{:else}
@@ -170,6 +175,8 @@
 			<span class="text-xs whitespace-nowrap text-muted-foreground">
 				{#if environment.isEdge}
 					{pathCaption || securityLabel}
+				{:else if isDockerHost}
+					{m.environments_docker_host_label()}
 				{:else}
 					{directSecure ? m.environments_edge_https_label() : m.environments_edge_http_label()}
 				{/if}
@@ -243,7 +250,10 @@
 
 	{#if !environment.isEdge}
 		<div class="grid grid-cols-2 gap-x-6 gap-y-5 border-t border-border/50 pt-5 lg:grid-cols-4">
-			{@render stat(m.environments_api_url(), environment.apiUrl)}
+			{@render stat(
+				environment.dockerHost ? m.environments_docker_host_label() : m.environments_api_url(),
+				environment.dockerHost || environment.apiUrl
+			)}
 			{#if environment.lastSeen}
 				{@render stat(m.dashboard_all_last_seen(), formatRelativeTime(environment.lastSeen, { base: now }))}
 			{/if}

@@ -14,6 +14,8 @@ export type Environment = {
 	id: string;
 	name: string;
 	apiUrl: string;
+	// The manager sends null for agent environments, so callers must treat it as absent.
+	dockerHost?: string | null;
 	status: EnvironmentStatus;
 	enabled: boolean;
 	isEdge: boolean;
@@ -36,7 +38,8 @@ export type Environment = {
 };
 
 export interface CreateEnvironmentDTO {
-	apiUrl: string;
+	apiUrl?: string;
+	dockerHost?: string;
 	name: string;
 	bootstrapToken?: string;
 	useApiKey?: boolean;
@@ -45,6 +48,7 @@ export interface CreateEnvironmentDTO {
 
 export interface UpdateEnvironmentDTO {
 	apiUrl?: string;
+	dockerHost?: string;
 	accessToken?: string;
 	name?: string;
 	enabled?: boolean;

@@ -69,6 +69,12 @@ type EnvironmentService struct {
 	// jobs holds one health-check job per enabled environment; SetScheduler wires it on the manager.
 	jobs *entityjobs.Registry
 
+	// environmentJobsSync and environmentJobsForget are injected by the bootstrap so this domain can
+	// install or clear the daemon-facing cron jobs a docker-host environment owns without importing
+	// the job domain (which imports this one).
+	environmentJobsSync   func(ctx context.Context, environmentID string) error
+	environmentJobsForget func(ctx context.Context, environmentID string) error
+
 	// variableSyncer is set by SetVariableSyncer on the manager to avoid a wire cycle.
 	variableSyncer VariableSyncer
 
@@ -81,6 +87,10 @@ type EnvironmentService struct {
 	health   *health.Service
 	snippets *snippets.Service
 	swarm    *swarm.Service
+
+	// dockerService drops cached per-endpoint Docker clients when an environment's
+	// target changes or the environment is removed, since this service owns those rows.
+	dockerService *docker.DockerClientService
 }
 
 const (
@@ -144,6 +154,8 @@ func NewEnvironmentService(
 		health:   health.New(httpClient, dockerService),
 		snippets: snippets.New(eventService),
 		swarm:    swarm.New(apiKeyService),
+
+		dockerService: dockerService,
 	}
 	s.proxy = proxy.New(db, httpClient, settingsService, &s.syncGate)
 
@@ -312,6 +324,9 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, env *Environ
 	if err := normalization.Normalize(env); err != nil {
 		return nil, err
 	}
+	if err := validateEnvironmentTargetInternal(env); err != nil {
+		return nil, err
+	}
 	env.ID = uuid.New().String()
 
 	// Only set status to offline if not already set (e.g., API key flow sets it to pending)
@@ -333,6 +348,7 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, env *Environ
 	if env.Enabled {
 		s.registerHealthJob(ctx, env.ID)
 	}
+	s.syncEnvironmentJobsInternal(ctx, env.ID)
 	s.remoteEnvs.put(*env)
 	s.invalidateEnvironmentCache(env.ID)
 	s.NotifyRuntimeStateChanged()
@@ -384,6 +400,10 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 		return nil, validateCredentialTargetChangeErr
 	}
 
+	if err := applyDockerHostUpdateInternal(updates, current); err != nil {
+		return nil, err
+	}
+
 	updates["updated_at"] = new(time.Now())
 
 	if updateEnvironmentErr := s.db.WithContext(ctx).Model(&Environment{}).Where("id = ?", id).Updates(updates).Error; updateEnvironmentErr != nil {
@@ -397,6 +417,12 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 		return nil, err
 	}
 	s.remoteEnvs.put(*updated)
+
+	// The environment's Docker endpoint may have changed, or it may no longer be a
+	// docker-host environment at all: drop the cached connection instead of leaking it.
+	if previousHost := current.DockerHostURL(); previousHost != "" && previousHost != updated.DockerHostURL() && s.dockerService != nil {
+		s.dockerService.CloseHostClient(previousHost)
+	}
 
 	if rawAccessToken, ok := updates["access_token"]; ok {
 		accessToken, _ := rawAccessToken.(string)
@@ -413,6 +439,9 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 			}
 		}
 	}
+	// Keep the daemon-facing cron jobs in step with the environment's current state, including a
+	// changed docker_host endpoint or a disabled environment.
+	s.syncEnvironmentJobsInternal(ctx, id)
 
 	if id != LocalEnvironmentID {
 		go s.createEnvironmentEvent(context.WithoutCancel(ctx), id, updated.Name, event.EventTypeEnvironmentUpdate,
@@ -430,6 +459,7 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, id string, u
 
 	// Stop the per-environment health job before the row is removed.
 	s.jobs.Unregister(ctx, id)
+	s.forgetEnvironmentJobsInternal(ctx, id)
 
 	var syncIDs []string
 	if transactionErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -456,6 +486,7 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, id string, u
 	}); transactionErr != nil {
 		if env.Enabled {
 			s.registerHealthJob(ctx, env.ID)
+			s.syncEnvironmentJobsInternal(ctx, env.ID)
 		}
 		return transactionErr
 	}
@@ -472,6 +503,10 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, id string, u
 	s.ForgetSyncState(id)
 	s.remoteEnvs.remove(id)
 	s.invalidateEnvironmentCache(id)
+	// The environment is gone, so its cached Docker connection must not outlive it.
+	if host := env.DockerHostURL(); host != "" && s.dockerService != nil {
+		s.dockerService.CloseHostClient(host)
+	}
 	s.NotifyRuntimeStateChanged()
 
 	go s.createEnvironmentEvent(context.WithoutCancel(ctx), id, env.Name, event.EventTypeEnvironmentDelete,
@@ -754,8 +789,8 @@ func (s *EnvironmentService) ListEnvironmentsPaginated(ctx context.Context, para
 	if term := strings.TrimSpace(params.Search); term != "" {
 		searchPattern := "%" + term + "%"
 		q = q.Where(
-			"name LIKE ? OR api_url LIKE ?",
-			searchPattern, searchPattern,
+			"name LIKE ? OR api_url LIKE ? OR docker_host LIKE ?",
+			searchPattern, searchPattern, searchPattern,
 		)
 	}
 
@@ -806,6 +841,12 @@ func (s *EnvironmentService) listEnvironmentsPaginatedWithRuntimeFilters(
 		SearchAccessors: []pagination.SearchAccessor[environment.Environment]{
 			func(env environment.Environment) (string, error) { return env.Name, nil },
 			func(env environment.Environment) (string, error) { return env.ApiUrl, nil },
+			func(env environment.Environment) (string, error) {
+				if env.DockerHost == nil {
+					return "", nil
+				}
+				return *env.DockerHost, nil
+			},
 		},
 		SortBindings: []pagination.SortBinding[environment.Environment]{
 			{
@@ -860,7 +901,11 @@ func (s *EnvironmentService) listEnvironmentsPaginatedWithRuntimeFilters(
 				Key: "type",
 				Fn: func(item environment.Environment, filterValue string) bool {
 					typeKey := "http"
-					if item.IsEdge {
+					if item.DockerHost != nil && strings.TrimSpace(*item.DockerHost) != "" {
+						// Docker-host environments are not agents: they point straight
+						// at a Docker API, so they never classify as http/edge.
+						typeKey = "dockerhost"
+					} else if item.IsEdge {
 						// Disconnected or poll-only agents classify by the transport they last used.
 						transport := ""
 						if item.Connected != nil && *item.Connected && item.EdgeTransport != nil {
@@ -906,20 +951,6 @@ func (s *EnvironmentService) ListVisibleEnvironments(ctx context.Context) ([]env
 	}
 
 	return out, nil
-}
-
-// ListRemoteEnvironmentIDs returns the IDs of enabled remote environments; it
-// satisfies agg.RemoteEnvironmentLister for aggregated stream handlers.
-func (s *EnvironmentService) ListRemoteEnvironmentIDs(ctx context.Context) ([]string, error) {
-	envs, err := s.ListRemoteEnvironments(ctx)
-	if err != nil {
-		return nil, err
-	}
-	ids := make([]string, 0, len(envs))
-	for _, env := range envs {
-		ids = append(ids, env.ID)
-	}
-	return ids, nil
 }
 
 // ListRemoteEnvironments returns all non-local, enabled environments for syncing purposes.
@@ -984,10 +1015,98 @@ func (s *EnvironmentService) SetScheduler(ctx context.Context, jobScheduler sche
 	return s.jobs.SetScheduler(ctx, jobScheduler, admissionGate)
 }
 
+// SetEnvironmentJobsHooks injects the scheduler hooks that install or clear the cron jobs belonging
+// to one docker-host environment. Agent environments are untouched: their jobs run inside the agent.
+func (s *EnvironmentService) SetEnvironmentJobsHooks(
+	sync func(ctx context.Context, environmentID string) error,
+	forget func(ctx context.Context, environmentID string) error,
+) {
+	s.environmentJobsSync = sync
+	s.environmentJobsForget = forget
+}
+
+// SyncDockerHostEnvironmentJobs installs the scheduler records every enabled docker-host
+// environment owns. The manager calls it once the scheduler is running, because installs are
+// dropped while the scheduler is still starting.
+func (s *EnvironmentService) SyncDockerHostEnvironmentJobs(ctx context.Context) error {
+	if s == nil || s.environmentJobsSync == nil {
+		return nil
+	}
+	var errs []error
+	for _, id := range s.listEnabledDockerHostEnvironmentIDsInternal(ctx) {
+		if err := s.environmentJobsSync(s.jobs.Context(ctx), id); err != nil {
+			errs = append(errs, fmt.Errorf("sync jobs for environment %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// EnabledDockerHostEnvironmentIDs lists the environments this process serves directly against their
+// own Docker daemon. Services that must watch every daemon (image polling) install one schedule per
+// returned environment instead of reusing the manager's.
+func (s *EnvironmentService) EnabledDockerHostEnvironmentIDs(ctx context.Context) ([]string, error) {
+	return s.listEnabledDockerHostEnvironmentIDsInternal(ctx), nil
+}
+
+// listEnabledDockerHostEnvironmentIDsInternal returns the enabled environments the manager serves
+// itself against a remote daemon.
+func (s *EnvironmentService) listEnabledDockerHostEnvironmentIDsInternal(ctx context.Context) []string {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	var ids []string
+	if err := s.db.WithContext(ctx).
+		Table("environments").
+		Where("enabled = ?", true).
+		Where("docker_host IS NOT NULL AND docker_host <> ''").
+		Pluck("id", &ids).Error; err != nil {
+		slog.ErrorContext(ctx, "failed to list docker-host environments", "error", err)
+		return nil
+	}
+	return ids
+}
+
+// syncEnvironmentJobsInternal installs or clears the cron jobs one environment owns after it is
+// created, updated, enabled or disabled.
+func (s *EnvironmentService) syncEnvironmentJobsInternal(ctx context.Context, environmentID string) {
+	if s == nil || s.environmentJobsSync == nil || environmentID == "" || environmentID == LocalEnvironmentID {
+		return
+	}
+	env, err := s.GetEnvironmentByID(ctx, environmentID)
+	if err != nil || env == nil {
+		return
+	}
+	if !env.Enabled || !env.IsDockerHost() {
+		s.forgetEnvironmentJobsInternal(ctx, environmentID)
+		return
+	}
+	if err := s.environmentJobsSync(s.jobs.Context(ctx), environmentID); err != nil {
+		slog.ErrorContext(ctx, "failed to sync environment jobs", "environment", environmentID, "error", err)
+	}
+	slog.DebugContext(ctx, "Synced environment jobs", "environment", environmentID)
+}
+
+// forgetEnvironmentJobsInternal clears the scheduler records a disabled or deleted environment owned.
+func (s *EnvironmentService) forgetEnvironmentJobsInternal(ctx context.Context, environmentID string) {
+	if s == nil || s.environmentJobsForget == nil || environmentID == "" || environmentID == LocalEnvironmentID {
+		return
+	}
+	if err := s.environmentJobsForget(s.jobs.Context(ctx), environmentID); err != nil {
+		slog.ErrorContext(ctx, "failed to clear environment jobs", "environment", environmentID, "error", err)
+	}
+}
+
 // registerHealthJob schedules one environment's health check on the global
 // environmentHealthInterval; the run self-cancels once the environment is gone.
 func (s *EnvironmentService) registerHealthJob(ctx context.Context, envID string) {
-	s.jobs.Register(ctx, envID,
+	// A docker-host environment has no agent to hand work to, so its health-check run and schedule
+	// belong to that environment's own scheduler namespace; agent environments are checked by this
+	// manager and keep the manager's namespace.
+	registerCtx := ctx
+	if scoped, inProcess := s.InProcessTargetContext(s.jobs.Context(ctx), envID); inProcess && envID != LocalEnvironmentID {
+		registerCtx = scoped
+	}
+	s.jobs.Register(registerCtx, envID,
 		func(ctx context.Context) string {
 			sched := s.settingsService.GetStringSetting(ctx, "environmentHealthInterval", defaultEnvironmentHealthInterval)
 			return kit.Ternary(sched == "", defaultEnvironmentHealthInterval, sched)
@@ -1006,6 +1125,22 @@ func (s *EnvironmentService) ListEnabledEnvironmentIDs(ctx context.Context) ([]s
 		Where("enabled = ?", true).
 		Pluck("id", &ids).Error; err != nil {
 		return nil, fmt.Errorf("failed to list enabled environments: %w", err)
+	}
+	return ids, nil
+}
+
+// ListEnabledAgentEnvironmentIDs returns the enabled environments that are backed by an Arcane
+// agent. Docker-host environments are served in-process by the manager and have no agent to proxy
+// to, so agent-only pushes (for example the global variable sync that writes .env.global on the
+// other side) must skip them.
+func (s *EnvironmentService) ListEnabledAgentEnvironmentIDs(ctx context.Context) ([]string, error) {
+	var ids []string
+	if err := s.db.WithContext(ctx).
+		Table("environments").
+		Where("enabled = ?", true).
+		Where("docker_host IS NULL OR docker_host = ''").
+		Pluck("id", &ids).Error; err != nil {
+		return nil, fmt.Errorf("failed to list enabled agent environments: %w", err)
 	}
 	return ids, nil
 }
@@ -1045,8 +1180,16 @@ func (s *EnvironmentService) RunHealthChecksNow(ctx context.Context) error {
 		request.RequestedWithKey = parent.RequestedWithKey
 	}
 	for _, id := range ids {
+		// A docker-host environment's health run is executed here for that environment, so it is
+		// recorded in that environment's own namespace; agent environments keep the manager's.
+		submitCtx := ctx
+		request.EnvironmentID = LocalEnvironmentID
+		if scoped, inProcess := s.InProcessTargetContext(ctx, id); inProcess && id != LocalEnvironmentID {
+			request.EnvironmentID = id
+			submitCtx = scoped
+		}
 		request.JobID = s.jobs.JobName(id)
-		if _, submitErr := s.jobs.Scheduler().Submit(ctx, request); submitErr != nil {
+		if _, submitErr := s.jobs.Scheduler().Submit(submitCtx, request); submitErr != nil {
 			return submitErr
 		}
 	}
@@ -1084,8 +1227,9 @@ func (s *EnvironmentService) runHealthCheck(ctx context.Context, envID string) (
 		return scheduler.Outcome{Status: scheduler.Retrying, Message: "Environment is offline"}, errors.New("environment is offline")
 	}
 
-	// The local environment has no resources to push.
-	if envID == LocalEnvironmentID {
+	// Neither the local environment nor docker-host environments have an agent to push resources to:
+	// docker-host environments are served in-process from the manager, so their resources are local.
+	if envID == LocalEnvironmentID || localEnvironment.IsDockerHost() {
 		return scheduler.Outcome{Status: scheduler.Succeeded}, nil
 	}
 
@@ -1149,10 +1293,25 @@ func (s *EnvironmentService) TestConnection(ctx context.Context, id string, cust
 	}
 
 	apiURL := envRecord.ApiUrl
-	if customApiUrl != nil {
+	dockerHost := envRecord.DockerHostURL()
+	customURL := customApiUrl != nil
+	if customURL {
 		apiURL = *customApiUrl
 	}
-	status, err := s.health.Probe(ctx, id, apiURL, envRecord.IsEdge, customApiUrl != nil)
+	// A docker-host environment has no agent URL, so a "test connection" against an endpoint the
+	// user has edited but not yet saved carries the Docker endpoint, not an agent URL.
+	if envRecord.IsDockerHost() && customURL {
+		dockerHost = strings.TrimSpace(*customApiUrl)
+		apiURL = ""
+		customURL = false
+	}
+	status, err := s.health.Probe(ctx, health.Target{
+		ID:         id,
+		APIURL:     apiURL,
+		IsEdge:     envRecord.IsEdge,
+		CustomURL:  customURL,
+		DockerHost: dockerHost,
+	})
 	if customApiUrl == nil {
 		if updateErr := s.updateEnvironmentStatus(ctx, id, status); updateErr != nil {
 			slog.WarnContext(ctx, "Failed to persist environment status", "environmentId", id, "status", status, "error", updateErr)
@@ -1350,6 +1509,11 @@ func (s *EnvironmentService) syncToRemoteEnvironments(ctx context.Context, kind 
 
 	var failedCount int
 	for _, env := range envs {
+		// A docker-host environment is driven in process, never synced over the agent API.
+		if env.IsDockerHost() {
+			slog.DebugContext(ctx, "Skipping sync for docker-host environment", "kind", kind, "environmentId", env.ID, "environmentName", env.Name)
+			continue
+		}
 		if env.AccessToken == nil || strings.TrimSpace(*env.AccessToken) == "" {
 			slog.DebugContext(ctx, "Skipping sync for environment without access token", "kind", kind, "environmentId", env.ID, "environmentName", env.Name)
 			continue
@@ -1374,6 +1538,11 @@ func (s *EnvironmentService) CheckS3DestinationReferences(ctx context.Context, d
 		return fmt.Errorf("failed to list remote environments for S3 destination reference check: %w", err)
 	}
 	for _, env := range envs {
+		// A docker-host environment is driven in process; it never receives destination syncs and
+		// holds no copies of this destination.
+		if env.IsDockerHost() {
+			continue
+		}
 		// Environments without an access token never receive destination syncs.
 		if env.AccessToken == nil || strings.TrimSpace(*env.AccessToken) == "" {
 			continue
@@ -1394,6 +1563,9 @@ func (s *EnvironmentService) resolveRemoteEnvironmentTarget(ctx context.Context,
 	envRecord, err := s.GetEnvironmentByID(ctx, envID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get environment: %w", err)
+	}
+	if envRecord.IsDockerHost() {
+		return nil, fmt.Errorf("environment %q is a docker-host environment and has no agent to proxy to", envID)
 	}
 
 	return proxy.NewTarget(envRecord.ID, envRecord.Name, envRecord.ApiUrl, envRecord.IsEdge, envRecord.AccessToken)
@@ -1422,6 +1594,10 @@ func (s *EnvironmentService) ProxyJSONRequest(ctx context.Context, envID, method
 
 // ProxyJSONRequestForEnvironment sends a JSON request for an already-loaded environment row.
 func (s *EnvironmentService) ProxyJSONRequestForEnvironment(ctx context.Context, env Environment, method, path string, body []byte, out any) error {
+	if env.IsDockerHost() {
+		return fmt.Errorf("environment %q is a docker-host environment and has no agent to proxy to", env.ID)
+	}
+
 	proxyCtx, cancel := s.proxy.Context(ctx)
 	defer cancel()
 

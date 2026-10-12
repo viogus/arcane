@@ -10,6 +10,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/notification"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/system"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	scheduleutil "github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/schedule"
 )
 
@@ -63,7 +64,14 @@ func (j *ScheduledPruneJob) Run(ctx context.Context) (schedulertypes.Outcome, er
 		"buildCache", req.BuildCache,
 	)
 
-	result, started, err := j.systemService.PruneScheduled(ctx, "0", req)
+	// A docker-host environment's runs execute in this process with that environment's target in
+	// context, so the prune is attributed to it instead of the manager's own daemon.
+	environmentID := envcontext.EnvironmentIDFromContext(ctx)
+	if environmentID == "" {
+		environmentID = "0"
+	}
+
+	result, started, err := j.systemService.PruneScheduled(ctx, environmentID, req)
 	if err != nil {
 		slog.ErrorContext(ctx, "scheduled prune run failed", "error", err)
 		return schedulertypes.Outcome{}, err

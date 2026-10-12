@@ -27,17 +27,34 @@ func New(httpClient *http.Client, dockerService *docker.DockerClientService) *Se
 	return &Service{httpClient: httpClient, dockerService: dockerService}
 }
 
+// Target describes the environment being probed.
+type Target struct {
+	// ID is the environment UUID ("0" is the manager's own environment).
+	ID string
+	// APIURL is the agent base URL, used for agent and edge environments.
+	APIURL string
+	// IsEdge selects tunnel-based probing.
+	IsEdge bool
+	// CustomURL forces a direct HTTP probe against APIURL (connection test with an override).
+	CustomURL bool
+	// DockerHost is the Docker API endpoint of a "docker-host" environment, probed with a Docker ping.
+	DockerHost string
+}
+
 // Probe reports "online", "offline" or "error" for one environment. A custom
 // API URL always probes directly over HTTP.
-func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customURL bool) (string, error) {
-	if id == "0" && !customURL {
+func (s *Service) Probe(ctx context.Context, target Target) (string, error) {
+	if target.ID == "0" && !target.CustomURL {
 		return s.probeLocalDockerInternal(ctx)
 	}
-	if isEdge && !customURL {
-		return probeEdgeInternal(ctx, id)
+	if target.DockerHost != "" && !target.CustomURL {
+		return s.probeDockerHostInternal(ctx, target.DockerHost)
+	}
+	if target.IsEdge && !target.CustomURL {
+		return probeEdgeInternal(ctx, target.ID)
 	}
 
-	healthURL, err := buildEndpointURLInternal(apiURL, "/api/health")
+	healthURL, err := buildEndpointURLInternal(target.APIURL, "/api/health")
 	if err != nil {
 		return "offline", fmt.Errorf("invalid environment API URL: %w", err)
 	}
@@ -94,6 +111,22 @@ func (s *Service) probeLocalDockerInternal(ctx context.Context) (string, error) 
 	}
 	if _, pingErr := dockerClient.Ping(reqCtx, client.PingOptions{}); pingErr != nil {
 		return "offline", fmt.Errorf("docker ping failed: %w", pingErr)
+	}
+	return "online", nil
+}
+
+// probeDockerHostInternal pings a "docker-host" environment's Docker API endpoint. The manager
+// talks to that daemon directly, so Docker API reachability is the entire health signal.
+func (s *Service) probeDockerHostInternal(ctx context.Context, host string) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	dockerClient, err := s.dockerService.GetHostClient(reqCtx, host)
+	if err != nil {
+		return "offline", fmt.Errorf("failed to connect to Docker host %q: %w", host, err)
+	}
+	if _, pingErr := dockerClient.Ping(reqCtx, client.PingOptions{}); pingErr != nil {
+		return "offline", fmt.Errorf("docker ping failed for %q: %w", host, pingErr)
 	}
 	return "online", nil
 }

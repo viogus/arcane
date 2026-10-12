@@ -101,3 +101,22 @@ func TestSystemStatsSamplerRearmsOnFasterSubscriber(t *testing.T) {
 		t.Fatal("sampler did not re-arm to the faster subscriber's interval")
 	}
 }
+
+func TestCheckRateLimitAllowsAFullDashboard(t *testing.T) {
+	handler := &WebSocketHandler{}
+	clientIP := "203.0.113.7"
+
+	// The dashboard opens one live stats socket per online environment card, so a dashboard with
+	// several environments must fit inside the per-client bound.
+	require.GreaterOrEqual(t, maxActiveSystemStatsConnectionsPerClient, 16)
+	for i := range maxActiveSystemStatsConnectionsPerClient {
+		require.Truef(t, handler.checkRateLimit(clientIP), "connection %d of %d should be accepted", i+1, maxActiveSystemStatsConnectionsPerClient)
+	}
+
+	// The bound still caps a single client, and other clients keep their own budget.
+	require.False(t, handler.checkRateLimit(clientIP))
+	require.True(t, handler.checkRateLimit("203.0.113.8"))
+
+	handler.releaseRateLimit(clientIP)
+	require.True(t, handler.checkRateLimit(clientIP))
+}

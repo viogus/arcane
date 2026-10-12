@@ -20,6 +20,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/apns"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/gitops"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/job"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
@@ -29,6 +30,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/concurrency"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis"
 )
 
@@ -46,6 +48,8 @@ func newJobScheduler(
 	volumes *volume.VolumeService,
 	gitopsSync *gitops.GitOpsSyncService,
 	actors *francis.Runtime,
+	environmentService *environment.EnvironmentService,
+	eventService *event.EventService,
 ) (
 	schedulertypes.JobScheduler,
 	error,
@@ -80,6 +84,15 @@ func newJobScheduler(
 			}
 			if imageUpdateWatcher != nil {
 				imageUpdateWatcher.SetCoordinator(jobService.Coordinator())
+				// Image polling must reach every daemon this process serves itself, so hand the
+				// watcher the environment rows before it starts; it checkpoints one schedule per
+				// docker-host environment (see ImageUpdateWatcher.refreshScheduleInternal).
+				if environmentService != nil {
+					imageUpdateWatcher.SetEnvironmentProvider(environmentService)
+				}
+				// A docker-host environment added while the process runs is synced through the job
+				// service, which then asks the watcher to install its polling records.
+				jobService.SetBusWatcherScheduleRefresh(imageUpdateWatcher.RefreshSchedule)
 				if registerBusWatcherErr := jobScheduler.RegisterBusWatcher(imageUpdateWatcher, true); registerBusWatcherErr != nil {
 					return registerBusWatcherErr
 				}
@@ -88,6 +101,27 @@ func newJobScheduler(
 				return fmt.Errorf("start scheduler: %w", startSchedulerErr)
 			}
 			jobService.Coordinator().Activate()
+			// Docker-host environments are served by this process against a remote daemon, so their
+			// own cron records are installed only now: installs are dropped before the scheduler runs.
+			if environmentService != nil {
+				if syncErr := environmentService.SyncDockerHostEnvironmentJobs(ctx); syncErr != nil {
+					return fmt.Errorf("sync docker-host environment jobs: %w", syncErr)
+				}
+			}
+			// Same reason: the watcher's own startup refresh can land before the coordinator accepts
+			// checkpoints, so ask for the per-environment image-polling schedules again now that the
+			// scheduler is activated.
+			if imageUpdateWatcher != nil {
+				imageUpdateWatcher.RefreshSchedule()
+			}
+			// A docker-host environment's daemon is watched here, not by an agent, so its events are
+			// recorded per environment once the environments are being served.
+			if eventService != nil && environmentService != nil {
+				eventService.SetDockerHostEventProvider(environmentService)
+				if _, startErr := concurrency.StartSupervised(schedulerCtx, "Docker host event log", eventService.SubscribeDockerHostEnvironmentEvents()); startErr != nil {
+					return fmt.Errorf("start docker host event log: %w", startErr)
+				}
+			}
 			if analytics != nil {
 				if _, submitErr := jobService.Coordinator().Submit(ctx, schedulertypes.Request{JobID: analytics.Name(), EnvironmentID: "0", Trigger: "startup"}); submitErr != nil {
 					return fmt.Errorf("submit startup job %q: %w", analytics.Name(), submitErr)
@@ -393,6 +427,10 @@ func registerDynamicJobs(params dynamicJobsParams) error {
 		params.JobSchedule.RunEnvironmentHealthNow = func(ctx context.Context) error {
 			return params.Environment.RunHealthChecksNow(ctx)
 		}
+		// Cron jobs that talk to an environment's own Docker daemon need one scheduler record per
+		// docker-host environment; the job service owns the records, the environment service owns
+		// the rows, so the environment service asks it to install or clear them.
+		params.Environment.SetEnvironmentJobsHooks(params.JobSchedule.SyncEnvironmentJobs, params.JobSchedule.ForgetEnvironmentJobs)
 		params.Environment.RescheduleHealthJobs(params.AppCtx)
 	}
 	return nil
@@ -592,6 +630,10 @@ func syncTimeoutSettingsToAgents(ctx context.Context, localEnvironment timeoutSe
 	slog.InfoContext(ctx, "Syncing environment settings to remote environments", "count", len(envs), "keys", keys)
 
 	for _, env := range envs {
+		// Docker-host environments are served by this process; there is no agent to push settings to.
+		if env.IsDockerHost() {
+			continue
+		}
 		responseBody, statusCode, proxyRequestErr := localEnvironment.ProxyRequest(ctx, env.ID, http.MethodPut, "/api/environments/0/settings", body)
 		if proxyRequestErr != nil {
 			slog.WarnContext(ctx, "Failed to sync timeout settings to environment", "environmentId", env.ID, "environmentName", env.Name, "error", proxyRequestErr)

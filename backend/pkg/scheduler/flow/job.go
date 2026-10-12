@@ -25,7 +25,16 @@ type Job struct {
 	// a retry starts a fresh instance under a new attempt.
 	FallbackFn      func(ctx context.Context, previous scheduler.Run) (scheduler.Outcome, error)
 	ValidateRetryFn func(ctx context.Context, run scheduler.Run) error
+	// EnvironmentScope is the environment whose schedule namespace owns this job, filled in by the
+	// registry when the job is registered from an environment-scoped context.
+	EnvironmentScope string
 }
+
+// EnvironmentID satisfies scheduler.EnvironmentScopedJob.
+func (j *Job) EnvironmentID() string { return j.EnvironmentScope }
+
+// SetEnvironmentScope satisfies scheduler.EnvironmentScopeSetter.
+func (j *Job) SetEnvironmentScope(environmentID string) { j.EnvironmentScope = environmentID }
 
 // Name is the scheduler job name.
 func (j *Job) Name() string { return j.JobName }

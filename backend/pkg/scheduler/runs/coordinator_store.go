@@ -319,9 +319,19 @@ func (q *Coordinator) SetExecutor(execute, reconcile func(context.Context, st.Ru
 	q.reconcile = reconcile
 }
 
+// ScheduleState reports the schedule installed in the manager's own namespace.
 func (q *Coordinator) ScheduleState(ctx context.Context, jobID string) (st.QueueRecord, error) {
+	return q.ScheduleStateFor(ctx, "0", jobID)
+}
+
+// ScheduleStateFor reports the schedule installed in one environment's namespace. Environments keep
+// separate schedule records, so callers serving a specific environment must use this variant.
+func (q *Coordinator) ScheduleStateFor(ctx context.Context, environmentID, jobID string) (st.QueueRecord, error) {
+	if environmentID == "" {
+		environmentID = "0"
+	}
 	var state st.CoordinatorState
-	err := q.service.GetState(ctx, coordinatorTypeInternal, kit.SHA256Hex("0\x00"+jobID), &state)
+	err := q.service.GetState(ctx, coordinatorTypeInternal, kit.SHA256Hex(environmentID+"\x00"+jobID), &state)
 	normalizeRecordTimesInternal(&state.Record)
 	return state.Record, err
 }

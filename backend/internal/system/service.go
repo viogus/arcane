@@ -68,6 +68,12 @@ type SystemService struct {
 	activityService       *activity.ActivityService
 	dockerHostMemoryCache *hot.HotCache[struct{}, dockerHostMemoryInfo]
 
+	// dockerHostStatsMu guards the per-endpoint caches below. They are keyed by Docker API
+	// endpoint so two docker-host environments never share a reading.
+	dockerHostStatsMu    sync.Mutex
+	dockerHostReadings   map[string]dockerHostReadingInternal
+	dockerHostDiskUsages map[string]dockerHostDiskUsageInternal
+
 	prune   *prune.Service
 	upgrade *upgrade.Service
 	backup  *systembackup.Service

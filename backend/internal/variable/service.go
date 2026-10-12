@@ -49,6 +49,9 @@ const (
 // and materializes each environment's effective set into that environment's
 // .env.global file: locally via template.TemplateService, remotely via the existing
 // agent variables endpoint.
+//
+// Remote pushes only target agent-backed environments: a docker-host environment is served
+// in-process by the manager and has no agent on the other side to accept the request.
 type VariableService struct {
 	db                        *database.DB
 	proxyEnvironmentJSON      func(context.Context, string, string, string, []byte, any) error
@@ -73,7 +76,7 @@ func NewVariableService(db *database.DB, environmentService *environment.Environ
 	}
 	if environmentService != nil {
 		service.proxyEnvironmentJSON = environmentService.ProxyJSONRequest
-		service.listEnabledEnvironmentIDs = environmentService.ListEnabledEnvironmentIDs
+		service.listEnabledEnvironmentIDs = environmentService.ListEnabledAgentEnvironmentIDs
 	}
 	return service
 }

@@ -140,7 +140,7 @@ func (h *WebSocketHandler) serveLogStream(
 	c *echo.Context,
 	kind, resourceID string,
 	params logStreamParams,
-	hubBuilder func(streamKey string, onEmpty func(*wsLogStream)) *wsLogStream,
+	hubBuilder func(ctx context.Context, streamKey string, onEmpty func(*wsLogStream)) *wsLogStream,
 ) {
 	conn, unregister, ok := h.acceptWS(c, kind, resourceID)
 	if !ok {
@@ -148,8 +148,12 @@ func (h *WebSocketHandler) serveLogStream(
 	}
 
 	streamKey := buildLogStreamKey(c.Param("id"), kind, resourceID, params.format, params.batched, params.follow, params.tail, params.since, params.timestamps)
+	// Hubs outlive the request that created them, so they must not cancel with it,
+	// but they must keep its values: the request context carries the target Docker
+	// daemon, and the log producer resolves its client from the context.
+	baseCtx := context.WithoutCancel(c.Request().Context())
 	stream := h.getOrCreateLogStream(streamKey, func(onEmpty func(*wsLogStream)) *wsLogStream {
-		return hubBuilder(streamKey, onEmpty)
+		return hubBuilder(baseCtx, streamKey, onEmpty)
 	})
 	release := func() {
 		unregister()
@@ -219,8 +223,9 @@ func (h *WebSocketHandler) ProjectLogs(c *echo.Context) error {
 	}
 
 	params := parseLogStreamParams(c)
-	h.serveLogStream(c, systemtypes.WSKindProjectLogs, projectID, params, func(streamKey string, onEmpty func(*wsLogStream)) *wsLogStream {
+	h.serveLogStream(c, systemtypes.WSKindProjectLogs, projectID, params, func(ctx context.Context, streamKey string, onEmpty func(*wsLogStream)) *wsLogStream {
 		return h.startLogHub(
+			ctx,
 			streamKey,
 			projectID,
 			"project",
@@ -234,7 +239,7 @@ func (h *WebSocketHandler) ProjectLogs(c *echo.Context) error {
 	return nil
 }
 
-func newWSLogStream(key, format string) (*wsLogStream, context.Context) {
+func newWSLogStream(base context.Context, key, format string) (*wsLogStream, context.Context) {
 	ls := &wsLogStream{
 		hub:             wshub.NewHub(1024),
 		firstSubscriber: make(chan struct{}),
@@ -245,7 +250,7 @@ func newWSLogStream(key, format string) (*wsLogStream, context.Context) {
 		close(ls.firstSubscriber)
 	})
 
-	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec,forbidigo // Shared log hubs own their lifecycle and idle cancellation across requests.
+	ctx, cancel := newHubContext(base)
 	ls.cancel = cancel
 
 	go ls.hub.Run(ctx)
@@ -278,6 +283,7 @@ func normalizeProjectLogText(line string) string {
 }
 
 func (h *WebSocketHandler) startLogHub(
+	base context.Context,
 	key, resourceID, label string,
 	params logStreamParams,
 	stream func(context.Context, string, chan<- string, bool, string, string, bool) error,
@@ -285,7 +291,7 @@ func (h *WebSocketHandler) startLogHub(
 	normalizeText func(string) string,
 	onEmptyHook func(*wsLogStream),
 ) *wsLogStream {
-	ls, ctx := newWSLogStream(key, params.format)
+	ls, ctx := newWSLogStream(base, key, params.format)
 
 	ls.hub.SetOnEmpty(func() {
 		if onEmptyHook != nil {
@@ -424,8 +430,9 @@ func (h *WebSocketHandler) ContainerLogs(c *echo.Context) error {
 	}
 
 	params := parseLogStreamParams(c)
-	h.serveLogStream(c, systemtypes.WSKindContainerLogs, containerID, params, func(streamKey string, onEmpty func(*wsLogStream)) *wsLogStream {
+	h.serveLogStream(c, systemtypes.WSKindContainerLogs, containerID, params, func(ctx context.Context, streamKey string, onEmpty func(*wsLogStream)) *wsLogStream {
 		return h.startLogHub(
+			ctx,
 			streamKey,
 			containerID,
 			"container",
@@ -464,8 +471,9 @@ func (h *WebSocketHandler) ServiceLogs(c *echo.Context) error {
 	}
 
 	params := parseLogStreamParams(c)
-	h.serveLogStream(c, systemtypes.WSKindServiceLogs, serviceID, params, func(streamKey string, onEmpty func(*wsLogStream)) *wsLogStream {
+	h.serveLogStream(c, systemtypes.WSKindServiceLogs, serviceID, params, func(ctx context.Context, streamKey string, onEmpty func(*wsLogStream)) *wsLogStream {
 		return h.startLogHub(
+			ctx,
 			streamKey,
 			serviceID,
 			"service",

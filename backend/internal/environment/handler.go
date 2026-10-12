@@ -302,8 +302,9 @@ func (h *EnvironmentHandler) CreateEnvironment(ctx context.Context, input *Creat
 	}
 
 	env := &Environment{
-		ApiUrl:  input.Body.ApiUrl,
-		Enabled: true,
+		ApiUrl:     input.Body.ApiUrl,
+		DockerHost: input.Body.DockerHost,
+		Enabled:    true,
 	}
 	if input.Body.Name != nil {
 		env.Name = *input.Body.Name
@@ -315,7 +316,10 @@ func (h *EnvironmentHandler) CreateEnvironment(ctx context.Context, input *Creat
 		env.IsEdge = *input.Body.IsEdge
 	}
 	useApiKey := input.Body.UseApiKey != nil && *input.Body.UseApiKey
-	if useApiKey {
+	if useApiKey && env.DockerHostURL() != "" {
+		return nil, huma.Error400BadRequest("A docker-host environment cannot use an agent API key")
+	}
+	if useApiKey || env.DockerHostURL() != "" {
 		env.Status = string(EnvironmentStatusPending)
 	} else if input.Body.AccessToken != nil && *input.Body.AccessToken != "" {
 		env.AccessToken = input.Body.AccessToken
@@ -323,7 +327,11 @@ func (h *EnvironmentHandler) CreateEnvironment(ctx context.Context, input *Creat
 
 	created, err := h.environmentService.CreateEnvironment(ctx, env, &user.ID, &user.Username)
 	if err != nil {
-		return nil, huma.Error500InternalServerError("Failed to create environment: " + err.Error())
+		apiErr := common.ToAPIError(err)
+		if apiErr.HTTPStatus() == http.StatusInternalServerError {
+			return nil, huma.Error500InternalServerError("Failed to create environment: " + err.Error())
+		}
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 
 	var apiKey *string
@@ -409,6 +417,9 @@ func (h *EnvironmentHandler) UpdateEnvironment(ctx context.Context, input *Updat
 		if req.AccessToken != nil {
 			updates["access_token"] = *req.AccessToken
 		}
+		if req.DockerHost != nil {
+			updates["docker_host"] = *req.DockerHost
+		}
 	}
 	if req.Name != nil {
 		updates["name"] = *req.Name
@@ -439,6 +450,12 @@ func (h *EnvironmentHandler) UpdateEnvironment(ctx context.Context, input *Updat
 
 	var newApiKey *string
 	if req.RegenerateApiKey != nil && *req.RegenerateApiKey {
+		// A docker-host environment has no agent, so there is no agent API key to rotate; minting
+		// one would leave a live agent credential on a row that must carry none.
+		if updated.IsDockerHost() {
+			return nil, huma.Error400BadRequest("A docker-host environment has no agent API key to regenerate")
+		}
+
 		localUser, err := handlerutil.RequireUser(ctx)
 		if err != nil {
 			return nil, err
@@ -647,6 +664,12 @@ func (h *EnvironmentHandler) GetDeploymentSnippets(ctx context.Context, input *G
 		return nil, huma.Error404NotFound("Environment not found")
 	}
 
+	// A docker-host environment is served directly by the manager and runs no agent, so it has no
+	// credentials to substitute into a snippet. Say that instead of reporting missing agent config.
+	if env.IsDockerHost() {
+		return nil, huma.Error400BadRequest("A docker-host environment has no agent deployment snippets")
+	}
+
 	if env.ApiKeyID == nil {
 		return nil, huma.Error400BadRequest("Environment does not have an API key configured")
 	}
@@ -715,7 +738,9 @@ func (h *EnvironmentHandler) GetEnvironmentVersion(ctx context.Context, input *G
 	defer cancel()
 
 	var versionInfo version.Info
-	if env.ID == LocalEnvironmentID && h.localVersion != nil {
+	// The manager serves docker-host environments in-process, so like the local environment their
+	// version is this process's version rather than an agent's.
+	if (env.ID == LocalEnvironmentID || env.IsDockerHost()) && h.localVersion != nil {
 		versionInfo = *h.localVersion(reqCtx)
 	} else if proxyErr := h.environmentService.ProxyJSONRequestForEnvironment(reqCtx, *env, http.MethodGet, "/api/app-version", nil, &versionInfo); proxyErr != nil {
 		return nil, handlerutil.TranslateRemoteProxyError(proxyErr)
@@ -831,6 +856,10 @@ func (h *EnvironmentHandler) loadEnvironmentMTLSFiles(ctx context.Context, envir
 	env, err := h.environmentService.GetEnvironmentByID(ctx, environmentID)
 	if err != nil {
 		return nil, nil, huma.Error404NotFound("Environment not found")
+	}
+	// The manager talks to a docker-host daemon itself; there is no agent mTLS material to hand out.
+	if env.IsDockerHost() {
+		return nil, nil, huma.Error400BadRequest("A docker-host environment has no agent mTLS assets")
 	}
 	if !env.IsEdge {
 		return nil, nil, huma.Error400BadRequest("Environment is not an edge agent")

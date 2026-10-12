@@ -156,6 +156,32 @@ func (s *Service) Collect(ctx context.Context, items []containertypes.Summary) (
 	return samples, nil
 }
 
+// HostSample aggregates one sample per container into a single reading. It exists for environments
+// reachable only over the Docker API: nobody samples the host behind that endpoint, so the running
+// containers are the closest reading the manager can take without reporting its own machine.
+type HostSample struct {
+	CPUPercent       float64
+	MemoryUsageBytes uint64
+	Containers       int
+}
+
+// SumHost aggregates the current samples of the given containers, reusing the same cache and flights
+// as Collect so overlapping dashboard and metrics collections share Docker calls.
+func (s *Service) SumHost(ctx context.Context, ids []string) (HostSample, error) {
+	raw, err := collect(ctx, s.batchTimeout, ids, s.fetch)
+	if err != nil {
+		return HostSample{}, fmt.Errorf("failed to collect container resource samples: %w", err)
+	}
+	var sample HostSample
+	for _, statsData := range raw {
+		built := stats.BuildSample(statsData)
+		sample.CPUPercent += float64(built.CPUTenths) / 10
+		sample.MemoryUsageBytes += built.MemoryUsageBytes
+		sample.Containers++
+	}
+	return sample, nil
+}
+
 // collect runs fetch for each ID with bounded concurrency under timeout. Individual failures are
 // skipped; on batch timeout or cancellation it returns the partial result with the error.
 func collect[T any](ctx context.Context, timeout time.Duration, ids []string, fetch func(context.Context, string) (T, error)) (map[string]T, error) {

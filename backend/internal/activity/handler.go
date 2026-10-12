@@ -22,6 +22,7 @@ import (
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/remenv"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
@@ -89,18 +90,36 @@ func NewHandler(activityService *ActivityService, localEnvironment EnvironmentDe
 	}
 }
 
-func (h *ActivityHandler) ListActivities(ctx context.Context, input *ListActivitiesInput) (*handlerutil.Page[activity.Activity], error) {
-	if input.EnvironmentID != "0" {
-		return h.proxyListActivitiesInternal(ctx, input)
+// servedInProcessInternal reports whether the manager holds this environment's data itself. The local
+// environment and docker-host environments are served in-process (there is no agent to proxy to);
+// agent environments are reached over HTTP.
+func (h *ActivityHandler) servedInProcessInternal(ctx context.Context, environmentID string) bool {
+	if environmentID == environment.LocalEnvironmentID {
+		return true
 	}
+	// The request context carries the resolved environment target for manager-local paths too (the
+	// middleware attaches it for docker-host environments), which is the only reliable signal while a
+	// freshly created docker-host environment has not been seen by the active-remote-environment cache.
+	if envcontext.IsDockerHostTarget(ctx) {
+		return true
+	}
+	if environmentID == "" || h.environment.GetActiveRemoteEnvironment == nil {
+		return false
+	}
+	localEnvironment, ok := h.environment.GetActiveRemoteEnvironment(environmentID).Get()
+	return ok && localEnvironment.IsDockerHost()
+}
 
+// listInProcessActivitiesInternal reads the activity rows the manager recorded itself, which is the
+// only source for the local environment and for docker-host environments.
+func (h *ActivityHandler) listInProcessActivitiesInternal(ctx context.Context, environmentID string, input *ListActivitiesInput) (*handlerutil.Page[activity.Activity], error) {
 	params := activityListParamsInternal(input)
 
-	activities, paginationResp, err := h.activityService.ListActivitiesPaginated(ctx, input.EnvironmentID, params)
+	activities, paginationResp, err := h.activityService.ListActivitiesPaginated(ctx, environmentID, params)
 	if err != nil {
 		return nil, huma.Error500InternalServerError(err.Error())
 	}
-	h.applyActivitySourceLabelsInternal(ctx, input.EnvironmentID, activities)
+	h.applyActivitySourceLabelsInternal(ctx, environmentID, activities)
 
 	return &handlerutil.Page[activity.Activity]{
 		Body: base.Paginated[activity.Activity]{
@@ -111,6 +130,14 @@ func (h *ActivityHandler) ListActivities(ctx context.Context, input *ListActivit
 	}, nil
 }
 
+func (h *ActivityHandler) ListActivities(ctx context.Context, input *ListActivitiesInput) (*handlerutil.Page[activity.Activity], error) {
+	if !h.servedInProcessInternal(ctx, input.EnvironmentID) {
+		return h.proxyListActivitiesInternal(ctx, input)
+	}
+
+	return h.listInProcessActivitiesInternal(ctx, input.EnvironmentID, input)
+}
+
 func (h *ActivityHandler) GetActivity(ctx context.Context, input *GetActivityInput) (*handlerutil.Out[activity.Detail], error) {
 	if input.ActivityID == "" {
 		return nil, huma.Error400BadRequest("activity id is required")
@@ -119,7 +146,7 @@ func (h *ActivityHandler) GetActivity(ctx context.Context, input *GetActivityInp
 	detail, err := h.activityService.GetActivityDetail(ctx, input.EnvironmentID, input.ActivityID, input.Limit)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			if input.EnvironmentID != "0" {
+			if !h.servedInProcessInternal(ctx, input.EnvironmentID) {
 				return h.proxyGetActivityInternal(ctx, input)
 			}
 			return nil, huma.Error404NotFound("activity not found")
@@ -145,7 +172,7 @@ func (h *ActivityHandler) ClearHistory(ctx context.Context, input *ClearActivity
 		return nil, huma.Error500InternalServerError(err.Error())
 	}
 
-	if input.EnvironmentID != "0" {
+	if !h.servedInProcessInternal(ctx, input.EnvironmentID) {
 		out, proxyClearHistoryErr := h.proxyClearHistoryInternal(ctx, input)
 		if proxyClearHistoryErr != nil {
 			return nil, proxyClearHistoryErr
@@ -172,7 +199,7 @@ func (h *ActivityHandler) CancelActivity(ctx context.Context, input *CancelActiv
 	if err != nil {
 		switch {
 		case errors.Is(err, gorm.ErrRecordNotFound):
-			if input.EnvironmentID != "0" {
+			if !h.servedInProcessInternal(ctx, input.EnvironmentID) {
 				return h.proxyCancelActivityInternal(ctx, input)
 			}
 			return nil, huma.Error404NotFound("activity not found")
@@ -332,18 +359,30 @@ func (h *ActivityHandler) runRemoteActivityStreamPollerInternal(ctx context.Cont
 	poll := func() {
 		currentEnvironment := localEnvironment
 		if h.environment.GetActiveRemoteEnvironment != nil {
-			var ok bool
-			currentEnvironment, ok = h.environment.GetActiveRemoteEnvironment(environmentID).Get()
-			if !ok {
+			// The snapshot cache is refreshed from agent activity, so a docker-host environment can be
+			// missing from it (while the reconcile loop that handed us localEnvironment is not). Keep
+			// polling those in-process instead of silently dropping their stream.
+			if cached, ok := h.environment.GetActiveRemoteEnvironment(environmentID).Get(); ok {
+				currentEnvironment = cached
+			} else if !localEnvironment.IsDockerHost() {
 				return
 			}
 		}
 
-		output, err := h.proxyListActivitiesForEnvironmentInternal(ctx, currentEnvironment, &ListActivitiesInput{
+		streamInput := &ListActivitiesInput{
 			EnvironmentID: environmentID,
 			Limit:         resolveActivityStreamLimitInternal(limit),
 			Order:         "desc",
-		})
+		}
+		var output *handlerutil.Page[activity.Activity]
+		var err error
+		if currentEnvironment.IsDockerHost() {
+			// The manager records docker-host activity itself, so the stream reads those rows
+			// directly instead of proxying to an agent that does not exist.
+			output, err = h.listInProcessActivitiesInternal(ctx, environmentID, streamInput)
+		} else {
+			output, err = h.proxyListActivitiesForEnvironmentInternal(ctx, currentEnvironment, streamInput)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return

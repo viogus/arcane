@@ -32,6 +32,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/s3"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 )
 
@@ -110,7 +111,7 @@ func TestRenameVolumeRejectsInvalidAndProtectedNames(t *testing.T) {
 
 func applyVolumeBackupMigrationsInternal(t *testing.T, gormDB *gorm.DB) {
 	t.Helper()
-	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql"} {
+	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql", "095_add_volume_backup_policy_environment.sql", "097_add_volume_backup_environment.sql"} {
 		migration, err := os.ReadFile("../../resources/migrations/sqlite/" + name)
 		require.NoError(t, err)
 		require.NoError(t, gormDB.Exec(strings.Split(string(migration), "-- +goose Down")[0]).Error)
@@ -192,6 +193,52 @@ func TestListBackupsPaginatedByManagementTypeInternal(t *testing.T) {
 	for _, entry := range volumeRows {
 		require.Equal(t, backup.ManagementTypeVolume, entry.Type)
 	}
+}
+
+func TestListBackupsIsolatesHistoryPerEnvironment(t *testing.T) {
+	gormDB, err := gorm.Open(sqlite.Open("file:volume-backup-environments?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	applyVolumeBackupMigrationsInternal(t, gormDB)
+	service := &VolumeService{db: &database.DB{DB: gormDB}}
+	store := service.backupStoreInternal()
+
+	// Two daemons can each own a volume called "app-data"; the same name must not mix histories.
+	managerRecord := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(t.Context(), managerRecord))
+	remoteCtx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-remote"})
+	remoteRecord := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(remoteCtx, remoteRecord))
+
+	managerRows, total, err := service.listBackupsInternal(t.Context(), "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, managerRows, 1)
+	require.Equal(t, managerRecord.ID, managerRows[0].ID)
+
+	remoteRows, total, err := service.listBackupsInternal(remoteCtx, "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, remoteRows, 1)
+	require.Equal(t, remoteRecord.ID, remoteRows[0].ID)
+
+	// Completion goes through Save, which must not blank the stored environment (the DTO has no
+	// field for it) and thereby drop the row out of its own environment's history.
+	managerRecord.Status = string(VolumeBackupStatusFailed)
+	require.NoError(t, store.Save(t.Context(), managerRecord))
+	var stored VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", managerRecord.ID).First(&stored).Error)
+	require.Equal(t, "0", stored.EnvironmentID)
+	managerRows, total, err = service.listBackupsInternal(t.Context(), "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, managerRows, 1)
+
+	// Rows written by the manager default to "0" and stay invisible to a remote environment.
+	require.NoError(t, gormDB.Create(&VolumeBackup{VolumeName: "app-data", Status: VolumeBackupStatusSucceeded}).Error)
+	remoteRows, total, err = service.listBackupsInternal(remoteCtx, "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, remoteRows, 1)
 }
 
 func newVolumeWorkspaceTestDockerClientInternal(t *testing.T, server *httptest.Server) *client.Client {
