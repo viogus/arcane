@@ -1,12 +1,15 @@
 package environment
 
 import (
+	"context"
 	"hash/maphash"
 	"strings"
 	"sync"
 
 	"github.com/samber/hot"
 	"go.getarcane.app/kit/pkg"
+
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 )
 
 // edgeTokenCache maps agent tokens to environment IDs; the reverse index drops
@@ -117,4 +120,16 @@ func (c *remoteEnvSnapshotCache) put(env Environment) {
 		delete(c.envs, env.ID)
 	}
 	c.revision++
+}
+
+// RuntimeTarget is the context target for work this process runs against the environment's own
+// daemon: its identity, the endpoint that daemon is reached on, and the bearer token a tunnel in
+// front of it requires. Every path that rebuilds a target from a stored environment must use it, so
+// a credential or endpoint field added here cannot be forgotten at one of the call sites.
+func (e Environment) RuntimeTarget(ctx context.Context) envcontext.Target {
+	return envcontext.Target{
+		EnvironmentID:   e.ID,
+		DockerHost:      e.DockerHostURL(),
+		DockerHostToken: e.DecryptedDockerHostToken(ctx),
+	}
 }

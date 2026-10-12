@@ -424,9 +424,9 @@ func TestListWebhookSummaries_ResolvesTargetNames(t *testing.T) {
 	db := setupWebhookServiceTestDB(t)
 	svc := newTestWebhookService(db)
 
-	require.NoError(t, db.WithContext(ctx).Exec(`CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL)`).Error)
+	require.NoError(t, db.WithContext(ctx).Exec(`CREATE TABLE projects (id TEXT PRIMARY KEY, environment_id TEXT NOT NULL, name TEXT NOT NULL)`).Error)
 	require.NoError(t, db.WithContext(ctx).Exec(`CREATE TABLE gitops_syncs (id TEXT PRIMARY KEY, environment_id TEXT NOT NULL, name TEXT NOT NULL)`).Error)
-	require.NoError(t, db.WithContext(ctx).Exec(`INSERT INTO projects (id, name) VALUES (?, ?)`, "project-1", "Main Project").Error)
+	require.NoError(t, db.WithContext(ctx).Exec(`INSERT INTO projects (id, environment_id, name) VALUES (?, ?, ?)`, "project-1", types.LocalDockerEnvironmentID, "Main Project").Error)
 	require.NoError(t, db.WithContext(ctx).Exec(`INSERT INTO gitops_syncs (id, environment_id, name) VALUES (?, ?, ?)`, "sync-1", types.LocalDockerEnvironmentID, "Deploy Sync").Error)
 
 	_, _, err := svc.CreateWebhook(ctx, "project-hook", WebhookTargetTypeProject, WebhookActionTypeUpdate, "project-1", types.LocalDockerEnvironmentID, user.Actor{}, authz.SudoPermissionSet())

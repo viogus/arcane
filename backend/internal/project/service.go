@@ -1101,7 +1101,7 @@ func (s *ProjectService) updateProjectServices(ctx context.Context, projectID st
 		}
 	}
 
-	defer s.eventService.BeginComposeSuppressionWindow(compProj.Name)()
+	defer s.eventService.BeginComposeSuppressionWindow(ctx, compProj.Name)()
 
 	// 2. Set status to deploying/restarting
 	if updateProjectStatusErr := s.updateProjectStatus(ctx, projectID, ProjectStatusDeploying); updateProjectStatusErr != nil {
@@ -1284,7 +1284,7 @@ func (s *ProjectService) deployProject(ctx context.Context, projectID string, us
 		Load: func(ctx context.Context) (*types.Project, error) {
 			model, loadComposeProjectForProjectErr := s.loadComposeProjectForProject(ctx, projectFromDb, deployment.PrepareProjectBindDirectories(projectFromDb.Path))
 			if loadComposeProjectForProjectErr == nil {
-				closeSuppression = s.eventService.BeginComposeSuppressionWindow(model.Name)
+				closeSuppression = s.eventService.BeginComposeSuppressionWindow(ctx, model.Name)
 			}
 			return model, loadComposeProjectForProjectErr
 		},
@@ -1347,7 +1347,7 @@ func (s *ProjectService) downProject(ctx context.Context, projectFromDb *Project
 		return fmt.Errorf("failed to update project status to stopping: %w", updateProjectStatusErr)
 	}
 
-	defer s.eventService.BeginComposeSuppressionWindow(proj.Name)()
+	defer s.eventService.BeginComposeSuppressionWindow(ctx, proj.Name)()
 
 	if composeDownErr := projects.ComposeDown(ctx, proj, false); composeDownErr != nil {
 		_ = s.updateProjectStatus(context.WithoutCancel(ctx), projectID, projectFromDb.Status)
@@ -1587,7 +1587,7 @@ func (s *ProjectService) DestroyProject(ctx context.Context, projectID string, r
 		compProj, lerr := s.loadComposeProjectForProject(ctx, proj, nil)
 		switch {
 		case lerr == nil:
-			defer s.eventService.BeginComposeSuppressionWindow(compProj.Name)()
+			defer s.eventService.BeginComposeSuppressionWindow(ctx, compProj.Name)()
 			if derr := projects.ComposeDown(ctx, compProj, true); derr != nil && !missing(derr) {
 				return fmt.Errorf("failed to remove project volumes: %w", derr)
 			}
@@ -1695,7 +1695,7 @@ func (s *ProjectService) PullProjectImages(ctx context.Context, projectID string
 		return fmt.Errorf("failed to load compose project: %w", lerr)
 	}
 
-	defer s.eventService.BeginComposeSuppressionWindow(compProj.Name)()
+	defer s.eventService.BeginComposeSuppressionWindow(ctx, compProj.Name)()
 
 	var pullErrs []error
 	for _, imageRef := range projects.PullableImageRefs(compProj) {
@@ -1722,7 +1722,7 @@ func (s *ProjectService) BuildProjectServices(ctx context.Context, projectID str
 		return fmt.Errorf("failed to load compose project in %s: %w", projectFromDb.Path, derr)
 	}
 
-	defer s.eventService.BeginComposeSuppressionWindow(projectModel.Name)()
+	defer s.eventService.BeginComposeSuppressionWindow(ctx, projectModel.Name)()
 
 	return s.composeCoordinator.BuildServices(ctx, projectID, projectModel, options, progressWriter, s.deployment.ImageOperations(user, nil))
 }
@@ -1751,7 +1751,7 @@ func (s *ProjectService) RestartProject(ctx context.Context, projectID string, s
 		return fmt.Errorf("failed to update project status to restarting: %w", updateProjectStatusErr)
 	}
 
-	defer s.eventService.BeginComposeSuppressionWindow(compProj.Name)()
+	defer s.eventService.BeginComposeSuppressionWindow(ctx, compProj.Name)()
 
 	if composeRestartErr := projects.ComposeRestart(ctx, compProj, services); composeRestartErr != nil {
 		_ = s.updateProjectStatus(context.WithoutCancel(ctx), projectID, proj.Status)

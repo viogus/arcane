@@ -682,10 +682,10 @@ func TestRecreateContainerDaemonCorrelation(t *testing.T) {
 		if path == "/containers/new-id/start" {
 			id = "new-id"
 		}
-		if !events.ShouldSuppressDaemonEvent("container", id, name, "") {
+		if !events.ShouldSuppressDaemonEvent(context.Background(), "container", id, name, "") {
 			t.Errorf("missing correlation before Docker mutation %s", path)
 		}
-		if events.ShouldSuppressDaemonEvent("container", "unrelated", "other", "") {
+		if events.ShouldSuppressDaemonEvent(context.Background(), "container", "unrelated", "other", "") {
 			t.Errorf("unrelated container suppressed during %s", path)
 		}
 		observed <- path
@@ -741,8 +741,8 @@ func TestRecreateContainerDaemonCorrelation(t *testing.T) {
 			<-observed,
 		},
 	)
-	require.True(t, events.ShouldSuppressDaemonEvent("container", "old-id", "", ""))
-	require.True(t, events.ShouldSuppressDaemonEvent("container", "new-id", "", ""))
+	require.True(t, events.ShouldSuppressDaemonEvent(context.Background(), "container", "old-id", "", ""))
+	require.True(t, events.ShouldSuppressDaemonEvent(context.Background(), "container", "new-id", "", ""))
 	journals, err := kvService.ListByPrefix(t.Context(), redeployJournalKeyPrefix)
 	require.NoError(t, err)
 	require.Empty(t, journals)

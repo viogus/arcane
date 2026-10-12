@@ -24,13 +24,14 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/backup"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume/children/backup/children/policies"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow/flowtest"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 )
 
 func applyVolumeBackupMigrations(t *testing.T, gormDB *gorm.DB) {
 	t.Helper()
-	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql"} {
+	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql", "096_add_volume_backup_policy_environment.sql", "098_add_volume_backup_environment.sql"} {
 		migration, err := os.ReadFile("../../../../resources/migrations/sqlite/" + name)
 		require.NoError(t, err)
 		require.NoError(t, gormDB.Exec(strings.Split(string(migration), "-- +goose Down")[0]).Error)
@@ -115,7 +116,9 @@ func TestVolumeBackupPolicy_ScheduledRunCreatesActivity(t *testing.T) {
 	job, registered := jobScheduler.jobs["volume-backup:"+policy.ID]
 	require.True(t, registered)
 	// Holding the volume's admission lease skips the scheduled run, which still completes its activity.
-	lease, admitted, err := engine.TryAcquireRun(t.Context(), backup.VolumeAdmissionScope, policy.VolumeName)
+	// The lease is keyed per environment, as the scheduled run acquires it.
+	lease, admitted, err := engine.TryAcquireRun(t.Context(), backup.VolumeAdmissionScope,
+		volumeAdmissionIDInternal(envcontext.EnvironmentIDOrDefault(t.Context()), policy.VolumeName))
 	require.NoError(t, err)
 	require.True(t, admitted)
 	defer lease.Release(t.Context())

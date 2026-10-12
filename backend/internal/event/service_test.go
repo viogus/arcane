@@ -34,6 +34,11 @@ func setupEventServiceTestDB(t *testing.T) *database.DB {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&Event{}))
+	// SQLite :memory: gives every connection its own database, and the daemon event writer runs on
+	// its own goroutine, so pin the pool to the migrated connection.
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	sqlDB.SetMaxOpenConns(1)
 	return &database.DB{DB: db}
 }
 
@@ -377,7 +382,7 @@ func TestIngestAgentEventAuthenticatedEnvironment(t *testing.T) {
 			require.Equal(t, "remote-environment", *recorded.EnvironmentID)
 			require.Equal(t, "System", *recorded.Username)
 			require.Equal(t, req.Metadata, recorded.Metadata)
-			require.False(t, svc.ShouldSuppressDaemonEvent("container", "container-id", "web", "demo"))
+			require.False(t, svc.ShouldSuppressDaemonEvent(context.Background(), "container", "container-id", "web", "demo"))
 			var persisted Event
 			require.NoError(t, db.First(&persisted).Error)
 			require.Equal(t, "remote-environment", *persisted.EnvironmentID)
@@ -390,7 +395,7 @@ func TestIngestAgentEventAuthenticatedEnvironment(t *testing.T) {
 			recorded, err = svc.IngestAgentEvent(t.Context(), "remote-environment", req)
 			require.NoError(t, err)
 			require.Equal(t, "operator", *recorded.Username)
-			require.False(t, svc.ShouldSuppressDaemonEvent("container", "container-id", "web", "demo"))
+			require.False(t, svc.ShouldSuppressDaemonEvent(context.Background(), "container", "container-id", "web", "demo"))
 		})
 	}
 }
@@ -746,7 +751,7 @@ func TestDaemonSuppressionAndFailureAllowLaterObservations(t *testing.T) {
 				}))
 			}
 			if !failure {
-				svc.MarkDockerExpectation("container", "web", "")
+				svc.MarkDockerExpectation(context.Background(), "container", "web", "")
 			}
 			svc.RecordDockerEvent(t.Context(), msg)
 			require.NoError(t, svc.Stop(t.Context()))
@@ -913,7 +918,70 @@ func TestCreateEventCorrelationEligibility(t *testing.T) {
 				},
 			)
 			require.NoError(t, err)
-			require.Equal(t, tc.want, svc.ShouldSuppressDaemonEvent(strings.SplitN(string(tc.eventType), ".", 2)[0], "id", "", ""))
+			require.Equal(t, tc.want, svc.ShouldSuppressDaemonEvent(context.Background(), strings.SplitN(string(tc.eventType), ".", 2)[0], "id", "", ""))
 		})
 	}
+}
+
+func TestEventService_ListEventsPaginated_EnvironmentFilter(t *testing.T) {
+	ctx := t.Context()
+	db := setupEventServiceTestDB(t)
+	svc := NewEventService(db, nil, nil)
+
+	armDirect := "559e0aab-b5c6-4d5d-92da-684959ef23fb"
+	tyoDirect := "956f3648-b37e-48e7-99eb-3e6ef6cf5441"
+	seed := []Event{
+		{Type: EventTypeContainerStart, Severity: EventSeverityInfo, Title: "arm-direct event", EnvironmentID: &armDirect},
+		{Type: EventTypeContainerStart, Severity: EventSeverityInfo, Title: "tyo-direct event", EnvironmentID: &tyoDirect},
+		{Type: EventTypeContainerStart, Severity: EventSeverityInfo, Title: "manager event"},
+	}
+	for i := range seed {
+		require.NoError(t, db.Create(&seed[i]).Error, "seed event %d", i)
+	}
+
+	listWithEnvironmentFilter := func(value string) []string {
+		events, _, err := svc.ListEventsPaginated(ctx, pagination.QueryParams{
+			Limit:   10,
+			Filters: map[string]string{"environmentId": value},
+		})
+		require.NoError(t, err)
+		titles := make([]string, 0, len(events))
+		for _, e := range events {
+			titles = append(titles, e.Title)
+		}
+		return titles
+	}
+
+	require.ElementsMatch(t, []string{"arm-direct event"}, listWithEnvironmentFilter(armDirect))
+	require.ElementsMatch(t, []string{"arm-direct event", "tyo-direct event"}, listWithEnvironmentFilter(armDirect+","+tyoDirect))
+	require.ElementsMatch(t, []string{"arm-direct event", "tyo-direct event", "manager event"}, listWithEnvironmentFilter(""))
+	require.Empty(t, listWithEnvironmentFilter("0"))
+}
+
+func TestEventHandler_ListEventsAppliesEnvironmentFilter(t *testing.T) {
+	ctx := t.Context()
+	db := setupEventServiceTestDB(t)
+	svc := NewEventService(db, nil, nil)
+	handler := &EventHandler{eventService: svc}
+
+	armDirect := "559e0aab-b5c6-4d5d-92da-684959ef23fb"
+	seed := []Event{
+		{Type: EventTypeContainerStart, Severity: EventSeverityInfo, Title: "arm-direct event", EnvironmentID: &armDirect},
+		{Type: EventTypeContainerStart, Severity: EventSeverityInfo, Title: "manager event"},
+	}
+	for i := range seed {
+		require.NoError(t, db.Create(&seed[i]).Error, "seed event %d", i)
+	}
+
+	page, err := handler.ListEvents(ctx, &ListEventsInput{Limit: 10, EnvironmentID: armDirect})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), page.Body.Pagination.TotalItems)
+	require.Len(t, page.Body.Data, 1)
+	require.Equal(t, "arm-direct event", page.Body.Data[0].Title)
+	require.NotNil(t, page.Body.Data[0].EnvironmentID)
+	require.Equal(t, armDirect, *page.Body.Data[0].EnvironmentID)
+
+	unfiltered, err := handler.ListEvents(ctx, &ListEventsInput{Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, int64(2), unfiltered.Body.Pagination.TotalItems)
 }

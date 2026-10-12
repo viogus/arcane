@@ -3,6 +3,7 @@ package settings
 import (
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/middleware"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/edge"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 )
 
 func TestSettingsHandlerAppendRuntimeSettings(t *testing.T) {
@@ -114,6 +116,36 @@ func TestSettingsHandlerRemoteWorkspaceSettingsVisibility(t *testing.T) {
 	output, err = handler.GetSettings(adminCtx, &GetSettingsInput{EnvironmentID: "env-remote"})
 	require.NoError(t, err)
 	require.Equal(t, remoteSettings, output.Body)
+}
+
+func TestSettingsHandlerServesDockerHostEnvironmentsLocally(t *testing.T) {
+	// A docker-host environment is served in-process but has no agent to proxy to: proxying its
+	// settings returned 500 for the environment's public settings, which the dashboard polls.
+	settingsService, err := newSettingsServiceForTest(t, t.Context(), setupSettingsTestDB(t))
+	require.NoError(t, err)
+
+	proxyCalls := 0
+	proxy := func(_ context.Context, _, _, _ string, _ []byte, _ any) error {
+		proxyCalls++
+		return errors.New("a docker-host environment has no agent to proxy to")
+	}
+	handler := &SettingsHandler{settingsService: settingsService, proxyRemoteJSON: proxy}
+
+	ctx := envcontext.WithTarget(t.Context(), envcontext.Target{
+		EnvironmentID: "env-docker-host",
+		DockerHost:    "tcp://192.168.2.33:6001",
+	})
+
+	publicSettings, err := handler.GetPublicSettings(ctx, &GetPublicSettingsInput{EnvironmentID: "env-docker-host"})
+	require.NoError(t, err)
+	require.NotEmpty(t, publicSettings.Body)
+
+	adminCtx := context.WithValue(ctx, middleware.ContextKeyUserPermissions, authz.SudoPermissionSet())
+	allSettings, err := handler.GetSettings(adminCtx, &GetSettingsInput{EnvironmentID: "env-docker-host"})
+	require.NoError(t, err)
+	require.NotEmpty(t, allSettings.Body)
+
+	require.Zero(t, proxyCalls)
 }
 
 func runtimeSettingKeys(publicSettings []settings.PublicSetting) map[string]string {

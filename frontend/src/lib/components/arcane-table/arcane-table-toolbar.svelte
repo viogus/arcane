@@ -15,7 +15,7 @@
 	import DataTableFacetedFilter from './arcane-table-filter.svelte';
 	import DataTableTextFilter from './arcane-table-text-filter.svelte';
 	import DataTableViewOptions from './arcane-table-view-options.svelte';
-	import type { BulkAction } from './arcane-table.types.svelte';
+	import type { BulkAction, FilterOption } from './arcane-table.types.svelte';
 	import {
 		imageUpdateFilters,
 		usageFilters,
@@ -37,6 +37,7 @@
 		customToolbarActions,
 		class: className,
 		imageNameFilterOptions = [],
+		environmentFilterOptions = [],
 		wrapText = false,
 		onToggleWrapText,
 		isFiltered = false,
@@ -53,6 +54,7 @@
 		customToolbarActions?: Snippet;
 		class?: string;
 		imageNameFilterOptions?: string[];
+		environmentFilterOptions?: FilterOption[];
 		wrapText?: boolean;
 		onToggleWrapText?: () => void;
 		isFiltered?: boolean;
@@ -65,10 +67,13 @@
 		}))
 	);
 
+	// Prefer the merged-list column; the event log defines its own `environmentId` column and
+	// passes its options in. A table that merely has a column with that name is not
+	// environment-filtered, so it gets no facet.
 	const environmentColumn = $derived(
-		table.getAllColumns().some((col) => col.id === ENVIRONMENT_FILTER) ? table.getColumn(ENVIRONMENT_FILTER) : undefined
+		table.getAllColumns().find((col) => col.id === ENVIRONMENT_FILTER) ??
+			(environmentFilterOptions.length > 0 ? table.getColumn('environmentId') : undefined)
 	);
-	const environmentFilterOptions = $derived(environmentStore.shown.map((env) => ({ label: env.name, value: env.id })));
 	const usageColumn = $derived(table.getAllColumns().some((col) => col.id === 'inUse') ? table.getColumn('inUse') : undefined);
 	const updatesColumn = $derived(
 		table.getAllColumns().some((col) => col.id === 'updates') ? table.getColumn('updates') : undefined
@@ -88,6 +93,13 @@
 	);
 	const typeColumn = $derived(table.getAllColumns().some((col) => col.id === 'type') ? table.getColumn('type') : undefined);
 	const typeColumnFilterOptions = $derived(typeColumn?.columnDef.meta?.filterOptions ?? []);
+	// Options come from the page when it passes them (the event log loads them per environment),
+	// otherwise from the environments a merged list is currently showing.
+	const environmentColumnFilterOptions = $derived(
+		environmentFilterOptions.length > 0
+			? environmentFilterOptions
+			: environmentStore.shown.map((env) => ({ label: env.name, value: env.id }))
+	);
 	const tagsColumn = $derived(table.getAllColumns().some((col) => col.id === 'tags') ? table.getColumn('tags') : undefined);
 	const tagsColumnFilterOptions = $derived(tagsColumn?.columnDef.meta?.filterOptions ?? []);
 	const labelColumn = $derived(table.getAllColumns().some((col) => col.id === 'label') ? table.getColumn('label') : undefined);
@@ -117,7 +129,11 @@
 
 {#snippet filterList()}
 	{#if environmentColumn}
-		<DataTableFacetedFilter column={environmentColumn} title={m.resource_environment_cap()} options={environmentFilterOptions} />
+		<DataTableFacetedFilter
+			column={environmentColumn}
+			title={m.resource_environment_cap()}
+			options={environmentColumnFilterOptions}
+		/>
 	{/if}
 	{#if typeColumn && typeColumnFilterOptions.length > 0}
 		<DataTableFacetedFilter column={typeColumn} title={m.common_type()} options={typeColumnFilterOptions} />

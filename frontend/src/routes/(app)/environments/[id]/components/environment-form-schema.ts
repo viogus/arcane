@@ -6,6 +6,7 @@ export const environmentUpdateSchema = z.object({
 	name: z.string().min(1),
 	enabled: z.boolean(),
 	apiUrl: z.string(),
+	dockerHost: z.string(),
 	accessToken: z
 		.string()
 		.trim()

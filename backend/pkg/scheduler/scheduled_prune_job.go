@@ -10,6 +10,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/notification"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/system"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/timeouts"
 	scheduleutil "github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/schedule"
 )
@@ -64,7 +65,11 @@ func (j *ScheduledPruneJob) Run(ctx context.Context) (schedulertypes.Outcome, er
 		"buildCache", req.BuildCache,
 	)
 
-	result, started, err := j.systemService.PruneScheduled(ctx, "0", req)
+	// A docker-host environment's runs execute in this process with that environment's target in
+	// context, so the prune is attributed to it instead of the manager's own daemon.
+	environmentID := envcontext.EnvironmentIDOrDefault(ctx)
+
+	result, started, err := j.systemService.PruneScheduled(ctx, environmentID, req)
 	if started {
 		defer func() {
 			notifyCtx, cancelNotify := context.WithTimeout(context.WithoutCancel(ctx), timeouts.DefaultHTTPClient)

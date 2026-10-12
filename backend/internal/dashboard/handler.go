@@ -21,6 +21,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/remenv"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 )
@@ -224,19 +225,30 @@ func (h *DashboardHandler) runRemoteDashboardStreamPollerInternal(ctx context.Co
 
 		currentEnvironment := localEnvironment
 		if h.environmentService != nil {
-			var ok bool
-			currentEnvironment, ok = h.environmentService.GetActiveRemoteEnvironmentSnapshot(environmentID).Get()
-			if !ok {
+			// The snapshot cache is refreshed from agent activity, so a docker-host environment can be
+			// missing from it (while the reconcile loop that handed us localEnvironment is not). Keep
+			// polling those in-process instead of silently dropping their stream.
+			if cached, ok := h.environmentService.GetActiveRemoteEnvironmentSnapshot(environmentID).Get(); ok {
+				currentEnvironment = cached
+			} else if !localEnvironment.IsDockerHost() {
 				return
 			}
 		}
 
-		snapshot, err := h.fetchRemoteDashboardSnapshotInternal(pollCtx, currentEnvironment, debugAllGood)
-		if err != nil && isDashboardEndpointMissingInternal(err) {
-			// The agent runs a version without (or with an incompatible)
-			// aggregate dashboard endpoint; the underlying data is still
-			// there, so compose the snapshot from the granular endpoints.
-			snapshot, err = h.fetchLegacyDashboardSnapshotInternal(pollCtx, currentEnvironment)
+		var snapshot *dashboard.Snapshot
+		var err error
+		if currentEnvironment.IsDockerHost() {
+			// A docker-host environment is served in-process by the manager, so there is no agent
+			// endpoint to proxy to: build the snapshot against that environment's daemon instead.
+			snapshot, err = h.fetchInProcessDashboardSnapshotInternal(pollCtx, environmentID, currentEnvironment, debugAllGood)
+		} else {
+			snapshot, err = h.fetchRemoteDashboardSnapshotInternal(pollCtx, currentEnvironment, debugAllGood)
+			if err != nil && isDashboardEndpointMissingInternal(err) {
+				// The agent runs a version without (or with an incompatible)
+				// aggregate dashboard endpoint; the underlying data is still
+				// there, so compose the snapshot from the granular endpoints.
+				snapshot, err = h.fetchLegacyDashboardSnapshotInternal(pollCtx, currentEnvironment)
+			}
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -311,6 +323,25 @@ func (h *DashboardHandler) fetchRemoteDashboardSnapshotInternal(ctx context.Cont
 		return nil, common.Classify(common.ErrUnavailable, errors.New("dashboard snapshot not available"))
 	}
 	return &out.Data, nil
+}
+
+// fetchInProcessDashboardSnapshotInternal builds the snapshot for an environment the manager serves
+// itself over the Docker API (a docker-host environment). There is no agent to proxy to, so the
+// snapshot comes from the same service the REST handler uses, with the target environment carried
+// through the context so the snapshot is taken against that environment's daemon.
+func (h *DashboardHandler) fetchInProcessDashboardSnapshotInternal(ctx context.Context, environmentID string, localEnvironment environment.Environment, debugAllGood bool) (*dashboard.Snapshot, error) {
+	envCtx := envcontext.WithTarget(ctx, localEnvironment.RuntimeTarget(ctx))
+
+	snapshot, err := h.dashboardService.GetSnapshot(envCtx, DashboardActionItemsOptions{
+		DebugAllGood: debugAllGood,
+	}, false)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot == nil {
+		return nil, common.Classify(common.ErrUnavailable, errors.New("dashboard snapshot not available"))
+	}
+	return snapshot, nil
 }
 
 // fetchLegacyDashboardSnapshotInternal composes a dashboard snapshot from the

@@ -17,6 +17,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/userctx"
@@ -45,7 +46,9 @@ func NewHandler(service *Service, activityService *activity.ActivityService, env
 }
 
 func (h *Handler) GetBackupPolicy(ctx context.Context, input *GetVolumeBackupPolicyInput) (*handlerutil.Out[volume.BackupPolicyCollection], error) {
-	if input.EnvironmentID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so its
+	// backup policies are read from the manager's own database.
+	if input.EnvironmentID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		if h.environmentService == nil {
 			return nil, huma.Error500InternalServerError("environment service not available")
 		}
@@ -77,6 +80,9 @@ func (h *Handler) UpdateBackupPolicy(ctx context.Context, input *UpdateVolumeBac
 	var policies *volume.BackupPolicyCollection
 	var remoteResponse *base.ApiResponse[volume.BackupPolicyCollection]
 	errorStatus := http.StatusBadRequest
+	// A docker-host environment is served by this process: its policies are stored in the manager's
+	// own database, exactly like the local environment, and there is no agent to proxy the write to.
+	servedInProcess := input.EnvironmentID == "0" || envcontext.IsDockerHostTarget(ctx)
 	runtimeCtx := utils.ActivityRuntimeContext(ctx, h.appCtx)
 	_, err := activitylib.RunHandlerActivity(runtimeCtx, h.activityService, activitylib.HandlerOptions{
 		EnvironmentID:  input.EnvironmentID,
@@ -93,7 +99,7 @@ func (h *Handler) UpdateBackupPolicy(ctx context.Context, input *UpdateVolumeBac
 			"policyCount": len(input.Body.Policies),
 		},
 	}, func(activityCtx context.Context) error {
-		if input.EnvironmentID != "0" {
+		if !servedInProcess {
 			if h.environmentService == nil {
 				errorStatus = http.StatusInternalServerError
 				return errors.New("environment service not available")

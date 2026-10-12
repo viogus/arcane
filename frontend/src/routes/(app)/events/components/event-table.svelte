@@ -79,6 +79,12 @@
 		return environmentStore.available.find((e) => e.id === environmentId)?.name || environmentId;
 	}
 
+	// Events carry the environment they were attributed to, so the column is filterable:
+	// the value sent to the API is the environment id, while the badge shows its name.
+	const environmentFilterOptions = $derived(
+		environmentStore.available.map((environment) => ({ value: environment.id, label: environment.name }))
+	);
+
 	const columns = [
 		{
 			accessorKey: 'title',
@@ -104,7 +110,10 @@
 			cell: ResourceCell
 		},
 		{
-			id: 'environment',
+			// Filterable by the environment the event was attributed to; the API expects
+			// `environmentId`, so the column id doubles as the request filter key.
+			id: 'environmentId',
+			accessorFn: (item) => item.environmentId,
 			title: m.resource_environment_cap(),
 			cell: EnvironmentCell
 		},
@@ -126,7 +135,7 @@
 		{ id: 'severity', label: m.events_col_severity(), defaultVisible: true },
 		{ id: 'type', label: m.common_type(), defaultVisible: true },
 		{ id: 'resource', label: m.resource(), defaultVisible: true },
-		{ id: 'environment', label: m.resource_environment_cap(), defaultVisible: true },
+		{ id: 'environmentId', label: m.resource_environment_cap(), defaultVisible: true },
 		{ id: 'username', label: m.common_user(), defaultVisible: true },
 		{ id: 'timestamp', label: m.events_col_time(), defaultVisible: true }
 	];
@@ -233,7 +242,7 @@
 				getValue: (item: Event) => (item.environmentId ? environmentName(item.environmentId) : null),
 				icon: EnvironmentsIcon,
 				iconVariant: 'gray' as const,
-				show: (mobileFieldVisibility['environment'] ?? true) && !!item.environmentId
+				show: (mobileFieldVisibility['environmentId'] ?? true) && !!item.environmentId
 			},
 			{
 				label: m.common_user(),
@@ -278,6 +287,7 @@
 		return events;
 	}}
 	{columns}
+	{environmentFilterOptions}
 	{mobileFields}
 	rowActions={RowActions}
 	mobileCard={EventMobileCardSnippet}

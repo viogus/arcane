@@ -14,6 +14,7 @@ import (
 	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/middleware"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 )
@@ -56,12 +57,15 @@ type JobSchedulesHandler struct {
 }
 
 func (h *JobSchedulesHandler) ListJobs(ctx context.Context, input *ListJobsInput) (*GetJobsOutput, error) {
-	jobs, err := func() (*jobschedule.JobListResponse, error) {
-		if input.ID != "0" {
-			return h.jobService.ListRemoteJobs(ctx, input.ID)
-		}
-		return h.jobService.ListJobs(ctx)
-	}()
+	var jobs *jobschedule.JobListResponse
+	var err error
+	// A docker-host environment is served by this process: it has no agent to proxy to, so its
+	// schedules and runs are the manager's own.
+	if input.ID != "0" && !envcontext.IsDockerHostTarget(ctx) {
+		jobs, err = h.jobService.ListRemoteJobs(ctx, input.ID)
+	} else {
+		jobs, err = h.jobService.ListJobsForEnvironment(ctx, input.ID)
+	}
 	if err != nil {
 		return nil, jobHTTPError(err)
 	}
@@ -96,7 +100,9 @@ func (h *JobSchedulesHandler) RunJob(ctx context.Context, input *RunJobInput) (*
 }
 
 func (h *JobSchedulesHandler) Get(ctx context.Context, input *GetJobSchedulesInput) (*GetJobSchedulesOutput, error) {
-	if input.ID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so its
+	// schedules and runs are the manager's own.
+	if input.ID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		cfg, err := h.proxyRemoteJSON.JSON[jobschedule.Config](ctx, input.ID, http.MethodGet, "/api/environments/0/job-schedules", nil)
 		if err != nil {
 			return nil, err
@@ -109,7 +115,9 @@ func (h *JobSchedulesHandler) Get(ctx context.Context, input *GetJobSchedulesInp
 }
 
 func (h *JobSchedulesHandler) Update(ctx context.Context, input *UpdateJobSchedulesInput) (*handlerutil.Out[jobschedule.Config], error) {
-	if input.ID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so its
+	// schedules and runs are the manager's own.
+	if input.ID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		apiResp, err := h.proxyRemoteJSON.JSON[base.ApiResponse[jobschedule.Config]](ctx, input.ID, http.MethodPut, "/api/environments/0/job-schedules", input.Body)
 		if err != nil {
 			return nil, err
@@ -223,7 +231,9 @@ func (h *JobSchedulesHandler) AcknowledgeRun(ctx context.Context, input *jobsche
 // RestartWorker requests a continuous watcher's restart on the owning runtime,
 // forwarding remote requests to the agent. It does not enqueue a scheduled run.
 func (h *JobSchedulesHandler) RestartWorker(ctx context.Context, input *jobschedule.JobInput) (*RunJobOutput, error) {
-	if input.ID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so its
+	// schedules and runs are the manager's own.
+	if input.ID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		result, err := h.proxyRemoteJSON.JSON[jobschedule.JobRunResponse](ctx, input.ID, http.MethodPost, "/api/environments/0/jobs/"+input.JobID+"/restart", nil)
 		if err != nil {
 			return nil, err

@@ -22,6 +22,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/s3"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/entityjobs"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/jobcontext"
@@ -29,6 +30,28 @@ import (
 )
 
 const defaultSchedule = "0 0 2 * * *"
+
+// environmentIDFromContextInternal names the environment that owns the volume being operated on.
+// Requests for a docker-host environment carry that environment's target; everything else — the
+// local environment, agents serving their own API — is scoped to the local environment.
+func environmentIDFromContextInternal(ctx context.Context) string {
+	return envcontext.EnvironmentIDOrDefault(ctx)
+}
+
+// policyContextInternal scopes ctx to the environment a policy belongs to, keeping any daemon
+// endpoint the request already carried. The manager's own namespace needs no target.
+func policyContextInternal(ctx context.Context, policy *VolumeBackupPolicy) context.Context {
+	environmentID := policy.EnvironmentID
+	if environmentID == "" {
+		environmentID = environmentIDFromContextInternal(ctx)
+	}
+	if environmentID == "0" {
+		return ctx
+	}
+	target, _ := envcontext.TargetFromContext(ctx)
+	target.EnvironmentID = environmentID
+	return envcontext.WithTarget(ctx, target)
+}
 
 // Dependencies are the backup operations scheduled policies run through.
 type Dependencies struct {
@@ -86,7 +109,9 @@ func (s *Service) RegisterWorkflows(engine *flow.Engine) error {
 
 func (s *Service) policies(ctx context.Context, volumeName string) ([]VolumeBackupPolicy, error) {
 	var policies []VolumeBackupPolicy
-	if err := s.deps.DB.WithContext(ctx).Where("volume_name = ?", volumeName).Order("created_at ASC").Find(&policies).Error; err != nil {
+	if err := s.deps.DB.WithContext(ctx).
+		Where("environment_id = ? AND volume_name = ?", environmentIDFromContextInternal(ctx), volumeName).
+		Order("created_at ASC").Find(&policies).Error; err != nil {
 		return nil, fmt.Errorf("failed to load volume backup policies: %w", err)
 	}
 	return policies, nil
@@ -98,7 +123,9 @@ func (s *Service) Policy(ctx context.Context, volumeName, policyID string) (*Vol
 		return nil, nil
 	}
 	var policy VolumeBackupPolicy
-	err := s.deps.DB.WithContext(ctx).Where("id = ? AND volume_name = ?", policyID, volumeName).First(&policy).Error
+	err := s.deps.DB.WithContext(ctx).
+		Where("id = ? AND environment_id = ? AND volume_name = ?", policyID, environmentIDFromContextInternal(ctx), volumeName).
+		First(&policy).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -148,7 +175,9 @@ func (s *Service) UpdateBackupPolicies(ctx context.Context, volumeName string, u
 		Existing: existing,
 		ID:       func(policy *VolumeBackupPolicy) string { return policy.ID },
 		UpdateID: func(update volume.UpdateBackupPolicy) string { return update.ID },
-		New:      func() VolumeBackupPolicy { return VolumeBackupPolicy{VolumeName: volumeName} },
+		New: func() VolumeBackupPolicy {
+			return VolumeBackupPolicy{VolumeName: volumeName, EnvironmentID: environmentIDFromContextInternal(ctx)}
+		},
 		Build: func(ctx context.Context, policy *VolumeBackupPolicy, update volume.UpdateBackupPolicy) error {
 			normalized, validatePolicyUpdateErr := backup.ValidatePolicyUpdate(ctx, "volume", update, s.deps.S3Destinations)
 			if validatePolicyUpdateErr != nil {
@@ -173,7 +202,8 @@ func (s *Service) UpdateBackupPolicies(ctx context.Context, volumeName string, u
 func (s *Service) HasEnabledBackupPolicy(ctx context.Context, volumeName string) (bool, error) {
 	var count int64
 	if err := s.deps.DB.WithContext(ctx).Model(&VolumeBackupPolicy{}).
-		Where("volume_name = ? AND enabled = ?", volumeName, true).Count(&count).Error; err != nil {
+		Where("environment_id = ? AND volume_name = ? AND enabled = ?", environmentIDFromContextInternal(ctx), volumeName, true).
+		Count(&count).Error; err != nil {
 		return false, fmt.Errorf("failed to load volume backup policy override: %w", err)
 	}
 	return count > 0, nil
@@ -201,7 +231,11 @@ func (s *Service) runScheduledBackup(ctx context.Context, t flow.Task) (any, err
 		break
 	}
 	var policy VolumeBackupPolicy
-	if err := s.deps.DB.WithContext(ctx).Where("id = ? AND enabled = ?", input.PolicyID, true).First(&policy).Error; err != nil {
+	// The run's context names the environment the policy belongs to, so a policy of another
+	// environment is never backed up against this one's daemon.
+	if err := s.deps.DB.WithContext(ctx).
+		Where("id = ? AND environment_id = ? AND enabled = ?", input.PolicyID, environmentIDFromContextInternal(ctx), true).
+		First(&policy).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return scheduler.Outcome{Status: scheduler.Canceled, Message: "Backup policy disabled or deleted"}, nil
 		}
@@ -244,6 +278,9 @@ func (s *Service) reschedule(ctx context.Context, policy *VolumeBackupPolicy) {
 	if policy == nil {
 		return
 	}
+	// Install the job in the namespace of the environment that owns the policy, so startup
+	// registration (which runs without a request context) scopes policies correctly too.
+	ctx = policyContextInternal(ctx, policy)
 	if !policy.Enabled {
 		s.jobs.Unregister(ctx, policy.ID)
 		return
@@ -264,7 +301,9 @@ func (s *Service) reschedule(ctx context.Context, policy *VolumeBackupPolicy) {
 		},
 		ScheduleFn: func(ctx context.Context) string {
 			var current VolumeBackupPolicy
-			if err := s.deps.DB.WithContext(ctx).Where("id = ?", policyID).First(&current).Error; err != nil {
+			if err := s.deps.DB.WithContext(ctx).
+				Where("id = ? AND environment_id = ?", policyID, environmentIDFromContextInternal(ctx)).
+				First(&current).Error; err != nil {
 				return defaultSchedule
 			}
 			return current.Schedule
@@ -299,12 +338,41 @@ func (s *Service) Remove(ctx context.Context, volumeName string) {
 	for i := range policies {
 		s.jobs.Unregister(ctx, policies[i].ID)
 	}
-	if deleteBackupPolicyErr := s.deps.DB.WithContext(ctx).Where("volume_name = ?", volumeName).Delete(&VolumeBackupPolicy{}).Error; deleteBackupPolicyErr != nil {
+	if deleteBackupPolicyErr := s.deps.DB.WithContext(ctx).
+		Where("environment_id = ? AND volume_name = ?", environmentIDFromContextInternal(ctx), volumeName).
+		Delete(&VolumeBackupPolicy{}).Error; deleteBackupPolicyErr != nil {
 		slog.WarnContext(ctx, "Failed to delete volume backup policy", "volume", volumeName, "error", deleteBackupPolicyErr)
 	}
 }
 
 // Rename moves a renamed volume's policies inside the caller's transaction.
-func (s *Service) Rename(tx *gorm.DB, oldName, newName string) error {
-	return tx.Model(&VolumeBackupPolicy{}).Where("volume_name = ?", oldName).Update("volume_name", newName).Error
+func (s *Service) Rename(ctx context.Context, tx *gorm.DB, oldName, newName string) error {
+	return tx.Model(&VolumeBackupPolicy{}).
+		Where("environment_id = ? AND volume_name = ?", environmentIDFromContextInternal(ctx), oldName).
+		Update("volume_name", newName).Error
+}
+
+// PurgeEnvironment removes every policy an environment owns together with its scheduled job.
+// A deleted environment must not leave policies behind: startup registration would reinstall their
+// jobs and keep backing up a daemon nobody manages any more.
+func (s *Service) PurgeEnvironment(ctx context.Context, environmentID string) error {
+	environmentID = strings.TrimSpace(environmentID)
+	if environmentID == "" {
+		return nil
+	}
+	var policies []VolumeBackupPolicy
+	if err := s.deps.DB.WithContext(ctx).
+		Where("environment_id = ?", environmentID).
+		Find(&policies).Error; err != nil {
+		return fmt.Errorf("failed to list environment volume backup policies: %w", err)
+	}
+	for i := range policies {
+		s.jobs.Unregister(ctx, policies[i].ID)
+	}
+	if err := s.deps.DB.WithContext(ctx).
+		Where("environment_id = ?", environmentID).
+		Delete(&VolumeBackupPolicy{}).Error; err != nil {
+		return fmt.Errorf("failed to delete environment volume backup policies: %w", err)
+	}
+	return nil
 }

@@ -28,6 +28,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm/children/secrets"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm/children/services"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm/children/stacks"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 )
 
@@ -39,8 +40,9 @@ const (
 // SwarmService provides Docker Swarm cluster operations and coordinates its
 // services, nodes, stacks, configs, and secrets features.
 type SwarmService struct {
-	dockerService *docker.DockerClientService
-	kvService     *kv.KVService
+	dockerService      *docker.DockerClientService
+	kvService          *kv.KVService
+	environmentService *environment.EnvironmentService
 
 	services *services.Service
 	nodes    *nodes.Service
@@ -56,7 +58,7 @@ func NewSwarmService(
 	registryService *registry.ContainerRegistryService,
 	environmentService *environment.EnvironmentService,
 ) *SwarmService {
-	s := &SwarmService{dockerService: dockerService, kvService: kvService}
+	s := &SwarmService{dockerService: dockerService, kvService: kvService, environmentService: environmentService}
 
 	var registryAuth func(context.Context, string) (string, error)
 	if registryService != nil {
@@ -64,7 +66,7 @@ func NewSwarmService(
 	}
 
 	s.services = services.NewService(dockerService, s.ensureSwarmManager, s.listTasksPaginatedWithFilters)
-	s.nodes = nodes.NewService(dockerService, s.ensureSwarmManager, s.listTasksPaginatedWithFilters, s.GetSwarmJoinTokens, environmentService)
+	s.nodes = nodes.NewService(dockerService, s.ensureSwarmManager, s.listTasksPaginatedWithFilters, s.GetSwarmJoinTokens, s.joinSwarmInternal, environmentService)
 	s.stacks = stacks.NewService(dockerService, s.ensureSwarmManager, s.listTasksPaginatedWithFilters, s.services.PaginateSummaries, registryAuth, settingsService)
 	s.configs = configs.NewService(dockerService, s.ensureSwarmManager)
 	s.secrets = secrets.NewService(dockerService, s.ensureSwarmManager)
@@ -92,6 +94,40 @@ func (s *SwarmService) IsEnabled(ctx context.Context) (bool, error) {
 	}
 
 	return enabled, nil
+}
+
+// IsEnabledForContext reports whether the environment the request is scoped to
+// is in a swarm. The manager's own daemon answers for the local environment,
+// while a docker-host environment reports its own daemon's state, so the flag is
+// not shared between environments. When the manager's own daemon cannot be
+// inspected it falls back to the persisted manager-wide flag.
+func (s *SwarmService) IsEnabledForContext(ctx context.Context) bool {
+	if s == nil {
+		return false
+	}
+
+	if s.dockerService != nil {
+		dockerClient, clientErr := s.dockerService.GetClient(ctx)
+		if clientErr == nil {
+			infoResult, infoErr := dockerClient.Info(ctx, client.InfoOptions{})
+			if infoErr == nil {
+				return infoResult.Info.Swarm.LocalNodeState == swarm.LocalNodeStateActive
+			}
+			clientErr = infoErr
+		}
+		slog.WarnContext(ctx, "Failed to inspect the environment's daemon for swarm state; falling back to the persisted flag", "error", clientErr)
+		// The persisted flag describes the manager's own daemon, so it cannot answer for a
+		// docker-host environment whose daemon could not be inspected.
+		if envcontext.IsDockerHostTarget(ctx) {
+			return false
+		}
+	}
+
+	enabled, err := s.IsEnabled(ctx)
+	if err != nil {
+		return false
+	}
+	return enabled
 }
 
 func (s *SwarmService) ListTasksPaginated(ctx context.Context, params pagination.QueryParams) ([]swarmtypes.TaskSummary, pagination.Response, error) {
@@ -156,6 +192,19 @@ func (s *SwarmService) InitSwarm(ctx context.Context, req swarmtypes.SwarmInitRe
 }
 
 func (s *SwarmService) JoinSwarm(ctx context.Context, req swarmtypes.SwarmJoinRequest) error {
+	if err := s.joinSwarmInternal(ctx, req); err != nil {
+		return err
+	}
+
+	s.persistSwarmEnabledState(ctx, true)
+
+	return nil
+}
+
+// joinSwarmInternal joins the swarm cluster the request is scoped to without
+// persisting the manager's global swarm flag. nodes.Service uses it to join a
+// docker-host environment in-process against that environment's own daemon.
+func (s *SwarmService) joinSwarmInternal(ctx context.Context, req swarmtypes.SwarmJoinRequest) error {
 	if _, swarmJoinErr := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.SwarmJoinResult, error) {
 		return dockerClient.SwarmJoin(ctx, client.SwarmJoinOptions{
 			ListenAddr:    cmp.Or(strings.TrimSpace(req.ListenAddr), defaultSwarmListenAddr),
@@ -168,8 +217,6 @@ func (s *SwarmService) JoinSwarm(ctx context.Context, req swarmtypes.SwarmJoinRe
 	}); swarmJoinErr != nil {
 		return fmt.Errorf("failed to join swarm: %w", swarmJoinErr)
 	}
-
-	s.persistSwarmEnabledState(ctx, true)
 
 	return nil
 }
@@ -443,12 +490,38 @@ func (s *SwarmService) SyncSwarmEnabledState(ctx context.Context) error {
 	return nil
 }
 
+// persistSwarmEnabledState records the manager's own swarm flag.
+//
+// A docker-host environment is served in-process by this manager, but its swarm
+// lifecycle applies to that environment's daemon, so it must not move the
+// manager's global flag. The flag is only written for the manager's own
+// environment (and for callers that carry no environment target, such as the
+// startup sync).
 func (s *SwarmService) persistSwarmEnabledState(ctx context.Context, enabled bool) {
-	if s.kvService == nil {
+	if s == nil || s.kvService == nil {
+		return
+	}
+	if s.servesNonLocalEnvironmentInternal(ctx) {
 		return
 	}
 
 	if err := s.kvService.SetBool(ctx, KVKeySwarmEnabled, enabled); err != nil {
 		slog.WarnContext(ctx, "Failed to persist swarm enabled state", "enabled", enabled, "error", err)
 	}
+}
+
+// servesNonLocalEnvironmentInternal reports whether ctx is scoped to an
+// environment other than the manager's own. Agent environments are proxied and
+// never reach this service, so a non-local request is a docker-host environment
+// served in-process; its daemon state must not be written to the manager flag.
+func (s *SwarmService) servesNonLocalEnvironmentInternal(ctx context.Context) bool {
+	environmentID := envcontext.EnvironmentIDFromContext(ctx)
+	if environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return false
+	}
+	if s == nil || s.environmentService == nil {
+		return true
+	}
+	_, inProcess := s.environmentService.InProcessTargetContext(ctx, environmentID)
+	return inProcess
 }

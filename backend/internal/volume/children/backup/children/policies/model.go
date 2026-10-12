@@ -9,6 +9,10 @@ import (
 type VolumeBackupPolicy struct {
 	database.BaseModel
 
+	// EnvironmentID scopes the policy to the environment that owns the volume. Docker-host
+	// environments are served by this process, so their policies share this table with the local
+	// environment's and are told apart by this column.
+	EnvironmentID   string `json:"environmentId,omitempty" gorm:"column:environment_id;not null;default:'0';index"`
 	VolumeName      string `json:"volumeName" gorm:"column:volume_name;not null;index"`
 	Enabled         bool   `json:"enabled" gorm:"column:enabled;not null;default:false"`
 	Schedule        string `json:"schedule" gorm:"column:schedule;type:text;not null"`

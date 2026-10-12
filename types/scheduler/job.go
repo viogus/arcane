@@ -25,6 +25,20 @@ type ConditionalJob interface {
 	ShouldSchedule(ctx context.Context) bool
 }
 
+// EnvironmentScopedJob marks a job that belongs to exactly one environment (for example one
+// volume-backup job per policy or one health-check job per environment). Its schedule is installed
+// in that environment's namespace, so the runs it produces carry the environment and execute
+// against that environment's own Docker daemon. An empty ID means the manager's namespace.
+type EnvironmentScopedJob interface {
+	EnvironmentID() string
+}
+
+// EnvironmentScopeSetter is implemented by jobs whose owning environment is recorded when the job
+// is registered, such as a volume-backup job registered for one policy row.
+type EnvironmentScopeSetter interface {
+	SetEnvironmentScope(environmentID string)
+}
+
 // BusWatcher is a continuous event consumer owned by the application scheduler lifecycle.
 type BusWatcher interface {
 	Name() string
@@ -51,6 +65,13 @@ type DynamicScheduler interface {
 type JobController interface {
 	GetJob(jobID string) (Job, bool)
 	GetJobRuntimeState(jobID string) (JobRuntimeState, bool)
+	// GetJobRuntimeStateFor reports the schedule installed for one environment. Environments keep
+	// separate schedule records in the shared coordinator, so callers serving a specific
+	// environment must use this instead of GetJobRuntimeState, which reports the manager's.
+	GetJobRuntimeStateFor(ctx context.Context, environmentID, jobID string) (JobRuntimeState, bool)
+	// ClearJobScheduleFor unschedules a job for one environment only, leaving it registered for the
+	// others. Used when a docker-host environment is disabled or deleted.
+	ClearJobScheduleFor(ctx context.Context, environmentID, jobID string) error
 	RescheduleJob(ctx context.Context, job Job) error
 	RunBusWatcherNow(ctx context.Context, watcherID string) error
 }
@@ -91,9 +112,20 @@ type GenericJob struct {
 	RunFn       func(ctx context.Context) (Outcome, error)
 	ReconcileFn func(ctx context.Context, previous Run) (Outcome, error)
 	ShouldRunFn func(ctx context.Context) bool
+
+	// EnvironmentScope is the environment the job belongs to, or empty for the
+	// manager's own namespace. Schedules of scoped jobs are installed per
+	// environment so their runs execute against that environment's Docker daemon.
+	EnvironmentScope string
 }
 
 func (g *GenericJob) Name() string { return g.JobName }
+
+// EnvironmentID satisfies EnvironmentScopedJob.
+func (g *GenericJob) EnvironmentID() string { return g.EnvironmentScope }
+
+// SetEnvironmentScope satisfies EnvironmentScopeSetter.
+func (g *GenericJob) SetEnvironmentScope(environmentID string) { g.EnvironmentScope = environmentID }
 
 func (g *GenericJob) Schedule(ctx context.Context) string { return g.ScheduleFn(ctx) }
 

@@ -303,7 +303,7 @@ func (s *ContainerService) restoreContainerAfterRedeployFailure(
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 	defer cancel()
 
-	s.eventService.MarkDockerExpectation("container", containerID, containerName)
+	s.eventService.MarkDockerExpectation(ctx, "container", containerID, containerName)
 	if wasRunning {
 		if _, startErr := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerStartResult, error) {
 			return dockerClient.ContainerStart(ctx, containerID, client.ContainerStartOptions{})
@@ -401,7 +401,7 @@ func (s *ContainerService) runContainerLifecycleAction(ctx context.Context, cont
 		slog.WarnContext(ctx, "could not log container action", "action", cfg.action, "error", logErr)
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", containerID, "")()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", containerID, "")()
 	err = cfg.runContainerAction(ctx)
 	if err != nil {
 		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, "", user.ID, user.Username, "0", err, database.JSON{"action": cfg.action})
@@ -718,7 +718,7 @@ func (s *ContainerService) recreateContainer(
 		)
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", containerInfo.ID, containerName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", containerInfo.ID, containerName)()
 	backupName := fmt.Sprintf("%s%s%d", cmp.Or(containerName, "arcane-redeploy-"+containerInfo.ID[:min(12, len(containerInfo.ID))]), redeployBackupInfix, time.Now().Unix())
 
 	// Stopping the original made the daemon delete it, so rebuild it from the inspected config.
@@ -729,7 +729,7 @@ func (s *ContainerService) recreateContainer(
 			originalConfig.Hostname = "" // keep: copying Docker's 24-field container.Config to clear one field is unreadable
 		}
 
-		defer s.eventService.BeginDockerResourceSuppressionWindow("container", "", containerName)()
+		defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", "", containerName)()
 		restoreResp, restoreCreateErr := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerCreateResult, error) {
 			return compat.ContainerCreateWithCompatibilityForAPIVersion(ctx, dockerClient, client.ContainerCreateOptions{
 				Config:           &originalConfig,
@@ -746,7 +746,7 @@ func (s *ContainerService) recreateContainer(
 			return fmt.Errorf("failed to recreate original auto-remove container: %w", restoreCreateErr)
 		}
 
-		defer s.eventService.BeginDockerResourceSuppressionWindow("container", restoreResp.ID, containerName)()
+		defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", restoreResp.ID, containerName)()
 		if _, restoreStartErr := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerStartResult, error) {
 			return dockerClient.ContainerStart(ctx, restoreResp.ID, client.ContainerStartOptions{})
 		}); restoreStartErr != nil {
@@ -766,7 +766,7 @@ func (s *ContainerService) recreateContainer(
 		return nil
 	}
 
-	s.eventService.MarkDockerExpectation("container", containerInfo.ID, containerName)
+	s.eventService.MarkDockerExpectation(ctx, "container", containerInfo.ID, containerName)
 	if containerName != "" {
 		if renameErr := s.renameToRedeployBackup(ctx, containerInfo.ID, containerName, backupName, newName, user); renameErr != nil {
 			return "", renameErr
@@ -787,7 +787,7 @@ func (s *ContainerService) recreateContainer(
 		newConfig.Hostname = "" // keep: copying Docker's 24-field container.Config to clear one field is unreadable
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", "", newName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", "", newName)()
 	createResp, err := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerCreateResult, error) {
 		return compat.ContainerCreateWithCompatibilityForAPIVersion(ctx, dockerClient, client.ContainerCreateOptions{
 			Config:           newConfig,
@@ -806,7 +806,7 @@ func (s *ContainerService) recreateContainer(
 		return "", fmt.Errorf("failed to recreate container: %w", err)
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", createResp.ID, newName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", createResp.ID, newName)()
 
 	if stopAfterCreate {
 		if containerStopErr := s.stopContainer(ctx, containerInfo.ID); containerStopErr != nil {
@@ -835,7 +835,7 @@ func (s *ContainerService) recreateContainer(
 			// is rebuilt from its inspected config; a failed restore joins the start error.
 			rollbackCtx, cancelRollback := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
 			defer cancelRollback()
-			s.eventService.MarkDockerExpectation("container", createResp.ID, containerName)
+			s.eventService.MarkDockerExpectation(ctx, "container", createResp.ID, containerName)
 			_, removeErr := s.dockerService.Call(rollbackCtx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerRemoveResult, error) {
 				return dockerClient.ContainerRemove(ctx, createResp.ID, client.ContainerRemoveOptions{Force: true})
 			})
@@ -1362,7 +1362,7 @@ func (s *ContainerService) DeleteContainer(ctx context.Context, containerID stri
 		}
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", containerID, "")()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", containerID, "")()
 	volumeReleases := make([]func(), 0, len(volumesToRemove))
 	defer func() {
 		for _, release := range slices.Backward(volumeReleases) {
@@ -1370,7 +1370,7 @@ func (s *ContainerService) DeleteContainer(ctx context.Context, containerID stri
 		}
 	}()
 	for _, volumeName := range volumesToRemove {
-		volumeReleases = append(volumeReleases, s.eventService.BeginDockerResourceSuppressionWindow("volume", volumeName, volumeName))
+		volumeReleases = append(volumeReleases, s.eventService.BeginDockerResourceSuppressionWindow(ctx, "volume", volumeName, volumeName))
 	}
 	_, err = s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerRemoveResult, error) {
 		return dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
@@ -1440,7 +1440,7 @@ func (s *ContainerService) CreateContainer(
 		}
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", "", containerName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", "", containerName)()
 	resp, err := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerCreateResult, error) {
 		return compat.ContainerCreateWithCompatibility(ctx, dockerClient, client.ContainerCreateOptions{
 			Config:           config,
@@ -1469,7 +1469,7 @@ func (s *ContainerService) CreateContainer(
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", resp.ID, containerName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "container", resp.ID, containerName)()
 	if logErr := s.eventService.LogContainerEvent(ctx, event.EventTypeContainerCreate, resp.ID, "name", user.ID, user.Username, "0", database.JSON{
 		"action":      "create",
 		"containerId": resp.ID,
@@ -1556,6 +1556,23 @@ func (s *ContainerService) SampleResources(ctx context.Context, ids []string, ma
 		}
 	}
 	return s.stats.Collect(ctx, matched, maxAge)
+}
+
+// SumRunningResourceSamples totals the resource samples of the environment's running containers.
+// It backs environment-level readings for docker-host environments, where the manager talks to a
+// Docker API instead of an agent, so no component reports the remote host itself.
+func (s *ContainerService) SumRunningResourceSamples(ctx context.Context) (stats.HostSample, error) {
+	containers, err := s.dockerService.ListContainers(ctx)
+	if err != nil {
+		return stats.HostSample{}, err
+	}
+	ids := make([]string, 0, len(containers))
+	for i := range containers {
+		if containers[i].State == container.StateRunning {
+			ids = append(ids, containers[i].ID)
+		}
+	}
+	return s.stats.SumHost(ctx, ids)
 }
 
 func (s *ContainerService) ListContainersPaginated(
