@@ -2290,6 +2290,7 @@ func (s *ProjectService) ListAllProjects(ctx context.Context) ([]Project, error)
 
 func (s *ProjectService) ListProjects(ctx context.Context, params pagination.QueryParams) ([]projecttypes.Details, pagination.Response, error) {
 	updatesFilter := strings.TrimSpace(params.Filters["updates"])
+	deployedFilter := strings.TrimSpace(params.Filters["deployed"])
 	query := s.db.WithContext(ctx).Model(&Project{})
 	if archivedFilter := strings.TrimSpace(params.Filters["archived"]); !strings.EqualFold(archivedFilter, "all") {
 		archived, _ := kit.ParseBool(archivedFilter)
@@ -2308,7 +2309,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 
 	// Derived filters and status sorting read the container snapshot, so they page in memory over every candidate;
 	// otherwise the database pages and only the page gets live status and compose-backed presentation fields.
-	paginateInDB := strings.TrimSpace(params.Filters["status"]) == "" && updatesFilter == "" && strings.TrimSpace(params.Filters["label"]) == "" &&
+	paginateInDB := strings.TrimSpace(params.Filters["status"]) == "" && updatesFilter == "" && strings.TrimSpace(params.Filters["label"]) == "" && deployedFilter == "" &&
 		!strings.EqualFold(strings.TrimSpace(params.Sort), "status")
 	if !paginateInDB && params.Limit != -1 {
 		params.Limit = kit.Ternary(params.Limit <= 0, 20, min(params.Limit, 100))
@@ -3509,13 +3510,13 @@ func (s *ProjectService) StreamProjectLogs(ctx context.Context, projectID string
 	return projectdetails.Logs(ctx, projectdetails.RuntimeProjectName(proj.Name, matched), logsChan, follow, tail, since, timestamps)
 }
 
-func (s *ProjectService) GetProjectStatusCounts(ctx context.Context) (projecttypes.StatusCounts, error) {
+func (s *ProjectService) GetProjectStatusCounts(ctx context.Context, deployedOnly bool) (projecttypes.StatusCounts, error) {
 	// Runtime status comes from containers, so only the matching and fallback columns are read.
 	var projectsList []Project
 	if listProjectsErr := s.db.WithContext(ctx).Select("id", "name", "path", "status", "compose_project_name", "is_archived").Find(&projectsList).Error; listProjectsErr != nil {
 		return projecttypes.StatusCounts{}, fmt.Errorf("failed to list projects: %w", listProjectsErr)
 	}
-	return s.listing.StatusCounts(ctx, projectRecords(projectsList)), nil
+	return s.listing.StatusCounts(ctx, projectRecords(projectsList), deployedOnly), nil
 }
 
 func (s *ProjectService) AggregateProjects(ctx context.Context, params pagination.QueryParams) (base.Paginated[projecttypes.Details], error) {

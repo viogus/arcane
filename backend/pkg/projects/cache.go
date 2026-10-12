@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
@@ -13,9 +14,21 @@ import (
 	"github.com/samber/hot"
 )
 
+// composeCacheVariantsInternal bounds how many fingerprints one project keeps.
+// A single manager serves every environment, and each environment loads the same
+// project with its own paths and mapper, so keying a project by ID alone made the
+// environments evict each other and re-parse on every request. The bound also caps
+// memory: the cache holds at most composeCacheVariantsInternal values per project ID.
+const composeCacheVariantsInternal = 4
+
 type composeCacheInternal[T any] struct {
-	entries *hot.HotCache[string, composeCacheEntryInternal[T]]
+	entries *hot.HotCache[string, []composeCacheEntryInternal[T]]
 	clone   func(T) T
+	// variants serializes the read-modify-write of one project's variant list. The
+	// underlying cache is safe for concurrent use, but two environments storing the
+	// same project could otherwise both read the same previous list and the second
+	// store would drop the first one's entry.
+	variants sync.Mutex
 }
 
 type composeCacheEntryInternal[T any] struct {
@@ -32,7 +45,7 @@ type composeCacheStampInternal struct {
 // NewComposeCache caches Compose-derived values and their file dependencies.
 // clone, when supplied, isolates stored values from mutations by callers.
 func NewComposeCache[T any](capacity int, clone func(T) T) projecttypes.ComposeCache[T] {
-	return &composeCacheInternal[T]{entries: hot.NewHotCache[string, composeCacheEntryInternal[T]](hot.LRU, capacity).Build(), clone: clone}
+	return &composeCacheInternal[T]{entries: hot.NewHotCache[string, []composeCacheEntryInternal[T]](hot.LRU, capacity).Build(), clone: clone}
 }
 
 // NewParsedComposeCache keeps operation-local models separate from cached state.
@@ -49,12 +62,18 @@ func cloneComposeProjectInternal(project *composetypes.Project) *composetypes.Pr
 }
 
 func (c *composeCacheInternal[T]) Get(projectID, fingerprint string) (T, bool) {
-	entry, found := c.entries.Peek(projectID)
-	if found && entry.fingerprint == fingerprint && validComposeCacheEntryInternal(entry.stamps) {
-		if c.clone != nil {
-			return c.clone(entry.value), true
+	variants, found := c.entries.Peek(projectID)
+	if found {
+		for index := range variants {
+			variant := &variants[index]
+			if variant.fingerprint != fingerprint || !validComposeCacheEntryInternal(variant.stamps) {
+				continue
+			}
+			if c.clone != nil {
+				return c.clone(variant.value), true
+			}
+			return variant.value, true
 		}
-		return entry.value, true
 	}
 	var zero T
 	return zero, false
@@ -103,7 +122,22 @@ func (c *composeCacheInternal[T]) Set(projectID, fingerprint, projectPath, proje
 	if c.clone != nil {
 		value = c.clone(value)
 	}
-	c.entries.Set(projectID, composeCacheEntryInternal[T]{fingerprint: fingerprint, stamps: stamps, value: value})
+	entry := composeCacheEntryInternal[T]{fingerprint: fingerprint, stamps: stamps, value: value}
+	c.variants.Lock()
+	defer c.variants.Unlock()
+	previous, _ := c.entries.Peek(projectID)
+	variants := make([]composeCacheEntryInternal[T], 0, len(previous)+1)
+	variants = append(variants, entry)
+	for _, variant := range previous {
+		if variant.fingerprint == fingerprint {
+			continue
+		}
+		if len(variants) == composeCacheVariantsInternal {
+			break
+		}
+		variants = append(variants, variant)
+	}
+	c.entries.Set(projectID, variants)
 	return nil
 }
 

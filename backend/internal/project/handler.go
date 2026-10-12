@@ -51,10 +51,12 @@ type ListProjectsInput struct {
 	Tags          string `query:"tags" doc:"Filter by tag names (comma-separated, OR semantics)"`
 	Label         string `query:"label" doc:"Filter by container label key or key=value on any running service"`
 	Name          string `query:"name" doc:"Filter by exact project name (comma-separated for several)"`
+	Deployed      string `query:"deployed" doc:"Filter to projects with a container in this environment: 'true'"`
 }
 
 type GetProjectStatusCountsInput struct {
 	EnvironmentID string `path:"id" doc:"Environment ID"`
+	Deployed      string `query:"deployed" doc:"Count only projects with a container in this environment: 'true'"`
 }
 
 // ListProjectTagsInput identifies the environment whose tag catalog is requested.
@@ -167,6 +169,9 @@ func (h *ProjectHandler) ListProjects(ctx context.Context, input *ListProjectsIn
 	if input.Name != "" {
 		params.Filters["name"] = input.Name
 	}
+	if input.Deployed != "" {
+		params.Filters["deployed"] = input.Deployed
+	}
 	if _, ok := httpx.EnvironmentScopeFromContext(ctx); ok {
 		body, err := h.projectService.AggregateProjects(ctx, params)
 		if err != nil {
@@ -201,7 +206,7 @@ func (h *ProjectHandler) GetProjectStatusCounts(ctx context.Context, input *GetP
 		}
 		return &handlerutil.Out[project.StatusCounts]{Body: body}, nil
 	}
-	counts, err := h.projectService.GetProjectStatusCounts(ctx)
+	counts, err := h.projectService.GetProjectStatusCounts(ctx, strings.EqualFold(strings.TrimSpace(input.Deployed), "true"))
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to get project status counts: " + err.Error())
 	}

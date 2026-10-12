@@ -40,11 +40,18 @@ func detachFromHTTPContextInternal(parent context.Context, timeout time.Duration
 	return context.WithTimeout(ctx, timeout)
 }
 
+// newContextComposeClientInternal builds a one-shot Compose client bound to the
+// daemon the request is scoped to, so Compose commands run against the
+// docker-host environment being served instead of the manager's own daemon.
+func newContextComposeClientInternal(ctx context.Context, authConfigs map[string]registry.AuthConfig, prompt compose.Prompt, options ...composeClientOptionInternal) (*Client, error) {
+	return NewClient(ctx, composeDockerHostForContextInternal(ctx, ""), authConfigs, prompt, options...)
+}
+
 func ComposeRestart(ctx context.Context, proj *composetypes.Project, services []string) error {
 	restartCtx, cancel := detachFromHTTPContextInternal(ctx, defaultComposeTimeout)
 	defer cancel()
 
-	c, err := NewClient(restartCtx, "", nil, nil)
+	c, err := newContextComposeClientInternal(restartCtx, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -60,7 +67,7 @@ func ComposeStop(ctx context.Context, proj *composetypes.Project, services []str
 	stopCtx, cancel := detachFromHTTPContextInternal(ctx, defaultComposeTimeout)
 	defer cancel()
 
-	c, err := NewClient(stopCtx, "", nil, nil)
+	c, err := newContextComposeClientInternal(stopCtx, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -113,7 +120,7 @@ func ComposeUp(ctx context.Context,
 		clientOptions = append(clientOptions, withComposeServiceOptionsInternal(compose.WithMaxConcurrency(envOpts.ParallelLimit)))
 	}
 
-	c, err := NewClient(composeCtx, "", authConfigs, prompt, clientOptions...)
+	c, err := newContextComposeClientInternal(composeCtx, authConfigs, prompt, clientOptions...)
 	if err != nil {
 		return err
 	}
@@ -135,7 +142,7 @@ func ComposeCreate(ctx context.Context, proj *composetypes.Project, services []s
 	createCtx, cancel := detachFromHTTPContextInternal(ctx, defaultComposeTimeout)
 	defer cancel()
 
-	c, err := NewClient(createCtx, "", authConfigs, nil)
+	c, err := newContextComposeClientInternal(createCtx, authConfigs, nil)
 	if err != nil {
 		return err
 	}
@@ -178,9 +185,10 @@ func composeUpOptionsInternal(proj *composetypes.Project,
 
 // ComposePs lists a project's compose containers. dockerHost is the
 // config-resolved docker host used to reuse the shared read-only compose
-// client; empty uses the environment-resolved host.
+// client; a request served for a docker-host environment overrides it, and an
+// empty value falls back to a one-shot client for the manager's own daemon.
 func ComposePs(ctx context.Context, dockerHost string, proj *composetypes.Project, services []string, all bool) ([]api.ContainerSummary, error) {
-	c, err := plainComposeClientInternal(dockerHost)
+	c, err := plainComposeClientInternal(composeDockerHostForContextInternal(ctx, dockerHost))
 	if err != nil {
 		return nil, err
 	}
@@ -189,7 +197,7 @@ func ComposePs(ctx context.Context, dockerHost string, proj *composetypes.Projec
 }
 
 func ComposeGenerate(ctx context.Context, dockerHost, projectName string, containerIDs []string) (string, error) {
-	c, err := plainComposeClientInternal(dockerHost)
+	c, err := plainComposeClientInternal(composeDockerHostForContextInternal(ctx, dockerHost))
 	if err != nil {
 		return "", err
 	}
@@ -206,7 +214,7 @@ func ComposeDown(ctx context.Context, proj *composetypes.Project, removeVolumes 
 	downCtx, cancel := detachFromHTTPContextInternal(ctx, defaultComposeTimeout)
 	defer cancel()
 
-	c, err := NewClient(downCtx, "", nil, nil)
+	c, err := newContextComposeClientInternal(downCtx, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -220,7 +228,7 @@ func ComposeDown(ctx context.Context, proj *composetypes.Project, removeVolumes 
 // non-TTY containers keep their stderr metadata; deploy, attach, and other
 // compose operations use plain clients.
 func ComposeLogs(ctx context.Context, projectName string, out io.Writer, follow bool, tail, since string, timestamps bool) error {
-	c, err := NewClient(ctx, "", nil, nil, streamDemuxedLogsInternal)
+	c, err := newContextComposeClientInternal(ctx, nil, nil, streamDemuxedLogsInternal)
 	if err != nil {
 		return err
 	}
@@ -237,7 +245,7 @@ func ComposeLogs(ctx context.Context, projectName string, out io.Writer, follow 
 func ListGlobalComposeContainers(ctx context.Context, dockerClient client.APIClient, dockerHost string) ([]container.Summary, error) {
 	cli := dockerClient
 	if cli == nil {
-		c, err := plainComposeClientInternal(dockerHost)
+		c, err := plainComposeClientInternal(composeDockerHostForContextInternal(ctx, dockerHost))
 		if err != nil {
 			return nil, err
 		}

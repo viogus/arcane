@@ -625,6 +625,7 @@ export interface Project {
 	runningCount: string;
 	serviceCount: string;
 	status: string;
+	deployedHere?: boolean;
 	statusReason?: string;
 	configurationError?: ProjectConfigurationError;
 	updatedAt: string;
