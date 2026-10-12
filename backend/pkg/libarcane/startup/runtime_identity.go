@@ -20,7 +20,7 @@ import (
 const (
 	defaultDataDirectory    = "/app/data"
 	defaultBuildsDirectory  = "/builds"
-	defaultDatabaseURL      = "file:data/arcane.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(2500)&_txlock=immediate"
+	defaultDatabaseURL      = "file:data/arcane.db?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(2500)&_txlock=immediate"
 	defaultDockerConfigDir  = "/app/data/.docker"
 	defaultDockerSocketPath = "/var/run/docker.sock"
 	defaultRuntimeUID       = 65532

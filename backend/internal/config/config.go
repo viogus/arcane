@@ -35,7 +35,7 @@ type Config struct {
 	BuildablesConfig
 
 	AppUrl                string         `env:"APP_URL" default:"http://localhost:3552"`
-	DatabaseURL           string         `env:"DATABASE_URL" default:"file:data/arcane.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(2500)&_txlock=immediate" options:"file"`
+	DatabaseURL           string         `env:"DATABASE_URL" default:"file:data/arcane.db?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(2500)&_txlock=immediate" options:"file"`
 	AllowDowngrade        bool           `env:"ALLOW_DOWNGRADE" default:"false"`
 	AllowCLIPasswordReset bool           `env:"ALLOW_CLI_PASSWORD_RESET" default:"false"`
 	AllowCLIMFAReset      bool           `env:"ALLOW_CLI_MFA_RESET" default:"false"`

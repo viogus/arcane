@@ -81,7 +81,7 @@ func (a *coordinatorActorInternal) Invoke(ctx context.Context, method string, da
 		// Acceptance is persisted; dispatch failures are retried.
 		if err := a.flushInternal(ctx, &next); err != nil {
 			slog.WarnContext(ctx, "Job dispatch requires reconciliation", "jobId", next.Record.JobID, "environmentId", next.Record.EnvironmentID, "error", err)
-			a.q.signalInternal()
+			a.q.signalReconcileInternal(next.Record.EnvironmentID, next.Record.JobID)
 		}
 		return true, nil
 	case "activity-synced":
@@ -343,6 +343,22 @@ func (a *coordinatorActorInternal) Alarm(ctx context.Context, name string, data 
 	return a.flushInternal(ctx, &state)
 }
 
+// recordNeedsRepairInternal reports whether a record still holds work that only
+// a repair flush can restore.
+func recordNeedsRepairInternal(record *st.QueueRecord) bool {
+	return slices.ContainsFunc(record.Runs, func(run st.Run) bool { return !run.Status.Terminal() && run.Status != st.NeedsAttention })
+}
+
+// repairRecordsInternal flushes the given coordinators so schedule alarms and dispatches are restored.
+func (q *Coordinator) repairRecordsInternal(ctx context.Context, records []st.QueueRecord) error {
+	for _, record := range records {
+		if _, invokeErr := q.service.Invoke(ctx, coordinatorTypeInternal, kit.SHA256Hex(record.EnvironmentID+"\x00"+record.JobID), "repair", nil); invokeErr != nil {
+			return invokeErr
+		}
+	}
+	return nil
+}
+
 // repairInternal flushes coordinators so schedule alarms and dispatches are restored.
 // Unless all is set, it skips records without unfinished runs so idle coordinators can deactivate.
 func (q *Coordinator) repairInternal(ctx context.Context, all bool) error {
@@ -350,15 +366,13 @@ func (q *Coordinator) repairInternal(ctx context.Context, all bool) error {
 	if err != nil {
 		return err
 	}
-	for _, record := range records {
-		if !all && !slices.ContainsFunc(record.Runs, func(run st.Run) bool { return !run.Status.Terminal() && run.Status != st.NeedsAttention }) {
-			continue
-		}
-		if _, invokeErr := q.service.Invoke(ctx, coordinatorTypeInternal, kit.SHA256Hex(record.EnvironmentID+"\x00"+record.JobID), "repair", nil); invokeErr != nil {
-			return invokeErr
+	candidates := make([]st.QueueRecord, 0, len(records))
+	for index := range records {
+		if all || recordNeedsRepairInternal(&records[index]) {
+			candidates = append(candidates, records[index])
 		}
 	}
-	return nil
+	return q.repairRecordsInternal(ctx, candidates)
 }
 
 func (q *Coordinator) importLegacyInternal(ctx context.Context) error {

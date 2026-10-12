@@ -80,8 +80,12 @@ func New(databaseURL, encryptionKey, instanceID, port string, options ...local.H
 		options: []local.HostOption{
 			local.WithAddress(address), providerOption(storeURL),
 			local.WithMaxHosts(1), local.WithHostHealthCheckDeadline(150 * time.Second),
-			local.WithShutdownGracePeriod(10 * time.Second), local.WithAlarmsPollInterval(time.Second),
-			local.WithAlarmsFetchAheadInterval(30 * time.Second), local.WithAlarmsLeaseDuration(180 * time.Second),
+			local.WithShutdownGracePeriod(10 * time.Second),
+			// Alarms are leased 30s before they are due, so the poll interval only bounds how late a new
+			// alarm is picked up: polling every second re-runs the same queries and lease writes for no
+			// gain, while three seconds stays inside the shortest retry delay the scheduler arms (5s).
+			local.WithAlarmsPollInterval(3 * time.Second), local.WithAlarmsFetchAheadInterval(30 * time.Second),
+			local.WithAlarmsLeaseDuration(180 * time.Second),
 		},
 	}
 	runtime.options = append(runtime.options, local.WithLogger(slog.New(&actorLogHandler{

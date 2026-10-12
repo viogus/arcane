@@ -42,11 +42,17 @@ type Coordinator struct {
 	done         chan struct{}
 	wake         chan struct{}
 	enabled      atomic.Bool
-	execute      func(context.Context, st.Run) (st.Outcome, error)
-	reconcile    func(context.Context, st.Run) (st.Outcome, error)
-	observer     st.RunObserver
-	observerMu   sync.Mutex
-	location     *time.Location
+	// sweepRequested asks the dispatcher for a full pass on its next iteration.
+	sweepRequested atomic.Bool
+	// repairs holds the coordinator actors whose persisted state changed since the dispatcher last
+	// looked at them, so a wake reconciles those coordinators instead of every stored state.
+	repairMu   sync.Mutex
+	repairs    map[string]struct{}
+	execute    func(context.Context, st.Run) (st.Outcome, error)
+	reconcile  func(context.Context, st.Run) (st.Outcome, error)
+	observer   st.RunObserver
+	observerMu sync.Mutex
+	location   *time.Location
 }
 
 // Submit persists acceptance before waking the dispatcher. Run IDs deduplicate
@@ -128,7 +134,6 @@ func (q *Coordinator) Submit(ctx context.Context, request st.Request) (st.Run, e
 	})
 	if err == nil {
 		q.observeRunInternal(ctx, result)
-		q.signalInternal()
 	}
 	return result, err
 }
@@ -137,6 +142,45 @@ func (q *Coordinator) signalInternal() {
 	select {
 	case q.wake <- struct{}{}:
 	default:
+	}
+}
+
+// signalReconcileInternal queues one coordinator whose persisted state changed and wakes the
+// dispatcher, which then reconciles that coordinator instead of sweeping every stored state.
+func (q *Coordinator) signalReconcileInternal(environmentID, jobID string) {
+	q.repairMu.Lock()
+	if q.repairs == nil {
+		q.repairs = make(map[string]struct{})
+	}
+	q.repairs[kit.SHA256Hex(environmentID+"\x00"+jobID)] = struct{}{}
+	q.repairMu.Unlock()
+	q.signalInternal()
+}
+
+// takeRepairsInternal drains the coordinators waiting for a reconciliation.
+func (q *Coordinator) takeRepairsInternal() []string {
+	q.repairMu.Lock()
+	defer q.repairMu.Unlock()
+	if len(q.repairs) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(q.repairs))
+	for id := range q.repairs {
+		ids = append(ids, id)
+	}
+	q.repairs = make(map[string]struct{})
+	return ids
+}
+
+// requeueRepairsInternal restores coordinators whose reconciliation failed.
+func (q *Coordinator) requeueRepairsInternal(ids []string) {
+	q.repairMu.Lock()
+	defer q.repairMu.Unlock()
+	if q.repairs == nil {
+		q.repairs = make(map[string]struct{}, len(ids))
+	}
+	for _, id := range ids {
+		q.repairs[id] = struct{}{}
 	}
 }
 
@@ -205,7 +249,6 @@ func (q *Coordinator) CheckpointFor(ctx context.Context, environmentID, jobID, s
 		q.checkpointed[checkpointKey] = true
 		if recovered {
 			q.observeRunInternal(ctx, recoveredRun)
-			q.signalInternal()
 		}
 	}
 	return err
@@ -306,40 +349,68 @@ func (q *Coordinator) Stop(ctx context.Context) error {
 	}
 }
 
+const (
+	// sweepIntervalInternal is the cadence of the full coordinator sweep. Writers reconcile their own
+	// coordinator as soon as its state changes, so the sweep is a safety net that bounds how long a
+	// lost alarm, an unrepaired record, or an unreadable state can stay unnoticed.
+	sweepIntervalInternal = time.Minute
+	// dispatchRetryIntervalInternal retries a failed pass quickly instead of waiting for the next
+	// sweep.
+	dispatchRetryIntervalInternal = 5 * time.Second
+)
+
 func (q *Coordinator) dispatchInternal(ctx context.Context) {
 	defer close(q.done)
 
 	initialRetention := true
-	// Flush every coordinator once while enabled to restore schedule alarms; later passes only cover unfinished work.
+	// Flush every coordinator once while enabled to restore schedule alarms; later passes only cover
+	// the coordinators whose state changed since the previous pass.
 	fullRepair := true
 	nextRetention := time.Now()
+	nextSweep := time.Time{}
 	for ctx.Err() == nil {
-		q.retryActivitySyncInternal(ctx)
+		sweepRequested := q.sweepRequested.Swap(false)
+		pendingActivitySync := false
+		var dispatchErr error
+		if fullRepair || sweepRequested || !time.Now().Before(nextSweep) {
+			nextSweep = time.Now().Add(sweepIntervalInternal)
+			// The sweep covers every coordinator, so the queued reconciliations below are redundant.
+			q.takeRepairsInternal()
+			var repairRecords []st.QueueRecord
+			pendingActivitySync, repairRecords, dispatchErr = q.reconcileInternal(ctx, fullRepair)
+			if dispatchErr == nil {
+				dispatchErr = q.repairRecordsInternal(ctx, repairRecords)
+			}
+		} else if ids := q.takeRepairsInternal(); len(ids) > 0 {
+			pendingActivitySync, dispatchErr = q.reconcileActorsInternal(ctx, ids)
+			if dispatchErr != nil {
+				q.requeueRepairsInternal(ids)
+			}
+		}
+		if dispatchErr != nil {
+			nextSweep = time.Now().Add(dispatchRetryIntervalInternal)
+			if ctx.Err() == nil {
+				slog.ErrorContext(ctx, "Job queue dispatch failed", "error", dispatchErr)
+			}
+		} else if q.enabled.Load() {
+			fullRepair = false
+		}
 		if initialRetention || !time.Now().Before(nextRetention) {
 			if err := q.pruneInternal(ctx); err != nil {
 				if ctx.Err() == nil {
 					slog.ErrorContext(ctx, "Job retention failed", "error", err)
 				}
 			} else {
-				initialRetention = q.hasPendingActivitySyncInternal(ctx)
+				initialRetention = pendingActivitySync
 			}
 			nextRetention = time.Now().Add(time.Hour)
 		}
-		nextWake := time.Now().Add(15 * time.Second)
-		enabled := q.enabled.Load()
-		if err := q.repairInternal(ctx, fullRepair); err != nil {
-			if ctx.Err() == nil {
-				slog.ErrorContext(ctx, "Job queue dispatch failed", "error", err)
-			}
-			nextWake = time.Now().Add(5 * time.Second)
-		} else if enabled {
-			fullRepair = false
-		}
+		nextWake := nextSweep
 		if nextRetention.Before(nextWake) {
 			nextWake = nextRetention
 		}
-		if q.hasPendingActivitySyncInternal(ctx) {
-			activityRetry := time.Now().Add(5 * time.Second)
+		if pendingActivitySync {
+			activityRetry := time.Now().Add(dispatchRetryIntervalInternal)
 			if activityRetry.Before(nextWake) {
 				nextWake = activityRetry
 			}
@@ -503,7 +574,7 @@ func (q *Coordinator) Retry(ctx context.Context, environmentID, jobID, runID str
 		return nil
 	})
 	if err == nil {
-		q.signalInternal()
+		q.signalReconcileInternal(environmentID, jobID)
 	}
 	return run, err
 }
@@ -632,7 +703,7 @@ func (q *Coordinator) Resolve(ctx context.Context, environmentID, jobID, runID, 
 		return nil
 	})
 	if err == nil {
-		q.signalInternal()
+		q.signalReconcileInternal(environmentID, jobID)
 	}
 	return run, err
 }

@@ -248,7 +248,7 @@ func (q *Coordinator) UpdateRun(ctx context.Context, run st.Run, change func(*st
 		return ErrRunNotFound
 	})
 	if err == nil && wake {
-		q.signalInternal()
+		q.signalReconcileInternal(run.EnvironmentID, run.JobID)
 	}
 	if err == nil {
 		q.observeRunInternal(ctx, run)
@@ -336,7 +336,13 @@ func (q *Coordinator) ScheduleStateFor(ctx context.Context, environmentID, jobID
 	return state.Record, err
 }
 
-func (q *Coordinator) Activate() { q.enabled.Store(true); q.signalInternal() }
+// Activate lets the dispatcher accept work; the first pass flushes every stored coordinator so
+// schedule alarms that were set before a restart are restored.
+func (q *Coordinator) Activate() {
+	q.enabled.Store(true)
+	q.sweepRequested.Store(true)
+	q.signalInternal()
+}
 
 func receiptRunsInternal(receipts map[string]st.Run) []st.Run {
 	runs := make([]st.Run, 0, len(receipts))
