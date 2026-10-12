@@ -35,12 +35,21 @@
 
 	let { data } = $props();
 
-	function withArchivedFilter(options: SearchPaginationSortRequest, show: boolean): SearchPaginationSortRequest {
+	function withProjectScope(
+		options: SearchPaginationSortRequest,
+		includeArchived: boolean,
+		deployedOnly: boolean
+	): SearchPaginationSortRequest {
 		const filters = { ...(options.filters ?? {}) };
-		if (show) {
+		if (includeArchived) {
 			filters['archived'] = 'true';
 		} else {
 			delete filters['archived'];
+		}
+		if (deployedOnly) {
+			filters['deployed'] = 'true';
+		} else {
+			delete filters['deployed'];
 		}
 
 		return {
@@ -49,13 +58,17 @@
 		};
 	}
 
-	let baseProjectRequestOptions = $state(untrack(() => withArchivedFilter(data.projectRequestOptions, data.showArchived)));
+	let baseProjectRequestOptions = $state(
+		untrack(() => withProjectScope(data.projectRequestOptions, data.showArchived, !data.showAllEnvironments))
+	);
 	let selectedIds = $state<string[]>([]);
 	let isManualRefreshing = $state(false);
 	const queryClient = useQueryClient();
 	const scope = $derived(environmentStore.shownKey);
 	const showArchived = $derived(page.url.searchParams.get('archived') === 'true');
-	const projectRequestOptions = $derived(withArchivedFilter(baseProjectRequestOptions, showArchived));
+	const showAllEnvironments = $derived(page.url.searchParams.get('allEnvironments') === 'true');
+	const deployedOnly = $derived(!showAllEnvironments);
+	const projectRequestOptions = $derived(withProjectScope(baseProjectRequestOptions, showArchived, deployedOnly));
 	const countsFallback: ProjectStatusCounts = {
 		runningProjects: 0,
 		stoppedProjects: 0,
@@ -88,9 +101,11 @@
 		const queryScope = scope;
 		const environments = environmentStore.shown;
 		return {
-			queryKey: queryKeys.projects.statusCounts(queryScope),
+			queryKey: queryKeys.projects.statusCounts(queryScope, deployedOnly),
 			queryFn: () =>
-				sumAcrossEnvironments(environments, (id, config) => projectService.getProjectStatusCountsForEnvironment(id, config)),
+				sumAcrossEnvironments(environments, (id, config) =>
+					projectService.getProjectStatusCountsForEnvironment(id, { deployed: deployedOnly }, config)
+				),
 			initialData: data.scope === queryScope ? data.projectStatusCounts : undefined,
 			select: (value) => ({ envId: queryScope, value }),
 			refetchOnMount: false
@@ -185,7 +200,8 @@
 					.filter((listScope) => listScope !== requestedScope)
 					.flatMap((listScope) => [
 						queryClient.invalidateQueries({ queryKey: ['projects', listScope] }),
-						queryClient.invalidateQueries({ queryKey: queryKeys.projects.statusCounts(listScope) })
+						// Covers both the deployed-only and all-projects count scopes.
+						queryClient.invalidateQueries({ queryKey: ['projects', 'status-counts', listScope] })
 					])
 			);
 			if (requestedScope === scope) {
@@ -241,6 +257,16 @@
 			url.searchParams.set('archived', 'true');
 		} else {
 			url.searchParams.delete('archived');
+		}
+		await goto(`${url.pathname}${url.search}`, { reset: false, replace: true });
+	}
+
+	async function toggleAllEnvironments(next: boolean) {
+		const url = new URL(page.url.href);
+		if (next) {
+			url.searchParams.set('allEnvironments', 'true');
+		} else {
+			url.searchParams.delete('allEnvironments');
 		}
 		await goto(`${url.pathname}${url.search}`, { reset: false, replace: true });
 	}
@@ -330,11 +356,13 @@
 				bind:selectedIds
 				requestOptions={projectRequestOptions}
 				{showArchived}
+				{showAllEnvironments}
 				availableTags={projectTags}
 				onToggleArchived={toggleArchived}
+				onToggleAllEnvironments={toggleAllEnvironments}
 				onRefreshData={async (options) => {
 					const requestedScope = scope;
-					baseProjectRequestOptions = withArchivedFilter(options, showArchived);
+					baseProjectRequestOptions = withProjectScope(options, showArchived, deployedOnly);
 					// Let the query switch to the new options first; the refetch then joins its fetch.
 					await tick();
 					await Promise.all([

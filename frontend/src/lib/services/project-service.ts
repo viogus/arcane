@@ -185,8 +185,13 @@ class ProjectService extends BaseAPIService {
 		return this.getProjectStatusCountsForEnvironment(envId);
 	}
 
-	async getProjectStatusCountsForEnvironment(environmentId: string, config?: APIRequestConfig): Promise<ProjectStatusCounts> {
-		const res = await this.api.get(`/environments/${environmentId}/projects/counts`, config);
+	async getProjectStatusCountsForEnvironment(
+		environmentId: string,
+		options?: { deployed?: boolean },
+		config?: APIRequestConfig
+	): Promise<ProjectStatusCounts> {
+		const params = options?.deployed ? { deployed: 'true' } : undefined;
+		const res = await this.api.get(`/environments/${environmentId}/projects/counts`, { ...config, params });
 		return res.data.data;
 	}
 
