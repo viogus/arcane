@@ -26,7 +26,8 @@
 	const versionQuery = createQuery(() => ({
 		queryKey: queryKeys.system.versionInfo(environment.id),
 		queryFn: () => systemUpgradeService.getVersionInfo(environment.id),
-		enabled: isOnline && environment.id !== '0',
+		// docker-host environments run no Arcane of their own, so there is nothing to upgrade.
+		enabled: isOnline && environment.id !== '0' && !environment.dockerHost,
 		staleTime: 60 * 1000,
 		retry: false
 	}));

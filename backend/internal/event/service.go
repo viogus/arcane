@@ -33,6 +33,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event/children/correlation"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/middleware"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/edge"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/concurrency"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/httpx"
@@ -64,6 +65,10 @@ type EventService struct {
 	daemonDone    chan struct{}
 	daemonMu      sync.RWMutex
 	daemonStopped bool
+
+	dockerHostEventMu       sync.Mutex
+	dockerHostEventProvider dockerHostEventProviderInternal
+	dockerHostEvents        map[string]dockerHostEventSubscriptionInternal
 }
 
 func NewEventService(db *database.DB, cfg *config.Config, httpClient *http.Client) *EventService {
@@ -101,6 +106,9 @@ type CreateEventRequest struct {
 }
 
 func (s *EventService) CreateEvent(ctx context.Context, req CreateEventRequest) (*Event, error) {
+	// Work served for an environment runs in this process when it is a docker-host environment, so the
+	// rows it produces must name that environment instead of landing on the manager's own stream.
+	req.EnvironmentID = eventEnvironmentIDInternal(ctx, req.EnvironmentID)
 	records, err := s.persistEvents(ctx, []CreateEventRequest{req})
 	if err != nil {
 		return nil, err
@@ -152,11 +160,27 @@ func (s *EventService) persistEvents(ctx context.Context, reqs []CreateEventRequ
 		if !inserted[index] {
 			continue
 		}
-		s.correlateCreatedEvent(req)
+		s.correlateCreatedEvent(ctx, req)
 		s.changes.Publish(struct{}{})
 		s.forwardEventToManager(ctx, records[index])
 	}
 	return records, nil
+}
+
+// eventEnvironmentIDInternal attributes an event to the environment whose work produced it. A caller
+// that names a specific environment keeps it, because agent ingestion and event forwarding carry an
+// authoritative environment. A caller that names nothing, or names the manager while serving a
+// docker-host environment's request, is corrected to the request's target.
+func eventEnvironmentIDInternal(ctx context.Context, requested *string) *string {
+	environmentID := envcontext.EnvironmentIDFromContext(ctx)
+	if environmentID == "" {
+		return requested
+	}
+	if requested == nil || strings.TrimSpace(*requested) == "" || strings.TrimSpace(*requested) == "0" {
+		resolved := environmentID
+		return &resolved
+	}
+	return requested
 }
 
 // IngestAgentEvent assigns the authenticated environment instead of trusting the agent's local ID.
@@ -693,7 +717,10 @@ func (s *EventService) RecordDockerEvent(ctx context.Context, msg events.Message
 	if !ok {
 		return
 	}
-	if s.ShouldSuppressDaemonEvent(string(msg.Type), msg.Actor.ID, *req.ResourceName, msg.Actor.Attributes["com.docker.compose.project"]) {
+	// Work served for a docker-host environment runs in this process, so its daemon's
+	// observations must name that environment instead of the manager's own stream.
+	req.EnvironmentID = eventEnvironmentIDInternal(ctx, req.EnvironmentID)
+	if s.ShouldSuppressDaemonEvent(ctx, string(msg.Type), msg.Actor.ID, *req.ResourceName, msg.Actor.Attributes["com.docker.compose.project"]) {
 		return
 	}
 	if msg.TimeNano != 0 {
@@ -844,36 +871,37 @@ func mapDaemonEvent(msg events.Message) (CreateEventRequest, bool) {
 	}, true
 }
 
-// MarkDockerExpectation correlates subsequent daemon observations with a local Arcane action.
-func (s *EventService) MarkDockerExpectation(resourceType, resourceID, resourceName string) {
+// MarkDockerExpectation correlates subsequent daemon observations with a local Arcane action against
+// the environment named by ctx.
+func (s *EventService) MarkDockerExpectation(ctx context.Context, resourceType, resourceID, resourceName string) {
 	if s == nil {
 		return
 	}
-	s.correlation.MarkExpectation(resourceType, resourceID, resourceName)
+	s.correlation.MarkExpectation(eventEnvironmentIDOrDefaultInternal(ctx), resourceType, resourceID, resourceName)
 }
 
 // BeginComposeSuppressionWindow covers daemon events labeled with the Compose project.
-func (s *EventService) BeginComposeSuppressionWindow(composeProject string) func() {
+func (s *EventService) BeginComposeSuppressionWindow(ctx context.Context, composeProject string) func() {
 	if s == nil {
 		return func() {}
 	}
-	return s.correlation.BeginComposeWindow(composeProject)
+	return s.correlation.BeginComposeWindow(eventEnvironmentIDOrDefaultInternal(ctx), composeProject)
 }
 
 // BeginDockerResourceSuppressionWindow covers a mutation for its full duration and cleanup grace.
-func (s *EventService) BeginDockerResourceSuppressionWindow(resourceType, resourceID, resourceName string) func() {
+func (s *EventService) BeginDockerResourceSuppressionWindow(ctx context.Context, resourceType, resourceID, resourceName string) func() {
 	if s == nil {
 		return func() {}
 	}
-	return s.correlation.BeginResourceWindow(resourceType, resourceID, resourceName)
+	return s.correlation.BeginResourceWindow(eventEnvironmentIDOrDefaultInternal(ctx), resourceType, resourceID, resourceName)
 }
 
 // BeginDockerTypeSuppressionWindow covers bulk daemon operations whose per-item IDs are unknown until they finish.
-func (s *EventService) BeginDockerTypeSuppressionWindow(resourceType string) func() {
+func (s *EventService) BeginDockerTypeSuppressionWindow(ctx context.Context, resourceType string) func() {
 	if s == nil {
 		return func() {}
 	}
-	return s.correlation.BeginTypeWindow(resourceType)
+	return s.correlation.BeginTypeWindow(eventEnvironmentIDOrDefaultInternal(ctx), resourceType)
 }
 
 // SetDockerUpdatingContainers supplies the updater's live identities without coupling domains.
@@ -884,19 +912,28 @@ func (s *EventService) SetDockerUpdatingContainers(source func() []string) {
 	s.correlation.SetUpdatingContainers(source)
 }
 
-// ShouldSuppressDaemonEvent reports whether a daemon observation matches a recent local action.
-func (s *EventService) ShouldSuppressDaemonEvent(resourceType, actorID, actorName, composeProject string) bool {
+// ShouldSuppressDaemonEvent reports whether a daemon observation matches a recent local action
+// against the same environment's daemon.
+func (s *EventService) ShouldSuppressDaemonEvent(ctx context.Context, resourceType, actorID, actorName, composeProject string) bool {
 	if s == nil {
 		return false
 	}
-	return s.correlation.ShouldSuppress(resourceType, actorID, actorName, composeProject)
+	return s.correlation.ShouldSuppress(eventEnvironmentIDOrDefaultInternal(ctx), resourceType, actorID, actorName, composeProject)
 }
 
-func (s *EventService) correlateCreatedEvent(req CreateEventRequest) {
+// eventEnvironmentIDOrDefaultInternal names the daemon a correlation belongs to; a request without an
+// environment target is the manager's own daemon.
+func eventEnvironmentIDOrDefaultInternal(ctx context.Context) string {
+	return envcontext.EnvironmentIDOrDefault(ctx)
+}
+
+func (s *EventService) correlateCreatedEvent(ctx context.Context, req CreateEventRequest) {
 	if req.ResourceType == nil || req.Metadata["source"] == "docker" {
 		return
 	}
-	if cmp.Or(kit.FromPtr(req.EnvironmentID), "0") != "0" {
+	// A remote agent records its own environment's daemon observations; only an action this process
+	// executes against a daemon it is about to observe is worth correlating.
+	if envcontext.EnvironmentIDFromContext(ctx) == "" && req.EnvironmentID != nil && *req.EnvironmentID != "" && *req.EnvironmentID != "0" {
 		return
 	}
 	// Failure and observational records do not identify a successful Docker mutation.
@@ -911,5 +948,12 @@ func (s *EventService) correlateCreatedEvent(req CreateEventRequest) {
 	default:
 		return
 	}
-	s.correlation.MarkExpectation(*req.ResourceType, kit.FromPtr(req.ResourceID), kit.FromPtr(req.ResourceName))
+	var id, name string
+	if req.ResourceID != nil {
+		id = *req.ResourceID
+	}
+	if req.ResourceName != nil {
+		name = *req.ResourceName
+	}
+	s.MarkDockerExpectation(ctx, *req.ResourceType, id, name)
 }

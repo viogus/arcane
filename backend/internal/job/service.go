@@ -39,6 +39,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 	scheduleutil "github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/schedule"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/tracing"
@@ -75,6 +76,11 @@ type JobService struct {
 	// the manager only.
 	OnEnvironmentHealthReschedule func(ctx context.Context)
 	RunEnvironmentHealthNow       func(ctx context.Context) error
+
+	// busWatcherScheduleRefresh reinstalls the schedules owned by bus watchers (image polling) for
+	// every docker-host environment. Those records live in the watcher, so syncing an environment
+	// has to ask it to refresh instead of writing the record here. Set during bootstrap.
+	busWatcherScheduleRefresh func()
 }
 
 func NewJobService(
@@ -266,6 +272,8 @@ func (s *JobService) RescheduleJobsForSettingKeys(ctx context.Context, changedKe
 			continue
 		}
 
+		rescheduleCtx := s.jobRescheduleContextForEnvironmentInternal(ctx)
+
 		// environment-health fans out to per-environment dynamic jobs; delegate the
 		// reschedule to environment.EnvironmentService instead of looking up a single job.
 		if jobID == "environment-health" {
@@ -273,7 +281,7 @@ func (s *JobService) RescheduleJobsForSettingKeys(ctx context.Context, changedKe
 				rescheduleErrors = append(rescheduleErrors, errors.New("environment-health rescheduler not initialized"))
 				continue
 			}
-			s.OnEnvironmentHealthReschedule(s.lifecycleCtx)
+			s.OnEnvironmentHealthReschedule(rescheduleCtx)
 			continue
 		}
 
@@ -281,7 +289,7 @@ func (s *JobService) RescheduleJobsForSettingKeys(ctx context.Context, changedKe
 		// watcher so it re-reads its poll schedule instead.
 		if jobMeta.IsContinuous {
 			if jobID == "image-polling" {
-				if err := s.settings.NotifySettingsChanges(s.lifecycleCtx, "pollingInterval"); err != nil {
+				if err := s.settings.NotifySettingsChanges(rescheduleCtx, "pollingInterval"); err != nil {
 					rescheduleErrors = append(rescheduleErrors, err)
 				}
 			}
@@ -295,19 +303,19 @@ func (s *JobService) RescheduleJobsForSettingKeys(ctx context.Context, changedKe
 		}
 
 		slog.DebugContext(ctx, "Processing job setting change", "job", jobID, "settingsKey", jobMeta.SettingsKey, "enabledKey", jobMeta.EnabledKey)
-		if err := s.scheduler.RescheduleJob(s.lifecycleCtx, job); err != nil {
+		if err := s.scheduler.RescheduleJob(rescheduleCtx, job); err != nil {
 			rescheduleErrors = append(rescheduleErrors, fmt.Errorf("reschedule job %s: %w", jobID, err))
 			continue
 		}
 
-		runtimeState, ok := s.scheduler.GetJobRuntimeState(jobID)
+		runtimeState, ok := s.scheduler.GetJobRuntimeStateFor(rescheduleCtx, environmentIDOrLocalInternal(rescheduleCtx), jobID)
 		if !ok {
 			rescheduleErrors = append(rescheduleErrors, fmt.Errorf("job %s has no runtime scheduler state", jobID))
 			continue
 		}
 
 		conditional, isConditional := job.(scheduler.ConditionalJob)
-		expectedSchedule := kit.Ternary(isConditional && !conditional.ShouldSchedule(s.lifecycleCtx), "", job.Schedule(s.lifecycleCtx))
+		expectedSchedule := kit.Ternary(isConditional && !conditional.ShouldSchedule(rescheduleCtx), "", job.Schedule(rescheduleCtx))
 		if runtimeState.Schedule != expectedSchedule {
 			rescheduleErrors = append(rescheduleErrors, fmt.Errorf("job %s runtime schedule %q does not match requested schedule %q", jobID, runtimeState.Schedule, expectedSchedule))
 		}
@@ -316,50 +324,86 @@ func (s *JobService) RescheduleJobsForSettingKeys(ctx context.Context, changedKe
 	return errors.Join(rescheduleErrors...)
 }
 
+// jobRescheduleContextInternal prefers the app lifecycle context so cron jobs
+// and watchers outlive the HTTP request that triggered the reschedule.
+func (s *JobService) jobRescheduleContextInternal(ctx context.Context) context.Context {
+	if s.lifecycleCtx != nil {
+		return s.lifecycleCtx
+	}
+	return ctx
+}
+
+// jobRescheduleContextForEnvironmentInternal keeps the request's environment target while still
+// preferring the app lifecycle context, so an environment-scoped change lands on that
+// environment's own scheduler record instead of the manager's.
+func (s *JobService) jobRescheduleContextForEnvironmentInternal(ctx context.Context) context.Context {
+	base := s.jobRescheduleContextInternal(ctx)
+	target, ok := envcontext.TargetFromContext(ctx)
+	if !ok || target.EnvironmentID == "" {
+		return base
+	}
+	return envcontext.WithTarget(base, target)
+}
+
+// environmentIDOrLocalInternal names the environment a request context is scoped to, defaulting to
+// the manager's own environment when the context carries no target.
+func environmentIDOrLocalInternal(ctx context.Context) string {
+	if environmentID := envcontext.EnvironmentIDFromContext(ctx); environmentID != "" {
+		return environmentID
+	}
+	return environment.LocalEnvironmentID
+}
+
+// environmentScopedContextInternal returns a context scoped to environmentID when this process
+// serves that environment's daemon, so per-environment settings overrides and that environment's
+// scheduler records are used. Agent environments keep the caller's context unchanged.
+func (s *JobService) environmentScopedContextInternal(ctx context.Context, environmentID string) (context.Context, bool) {
+	if environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return ctx, true
+	}
+	return s.environment.InProcessTargetContext(ctx, environmentID)
+}
+
+// ListJobs describes this manager's scheduled jobs and their run status for its own daemon.
 func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse, error) {
+	return s.ListJobsForEnvironment(ctx, environment.LocalEnvironmentID)
+}
+
+// ListJobsForEnvironment describes this manager's scheduled jobs, with run status taken from the
+// given environment's runs. It exists because a docker-host environment is served by this process:
+// its job list is the manager's own catalog, but its run history belongs to that environment's
+// daemon.
+func (s *JobService) ListJobsForEnvironment(ctx context.Context, environmentID string) (*jobschedule.JobListResponse, error) {
+	if s == nil || s.settings == nil {
+		return nil, errors.New("job service not initialized")
+	}
+	environmentID = cmp.Or(environmentID, environment.LocalEnvironmentID)
+	// Read the environment's own schedule overrides and scheduler records when this process serves
+	// that environment's daemon.
+	if scopedCtx, inProcess := s.environmentScopedContextInternal(ctx, environmentID); inProcess {
+		ctx = scopedCtx
+	}
+
 	allMetadata := meta.GetAllJobMetadata()
 	jobs := make([]jobschedule.JobStatus, 0, len(allMetadata))
 
 	for _, jobMeta := range allMetadata {
-		schedule := func() string {
-			switch {
-			// Continuous jobs with a settings key (image-polling) are event-driven but
-			// also poll on that cron schedule, so surface the real expression.
-			case jobMeta.IsContinuous && jobMeta.SettingsKey == "":
-				return "continuous"
-			case jobMeta.ID == "analytics-heartbeat":
-				return "automatic (checked hourly; sent once per 24h)"
-			case jobMeta.SettingsKey == "":
-				return ""
+		schedule := s.getJobScheduleInternal(ctx, jobMeta)
+		nextRun := s.calculateNextRunInternal(schedule)
+		enabled := s.isJobEnabled(ctx, jobMeta)
+		prerequisites := s.evaluatePrerequisites(ctx, jobMeta)
+
+		if s.scheduler != nil && (jobMeta.SettingsKey != "" || jobMeta.ID == "upgrade-log-cleanup") && jobMeta.ID != "environment-health" {
+			if runtimeState, ok := s.scheduler.GetJobRuntimeStateFor(ctx, environmentID, jobMeta.ID); ok {
+				schedule = cmp.Or(runtimeState.Schedule, schedule)
+				nextRun = runtimeState.NextRun
 			}
-			defaultSchedule, _, _, err := settings.DefaultSettingsConfig().FieldByKey(jobMeta.SettingsKey)
-			return s.settings.GetStringSetting(ctx, jobMeta.SettingsKey, kit.Ternary(err != nil || defaultSchedule == "", "0 0 0 * * *", defaultSchedule))
-		}()
-		runtimeState, hasRuntimeState := s.scheduler.GetJobRuntimeState(jobMeta.ID)
-		useRuntimeState := hasRuntimeState && (jobMeta.SettingsKey != "" || jobMeta.ID == "upgrade-log-cleanup") && jobMeta.ID != "environment-health"
-		jobs = append(jobs, jobMeta.ToJobStatus(
-			cmp.Or(kit.Ternary(useRuntimeState, runtimeState.Schedule, ""), schedule),
-			kit.Ternary(useRuntimeState, runtimeState.NextRun, func() *time.Time {
-				if schedule == "" || schedule == "continuous" {
-					return nil
-				}
-				// Parse schedule and force it to use the same timezone as the scheduler.
-				sched, err := scheduleutil.Parser().Parse(schedule)
-				if err != nil {
-					return nil
-				}
-				if specSchedule, ok := sched.(*cron.SpecSchedule); ok {
-					specSchedule.Location = s.location // keep: cron's parser returns the schedule without a location option
-				}
-				// Calculate next run using the configured timezone.
-				return new(sched.Next(time.Now().In(s.location)))
-			}()),
-			s.isJobEnabled(ctx, jobMeta),
-			s.evaluatePrerequisites(ctx, jobMeta),
-		))
+		}
+
+		jobs = append(jobs, jobMeta.ToJobStatus(schedule, nextRun, enabled, prerequisites))
 	}
 
-	statuses, err := runtime.ApplyStatuses(ctx, s.runs, s.scheduler, "0", jobs)
+	statuses, err := runtime.ApplyStatuses(ctx, s.runs, s.scheduler, environmentID, jobs)
 	if err != nil {
 		return nil, err
 	}
@@ -379,6 +423,133 @@ func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse
 
 func (s *JobService) isJobEnabled(ctx context.Context, localMeta meta.JobMetadata) bool {
 	return localMeta.EnabledKey == "" || s.settings.GetBoolSetting(ctx, localMeta.EnabledKey, false)
+}
+
+// environmentCronJobIDsInternal lists the cron jobs that act on an environment's own Docker daemon
+// and therefore need one scheduler record per docker-host environment. Manager housekeeping (event
+// cleanup, session cleanup, analytics, upgrade-log cleanup) stays on the manager. Image polling is
+// not a cron entry but a continuous bus watcher, so its per-environment records are installed by the
+// watcher and cleared explicitly in ForgetEnvironmentJobs.
+func environmentCronJobIDsInternal() []string {
+	return []string{"auto-update", "auto-patch", "auto-heal", "scheduled-prune", "vulnerability-scan", "docker-client-refresh"}
+}
+
+// SyncEnvironmentJobs installs this environment's own scheduler records for the daemon-facing cron
+// jobs, reading that environment's schedule and enabled overrides. It is a no-op for agent
+// environments, whose jobs run inside the agent.
+func (s *JobService) SyncEnvironmentJobs(ctx context.Context, environmentID string) error {
+	if s == nil || s.scheduler == nil || environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return nil
+	}
+	scopedCtx, inProcess := s.environment.InProcessTargetContext(ctx, environmentID)
+	if !inProcess {
+		return nil
+	}
+	var errs []error
+	for _, jobID := range environmentCronJobIDsInternal() {
+		job, ok := s.scheduler.GetJob(jobID)
+		if !ok {
+			continue
+		}
+		if err := s.scheduler.RescheduleJob(scopedCtx, job); err != nil {
+			errs = append(errs, fmt.Errorf("schedule %s for environment %s: %w", jobID, environmentID, err))
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	// Image polling is a bus watcher: a newly enabled docker-host environment must start polling
+	// immediately, so ask the watcher to install its own per-environment records.
+	if s.busWatcherScheduleRefresh != nil {
+		s.busWatcherScheduleRefresh()
+	}
+	return nil
+}
+
+// SetBusWatcherScheduleRefresh registers the callback that reinstalls bus-watcher schedules
+// (image polling) whenever a docker-host environment is synced. Called during bootstrap.
+func (s *JobService) SetBusWatcherScheduleRefresh(refresh func()) {
+	if s == nil {
+		return
+	}
+	s.busWatcherScheduleRefresh = refresh
+}
+
+// ForgetEnvironmentJobs clears the scheduler records this environment owns when it is disabled or
+// deleted, without unregistering jobs that the other environments still use.
+func (s *JobService) ForgetEnvironmentJobs(ctx context.Context, environmentID string) error {
+	if s == nil || s.scheduler == nil || environmentID == "" || environmentID == environment.LocalEnvironmentID {
+		return nil
+	}
+	var errs []error
+	for _, jobID := range environmentCronJobIDsInternal() {
+		if err := s.scheduler.ClearJobScheduleFor(ctx, environmentID, jobID); err != nil {
+			errs = append(errs, fmt.Errorf("unschedule %s for environment %s: %w", jobID, environmentID, err))
+		}
+	}
+	// Image polling is a bus watcher: it owns no registry entry but still checkpoints one schedule per
+	// docker-host environment, so its record must be cleared here too.
+	if err := s.scheduler.ClearJobScheduleFor(ctx, environmentID, "image-polling"); err != nil {
+		errs = append(errs, fmt.Errorf("unschedule %s for environment %s: %w", "image-polling", environmentID, err))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	// The watcher also holds a live event subscription per served environment; ask it to reconcile so
+	// a disabled environment stops feeding events immediately.
+	if s.busWatcherScheduleRefresh != nil {
+		s.busWatcherScheduleRefresh()
+	}
+	return nil
+}
+
+func (s *JobService) getJobScheduleInternal(ctx context.Context, localMeta meta.JobMetadata) string {
+	// Continuous jobs with a settings key (image-polling) are event-driven but
+	// also poll on that cron schedule, so surface the real expression.
+	if localMeta.IsContinuous && localMeta.SettingsKey == "" {
+		return "continuous"
+	}
+
+	if localMeta.ID == "analytics-heartbeat" {
+		return "automatic (checked hourly; sent once per 24h)"
+	}
+
+	if localMeta.SettingsKey == "" {
+		return ""
+	}
+
+	defaultSchedule, _, _, err := settings.DefaultSettingsConfig().FieldByKey(localMeta.SettingsKey)
+	if err != nil || defaultSchedule == "" {
+		defaultSchedule = "0 0 0 * * *"
+	}
+
+	return s.settings.GetStringSetting(ctx, localMeta.SettingsKey, defaultSchedule)
+}
+
+func (s *JobService) calculateNextRunInternal(schedule string) *time.Time {
+	if schedule == "" || schedule == "continuous" {
+		return nil
+	}
+
+	// Parse schedule and force it to use the same timezone as the scheduler.
+	parser := scheduleutil.Parser()
+	sched, err := parser.Parse(schedule)
+	if err != nil {
+		return nil
+	}
+
+	location := time.UTC
+	if s != nil && s.location != nil {
+		location = s.location
+	}
+
+	if specSchedule, ok := sched.(*cron.SpecSchedule); ok {
+		specSchedule.Location = location
+	}
+
+	// Calculate next run using the configured timezone.
+	now := time.Now().In(location)
+	return new(sched.Next(now))
 }
 
 func (s *JobService) evaluatePrerequisites(ctx context.Context, localMeta meta.JobMetadata) []jobschedule.JobPrerequisite {
@@ -492,7 +663,15 @@ func (s *JobService) Submit(ctx context.Context, request scheduler.Request) (sch
 			return scheduler.Run{}, errors.New("environment is disabled")
 		}
 		metadata, ok := meta.GetJobMetadata(request.JobID)
-		if !strings.HasPrefix(request.JobID, "gitops-sync:") && !strings.HasPrefix(request.JobID, "volume-backup:") && (!ok || metadata.ManagerOnly || !metadata.CanRunManually) {
+		dynamicRemote := strings.HasPrefix(request.JobID, "gitops-sync:") || strings.HasPrefix(request.JobID, "volume-backup:")
+		switch {
+		// A docker-host environment is served by this process, so its jobs are validated and
+		// executed like local work instead of being handed to an agent.
+		case env.IsDockerHost():
+			if err := s.validateLocalJob(ctx, request.JobID); err != nil {
+				return scheduler.Run{}, err
+			}
+		case !dynamicRemote && (!ok || metadata.ManagerOnly || !metadata.CanRunManually):
 			return scheduler.Run{}, errors.New("job is not remotely runnable")
 		}
 	} else if err := s.validateLocalJob(ctx, request.JobID); err != nil {
@@ -567,33 +746,37 @@ func (s *JobService) executeRun(ctx context.Context, run scheduler.Run) (result 
 	))
 	jobAttr := attribute.String("arcane.job.id", jobType)
 	started := time.Now()
-	s.activeRuns.Add(ctx, 1, metric.WithAttributes(jobAttr))
+	if s.activeRuns != nil {
+		s.activeRuns.Add(ctx, 1, metric.WithAttributes(jobAttr))
+	}
 	defer func() {
 		outcomeAttr := attribute.String("arcane.job.outcome", string(result.Status))
 		span.SetAttributes(outcomeAttr)
 		tracing.End(span, runErr)
-		// Record against a non-canceled context so shutdown-interrupted runs still count.
-		metricCtx := context.WithoutCancel(ctx)
-		attrs := metric.WithAttributes(jobAttr, outcomeAttr)
-		s.activeRuns.Add(metricCtx, -1, metric.WithAttributes(jobAttr))
-		s.runCount.Add(metricCtx, 1, attrs)
-		s.runDuration.Record(metricCtx, time.Since(started).Seconds(), attrs)
+		if s.activeRuns != nil {
+			// Record against a non-canceled context so shutdown-interrupted runs still count.
+			metricCtx := context.WithoutCancel(ctx)
+			attrs := metric.WithAttributes(jobAttr, outcomeAttr)
+			s.activeRuns.Add(metricCtx, -1, metric.WithAttributes(jobAttr))
+			s.runCount.Add(metricCtx, 1, attrs)
+			s.runDuration.Record(metricCtx, time.Since(started).Seconds(), attrs)
+		}
 	}()
 
 	if err := s.authorizeRun(ctx, run); err != nil {
 		return scheduler.Outcome{Status: scheduler.Failed}, err
 	}
-	if run.EnvironmentID != "0" {
+	runCtx, inProcess := s.environment.InProcessTargetContext(ctx, run.EnvironmentID)
+	if !inProcess {
 		return s.remote.Deliver(ctx, run)
 	}
-	if slices.Contains([]string{"auto-update", "auto-patch", "auto-heal", "scheduled-prune", "vulnerability-scan", "image-polling"}, run.JobID) ||
-		strings.HasPrefix(run.JobID, "gitops-sync:") || strings.HasPrefix(run.JobID, "volume-backup:") || strings.HasPrefix(run.JobID, "system-backup:") {
-		status, err := s.environment.TestConnection(ctx, "0", nil)
+	if requiresDockerInternal(run.JobID) && s.environment != nil {
+		status, err := s.environment.TestConnection(runCtx, run.EnvironmentID, nil)
 		if err != nil || status != "online" {
 			return scheduler.Outcome{Status: scheduler.Waiting, Message: "Waiting for Docker"}, err
 		}
 	}
-	ctx = s.runs.ExecutionContext(ctx, run, "")
+	ctx = s.runs.ExecutionContext(runCtx, run, "")
 	if run.JobID == "environment-health" && s.RunEnvironmentHealthNow != nil {
 		return classifyOutcome(run.JobID, scheduler.Outcome{}, s.RunEnvironmentHealthNow(ctx))
 	}
@@ -661,13 +844,23 @@ func safeJob(jobID string) bool {
 	return strings.HasPrefix(jobID, "environment-health:")
 }
 
+func requiresDockerInternal(jobID string) bool {
+	switch jobID {
+	case "auto-update", "auto-patch", "auto-heal", "scheduled-prune", "vulnerability-scan", "image-polling":
+		return true
+	}
+	return strings.HasPrefix(jobID, "gitops-sync:") || strings.HasPrefix(jobID, "volume-backup:") || strings.HasPrefix(jobID, "system-backup:")
+}
+
 func (s *JobService) reconcileRun(ctx context.Context, run scheduler.Run) (scheduler.Outcome, error) {
 	if err := s.authorizeRun(ctx, run); err != nil {
 		return scheduler.Outcome{Status: scheduler.Failed}, err
 	}
-	if run.EnvironmentID != "0" {
+	runCtx, inProcess := s.environment.InProcessTargetContext(ctx, run.EnvironmentID)
+	if !inProcess {
 		return s.executeRun(ctx, run)
 	}
+	ctx = runCtx
 	if job, ok := s.scheduler.GetJob(run.JobID); ok {
 		if reconciler, localOk := job.(scheduler.Reconciler); localOk {
 			return reconciler.Reconcile(s.runs.ExecutionContext(ctx, run, ""), run)
@@ -743,7 +936,7 @@ func (s *JobService) ResolveRun(ctx context.Context, environmentID, jobID, runID
 	if actor == "" {
 		return scheduler.Run{}, errors.New("resolving operator identity is required")
 	}
-	if environmentID != "0" {
+	if _, inProcess := s.environment.InProcessTargetContext(ctx, environmentID); !inProcess {
 		return s.remote.ResolveRun(ctx, environmentID, jobID, runID, actor)
 	}
 	return s.runs.Resolve(ctx, environmentID, jobID, runID, actor)
@@ -752,7 +945,7 @@ func (s *JobService) ResolveRun(ctx context.Context, environmentID, jobID, runID
 // RetryRun revalidates local job eligibility before requeuing the existing run.
 // Remote retries follow the delivery protocol and retain confirmed target progress.
 func (s *JobService) RetryRun(ctx context.Context, environmentID, jobID, runID string) (scheduler.Run, error) {
-	if environmentID != "0" {
+	if _, inProcess := s.environment.InProcessTargetContext(ctx, environmentID); !inProcess {
 		// Queue one explicit retry while retaining the agent's target progress.
 		run, err := s.runs.Get(ctx, environmentID, jobID, runID)
 		if errors.Is(err, runs.ErrRunNotFound) {
@@ -785,6 +978,10 @@ func (s *JobService) RetryRun(ctx context.Context, environmentID, jobID, runID s
 
 // ListRemoteJobs returns an agent's catalog with manager-side run status.
 func (s *JobService) ListRemoteJobs(ctx context.Context, environmentID string) (*jobschedule.JobListResponse, error) {
+	// A docker-host environment has no agent to ask, so its catalog is this manager's own.
+	if _, inProcess := s.environment.InProcessTargetContext(ctx, environmentID); inProcess {
+		return s.ListJobsForEnvironment(ctx, environmentID)
+	}
 	catalog, err := s.remote.Catalog(ctx, environmentID)
 	if err != nil {
 		return nil, err
@@ -805,7 +1002,7 @@ func (s *JobService) ListRemoteJobs(ctx context.Context, environmentID string) (
 
 // ListRuns merges agent history with requests accepted by this manager.
 func (s *JobService) ListRuns(ctx context.Context, environmentID, jobID string, page, limit int) (scheduler.RunList, error) {
-	if environmentID == "0" {
+	if _, inProcess := s.environment.InProcessTargetContext(ctx, environmentID); inProcess {
 		return s.runs.List(ctx, environmentID, jobID, page, limit)
 	}
 	merged, err := s.remote.Runs(ctx, environmentID, jobID)
@@ -835,8 +1032,9 @@ func (s *JobService) ListRuns(ctx context.Context, environmentID, jobID string, 
 
 // GetRun prefers the manager's durable delivery record, then queries agent-owned history.
 func (s *JobService) GetRun(ctx context.Context, environmentID, jobID, runID string) (scheduler.Run, error) {
+	_, inProcess := s.environment.InProcessTargetContext(ctx, environmentID)
 	run, err := s.runs.Get(ctx, environmentID, jobID, runID)
-	if environmentID == "0" || !errors.Is(err, runs.ErrRunNotFound) {
+	if inProcess || !errors.Is(err, runs.ErrRunNotFound) {
 		return runtime.ProjectRunOutcome(run), err
 	}
 	run, err = s.remote.AgentRun(ctx, environmentID, jobID, runID)
@@ -848,8 +1046,9 @@ func (s *JobService) GetRun(ctx context.Context, environmentID, jobID, runID str
 
 // CancelRun cancels manager admission or explicitly forwards an agent-owned cancellation.
 func (s *JobService) CancelRun(ctx context.Context, environmentID, jobID, runID string) (scheduler.Run, error) {
+	_, inProcess := s.environment.InProcessTargetContext(ctx, environmentID)
 	_, err := s.runs.Get(ctx, environmentID, jobID, runID)
-	if environmentID != "0" && errors.Is(err, runs.ErrRunNotFound) {
+	if !inProcess && errors.Is(err, runs.ErrRunNotFound) {
 		return s.remote.MutateAgentRun(ctx, environmentID, jobID, runID, "cancel")
 	}
 	if err != nil {

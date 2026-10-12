@@ -69,7 +69,8 @@
 		{ value: 'http', label: m.environments_edge_http_label(), icon: EnvironmentsIcon },
 		{ value: 'edge', label: m.environments_edge_label(), icon: EnvironmentsIcon },
 		{ value: 'websocket', label: m.environments_edge_websocket_label(), icon: EnvironmentsIcon },
-		{ value: 'grpc', label: m.environments_edge_grpc_label(), icon: EnvironmentsIcon }
+		{ value: 'grpc', label: m.environments_edge_grpc_label(), icon: EnvironmentsIcon },
+		{ value: 'dockerhost', label: m.environments_docker_host_label(), icon: EnvironmentsIcon }
 	];
 
 	function resolveEnvironmentTransport(item: Environment): 'grpc' | 'websocket' | undefined {
@@ -79,6 +80,7 @@
 	}
 
 	function getEnvironmentTypeLabel(item: Environment): string {
+		if (item.dockerHost) return m.environments_docker_host_label();
 		if (!item.isEdge) return m.environments_edge_http_label();
 		const transport = resolveEnvironmentTransport(item);
 		if (!transport) return m.environments_edge_label();
@@ -268,7 +270,7 @@
 			>
 				{item.name}
 			</button>
-			<span class="font-mono text-xs leading-tight text-muted-foreground">{item.apiUrl}</span>
+			<span class="font-mono text-xs leading-tight text-muted-foreground">{item.dockerHost || item.apiUrl}</span>
 		</div>
 	</div>
 {/snippet}
@@ -328,10 +330,10 @@
 			},
 			{
 				label: m.environments_api_url(),
-				getValue: (item: Environment) => item.apiUrl,
+				getValue: (item: Environment) => item.dockerHost || item.apiUrl,
 				icon: StatsIcon,
 				iconVariant: 'gray' as const,
-				show: (mobileFieldVisibility['apiUrl'] ?? true) && !!item.apiUrl
+				show: (mobileFieldVisibility['apiUrl'] ?? true) && !!(item.apiUrl || item.dockerHost)
 			}
 		]}
 		rowActions={RowActions}

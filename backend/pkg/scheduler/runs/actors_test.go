@@ -281,6 +281,57 @@ func TestReconciliationRepairsMissingAlarm(t *testing.T) {
 	require.Empty(t, after.Runs)
 }
 
+// TestWaitingOutcomeRetriesOnAShortCadence covers the offline-environment case: a run that cannot
+// reach its daemon yet parks in Waiting. It must be retried (NextAttempt set, so the actor arms a
+// retry alarm) and it must be retried soon — an environment that reconnects seconds after the run
+// started should be served then, not after the exponential cap or at its next schedule occurrence.
+func TestWaitingOutcomeRetriesOnAShortCadence(t *testing.T) {
+	q := newResolutionQueue(t)
+	run, err := q.Submit(t.Context(), st.Request{JobID: "waiting-cadence"})
+	require.NoError(t, err)
+	run.Owner = "test-owner"
+	require.NoError(t, q.UpdateRun(t.Context(), run, func(current *st.Run) error {
+		current.Status = st.Running
+		current.Owner = run.Owner
+		// Deep into the retry curve: Retrying here would wait well over a minute.
+		current.AttemptCount = 6
+		return nil
+	}))
+
+	require.NoError(t, q.persistOutcome(t.Context(), run, st.Outcome{Status: st.Waiting, Message: "Waiting for Docker"}))
+	persisted, err := q.Get(t.Context(), "0", run.JobID, run.ID)
+	require.NoError(t, err)
+	require.Equal(t, st.Waiting, persisted.Status)
+	require.NotNil(t, persisted.NextAttempt)
+	delay := time.Until(*persisted.NextAttempt)
+	require.Positive(t, delay)
+	require.LessOrEqual(t, delay, waitingRetryDelayInternal, "a waiting run must not sit out the exponential backoff")
+
+	// Until that moment the run is not dispatchable, and the actor's next alarm is exactly it.
+	selected, retryAt := q.nextRun([]st.Run{persisted})
+	require.Nil(t, selected)
+	require.False(t, retryAt.IsZero())
+	require.WithinDuration(t, *persisted.NextAttempt, retryAt, time.Millisecond)
+
+	// Once the delay elapses the same record is dispatchable again, so a daemon that comes back is
+	// picked up by the retry rather than by waiting for the next schedule.
+	persisted.NextAttempt = new(time.Now().UTC().Add(-time.Second))
+	selected, retryAt = q.nextRun([]st.Run{persisted})
+	require.NotNil(t, selected)
+	require.Equal(t, persisted.ID, selected.ID)
+	require.True(t, retryAt.IsZero())
+}
+
+func TestRetryDelayInternalSeparatesRetryingFromWaiting(t *testing.T) {
+	require.Equal(t, waitingRetryDelayInternal, retryDelayInternal(st.Waiting, 1))
+	require.Equal(t, waitingRetryDelayInternal, retryDelayInternal(st.Waiting, 12))
+	// A failed attempt keeps backing off: 5s, then doubling, capped at five minutes.
+	require.Equal(t, 5*time.Second, retryDelayInternal(st.Retrying, 1))
+	require.Equal(t, 5*time.Second, retryDelayInternal(st.Retrying, 0))
+	require.Equal(t, 40*time.Second, retryDelayInternal(st.Retrying, 4))
+	require.Equal(t, retryBackoffCapInternal, retryDelayInternal(st.Retrying, 12))
+}
+
 func TestAdmissionAndCompletionRejectStaleTokens(t *testing.T) {
 	host := francistest.New(t)
 	first := NewAdmission(host.Service(), "first")

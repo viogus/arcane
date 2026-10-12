@@ -14,12 +14,18 @@
 	let {
 		environment,
 		currentStatus,
+		dockerVersion,
+		isDockerHost,
+		isLoadingDockerVersion,
 		isLoadingVersion,
 		remoteVersion,
 		versionInformation
 	}: {
 		environment: Environment;
 		currentStatus: EnvironmentStatus;
+		dockerVersion: string | null;
+		isDockerHost: boolean;
+		isLoadingDockerVersion: boolean;
 		isLoadingVersion: boolean;
 		remoteVersion: AppVersionInformation | null;
 		versionInformation: AppVersionInformation | null | undefined;
@@ -84,7 +90,18 @@
 	</Badge>
 	<div class="flex items-center gap-1.5 text-xs text-muted-foreground">
 		<TagIcon class="size-3.5 shrink-0" />
-		{#if environment.id === '0'}
+		{#if isDockerHost}
+			{#if isLoadingDockerVersion}
+				<Spinner class="size-3.5" />
+				<span>{m.common_action_checking()}</span>
+			{:else if dockerVersion}
+				<span class="font-mono" title={m.common_docker_version()}>{dockerVersion}</span>
+			{:else if currentStatus === 'online' || currentStatus === 'standby'}
+				<span>{m.environments_version_unavailable()}</span>
+			{:else}
+				<span>{m.common_offline()}</span>
+			{/if}
+		{:else if environment.id === '0'}
 			<span class="font-mono">{localDisplayVersion}</span>
 			{#if versionInformation?.updateAvailable}
 				<Badge variant="amber" size="sm">

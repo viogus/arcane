@@ -244,7 +244,7 @@
 			const host = settingsStore.current ? settingsStore.current?.dockerHost : 'unix:///var/run/docker.sock';
 			return host || 'unix:///var/run/docker.sock';
 		} else {
-			return env.apiUrl;
+			return env.dockerHost || env.apiUrl;
 		}
 	}
 </script>

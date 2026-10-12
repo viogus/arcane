@@ -20,6 +20,7 @@ import (
 	kit "go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/cgroup"
 
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	wshub "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/ws"
 	httputil "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/httpx"
 )
@@ -31,11 +32,45 @@ const (
 	// subscriber interval; the shared sampler never ticks faster than the
 	// fastest active subscriber.
 	systemStatsSamplerDefaultInterval = 2 * time.Second
+
+	// dockerHostStatsTimeout bounds one Docker-API-derived reading; the container samples inside it
+	// are already bounded separately.
+	dockerHostStatsTimeout = 8 * time.Second
+
+	// maxActiveSystemStatsConnectionsPerClient bounds the live stats sockets one client may hold.
+	// The dashboard opens one socket per online environment card, so the bound has to fit a whole
+	// dashboard: the previous fixed limit of 5 starved every environment past the fourth.
+	maxActiveSystemStatsConnectionsPerClient = 32
 )
 
 // ============================================================================
 // System WebSocket Endpoints
 // ============================================================================
+
+// checkRateLimit checks and applies rate limiting for WebSocket connections.
+func (h *WebSocketHandler) checkRateLimit(clientKey string) bool {
+	h.activeConnectionsMu.Lock()
+	defer h.activeConnectionsMu.Unlock()
+	if h.activeConnections[clientKey] >= maxActiveSystemStatsConnectionsPerClient {
+		return false
+	}
+	if h.activeConnections == nil {
+		h.activeConnections = make(map[string]int)
+	}
+	h.activeConnections[clientKey]++
+	return true
+}
+
+// releaseRateLimit decrements the connection counter and cleans up if needed.
+func (h *WebSocketHandler) releaseRateLimit(clientKey string) {
+	h.activeConnectionsMu.Lock()
+	defer h.activeConnectionsMu.Unlock()
+	if count := h.activeConnections[clientKey]; count > 1 {
+		h.activeConnections[clientKey] = count - 1
+	} else {
+		delete(h.activeConnections, clientKey)
+	}
+}
 
 func (h *WebSocketHandler) acquireSystemStatsSampler(ctx context.Context, interval time.Duration) bool {
 	h.systemStatsSampler.lifecycleMu.Lock()
@@ -339,25 +374,10 @@ func (h *WebSocketHandler) SystemStats(c *echo.Context) error {
 	userID, _ := c.Get("userID").(string)
 	clientKey := cmp.Or(userID, c.RealIP())
 
-	h.activeConnectionsMu.Lock()
-	if h.activeConnections[clientKey] >= 5 {
-		h.activeConnectionsMu.Unlock()
+	if !h.checkRateLimit(clientKey) {
 		return c.JSON(http.StatusTooManyRequests, map[string]any{"success": false, "error": "Too many concurrent stats connections for this client"})
 	}
-	if h.activeConnections == nil {
-		h.activeConnections = make(map[string]int)
-	}
-	h.activeConnections[clientKey]++
-	h.activeConnectionsMu.Unlock()
-	defer func() {
-		h.activeConnectionsMu.Lock()
-		defer h.activeConnectionsMu.Unlock()
-		if count := h.activeConnections[clientKey]; count > 1 {
-			h.activeConnections[clientKey] = count - 1
-		} else {
-			delete(h.activeConnections, clientKey)
-		}
-	}()
+	defer h.releaseRateLimit(clientKey)
 
 	conn, unregister, ok := h.acceptWS(c, systemtypes.WSKindSystemStats, "")
 	if !ok {
@@ -375,26 +395,38 @@ func (h *WebSocketHandler) SystemStats(c *echo.Context) error {
 
 	conn.SetReadLimit(512)
 
-	ticker := time.NewTicker(sampleInterval)
-	defer ticker.Stop()
-
 	ctx, cancel := context.WithCancel(c.Request().Context())
 	defer cancel()
-	if !h.acquireSystemStatsSampler(ctx, sampleInterval) {
-		h.releaseSystemStatsSampler(sampleInterval)
-		return nil
-	}
-	defer h.releaseSystemStatsSampler(sampleInterval)
 
 	// Single reader for this connection; it also services the keepalive pong. Do not add others.
-	go func() {
+	readPump := func() {
 		for {
 			if _, _, err := conn.Read(ctx); err != nil {
 				cancel()
 				return
 			}
 		}
-	}()
+	}
+
+	// A docker-host environment is served in-process, but the machine whose stats it should show is
+	// the remote Docker host: the local sampler would stream the manager's own resources.
+	if envcontext.DockerHostFromContext(ctx) != "" {
+		go readPump()
+		go wshub.KeepAlive(ctx, cancel, conn)
+		h.streamDockerHostSystemStats(ctx, conn, sampleInterval)
+		return nil
+	}
+
+	ticker := time.NewTicker(sampleInterval)
+	defer ticker.Stop()
+
+	if !h.acquireSystemStatsSampler(ctx, sampleInterval) {
+		h.releaseSystemStatsSampler(sampleInterval)
+		return nil
+	}
+	defer h.releaseSystemStatsSampler(sampleInterval)
+
+	go readPump()
 	go wshub.KeepAlive(ctx, cancel, conn)
 
 	send := func() error {
@@ -419,6 +451,61 @@ func (h *WebSocketHandler) SystemStats(c *echo.Context) error {
 		case <-ticker.C:
 			if err := send(); err != nil {
 				return nil
+			}
+		}
+	}
+}
+
+// streamDockerHostSystemStats streams readings taken from a remote Docker API. A failing first
+// sample closes the stream so the client shows its "stats unavailable" state instead of zeros;
+// later failures resend the last good reading.
+func (h *WebSocketHandler) streamDockerHostSystemStats(ctx context.Context, conn *websocket.Conn, interval time.Duration) {
+	if h.systemService == nil {
+		slog.WarnContext(ctx, "System service is unavailable; closing docker-host environment stats stream")
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var last systemtypes.SystemStats
+	sampled := false
+	send := func() bool {
+		sampleCtx, sampleCancel := context.WithTimeout(ctx, dockerHostStatsTimeout)
+		stats, err := h.systemService.DockerHostSystemStats(sampleCtx)
+		sampleCancel()
+		switch {
+		case err != nil && !sampled:
+			slog.WarnContext(ctx, "Failed to sample docker-host environment stats", "error", err)
+			return false
+		case err != nil:
+			slog.DebugContext(ctx, "Failed to refresh docker-host environment stats", "error", err)
+			stats = last
+		default:
+			last = stats
+			sampled = true
+		}
+
+		payload, marshalErr := json.Marshal(stats)
+		if marshalErr != nil {
+			slog.WarnContext(ctx, "Failed to encode docker-host environment stats", "error", marshalErr)
+			return false
+		}
+		wctx, localCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer localCancel()
+		return conn.Write(wctx, websocket.MessageText, payload) == nil
+	}
+
+	if !send() {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !send() {
+				return
 			}
 		}
 	}

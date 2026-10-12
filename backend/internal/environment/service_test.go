@@ -346,6 +346,44 @@ func TestEnvironmentService_IsKnownAccessToken_TracksTokenWrites(t *testing.T) {
 	require.False(t, svc.IsKnownAccessToken("seeded-token"))
 }
 
+func TestEnvironmentService_DeleteEnvironmentPurgesEnvironmentData(t *testing.T) {
+	ctx := t.Context()
+	db := setupEnvironmentServiceTestDB(t)
+	createTestEnvironment(t, db, "env-delete-purge", "http://env.example", nil)
+
+	var purged []string
+	svc := NewEnvironmentService(db, http.DefaultClient, nil, event.NewEventService(db, nil, nil), nil, nil)
+	svc.SetEnvironmentDataPurgeHook(func(_ context.Context, environmentID string) error {
+		purged = append(purged, environmentID)
+		return nil
+	})
+
+	require.NoError(t, svc.DeleteEnvironment(ctx, "env-delete-purge", nil, nil))
+
+	require.Equal(t, []string{"env-delete-purge"}, purged)
+	_, err := svc.GetEnvironmentByID(ctx, "env-delete-purge")
+	require.Error(t, err)
+}
+
+func TestEnvironmentService_DeleteEnvironmentKeepsRowWhenPurgeFails(t *testing.T) {
+	ctx := t.Context()
+	db := setupEnvironmentServiceTestDB(t)
+	createTestEnvironment(t, db, "env-delete-purge-fails", "http://env.example", nil)
+
+	purgeErr := errors.New("purge failed")
+	svc := NewEnvironmentService(db, http.DefaultClient, nil, event.NewEventService(db, nil, nil), nil, nil)
+	svc.SetEnvironmentDataPurgeHook(func(_ context.Context, _ string) error {
+		return purgeErr
+	})
+
+	err := svc.DeleteEnvironment(ctx, "env-delete-purge-fails", nil, nil)
+
+	require.ErrorIs(t, err, purgeErr)
+	env, getErr := svc.GetEnvironmentByID(ctx, "env-delete-purge-fails")
+	require.NoError(t, getErr)
+	require.Equal(t, "env-delete-purge-fails", env.ID)
+}
+
 func createTestRegistry(t *testing.T, db *database.DB, id string) {
 	t.Helper()
 
@@ -1426,6 +1464,13 @@ func TestEnvironmentService_ListEnvironmentsPaginated_FiltersByRuntimeType(t *te
 			IsEdge:            true,
 			LastEdgeTransport: new("websocket"),
 		},
+		{
+			ID: "env-dockerhost", CreatedAt: now, UpdatedAt: &now,
+			Name:       "Remote Docker",
+			DockerHost: new("tcp://192.168.2.33:6001"),
+			Status:     string(EnvironmentStatusOnline),
+			Enabled:    true,
+		},
 	}
 	require.NoError(t, db.WithContext(ctx).Create(&envs).Error)
 
@@ -1453,6 +1498,9 @@ func TestEnvironmentService_ListEnvironmentsPaginated_FiltersByRuntimeType(t *te
 		wantIDs    []string
 	}{
 		{name: "http", typeFilter: "http", wantIDs: []string{"0"}},
+		// Docker-host environments point at a remote Docker API and are not agents,
+		// so they are their own type and never classify as http.
+		{name: "dockerhost", typeFilter: "dockerhost", wantIDs: []string{"env-dockerhost"}},
 		// Poll-only edge environments (no tunnel transport) classify as plain edge.
 		{name: "edge", typeFilter: "edge", wantIDs: []string{"env-edge", "env-polling"}},
 		{name: "grpc", typeFilter: "grpc", wantIDs: []string{"env-grpc"}},

@@ -42,17 +42,17 @@ func (h *WebSocketHandler) ContainerStats(c *echo.Context) error {
 	// A reconnect can land exactly on the 5s idle-teardown boundary and load a
 	// hub whose Run has already exited. Drop that hub and retry once so the
 	// client gets a live producer instead of a silent socket.
-	// The hub owns connection cleanup, so it outlives the request and ends with the app.
+	// The hub owns connection cleanup; preserve request values without request cancellation.
+	// Request values carry the target Docker daemon, so the producer samples the
+	// environment this socket belongs to instead of the manager's own daemon.
+	baseCtx := context.WithoutCancel(c.Request().Context())
+	hubKey := containerStatsHubKey(c.Param("id"), containerID)
 	for attempt := range 2 {
-		actual, loaded := h.containerStatsHubs.LoadOrStore(containerID, wshub.NewHub(64))
-		hub, _ := actual.(*wshub.Hub)
-		if !loaded {
-			h.runContainerStatsHub(containerID, hub)
-		}
-		if wshub.ServeClientWithOnRemove(h.ctx, hub, conn, onRemove) {
+		hub := h.getOrCreateContainerStatsHub(hubKey, containerID, baseCtx)
+		if wshub.ServeClientWithOnRemove(baseCtx, hub, conn, onRemove) {
 			return nil
 		}
-		h.containerStatsHubs.CompareAndDelete(containerID, hub)
+		h.containerStatsHubs.CompareAndDelete(hubKey, hub)
 		slog.DebugContext(c.Request().Context(), "container stats hub stopped before client registration; retrying",
 			"containerId", containerID, "attempt", attempt+1)
 	}
@@ -65,8 +65,40 @@ func (h *WebSocketHandler) ContainerStats(c *echo.Context) error {
 
 const streamEndDrainGrace = 2 * time.Second
 
-func (h *WebSocketHandler) runContainerStatsHub(containerID string, hub *wshub.Hub) {
-	ctx, cancel := context.WithCancel(h.ctx)
+// containerStatsHubKey scopes a stats hub to one environment. Container IDs are
+// only unique per daemon, so a key without the environment id would let two
+// environments share (and leak) one producer's samples.
+func containerStatsHubKey(envID, containerID string) string {
+	return envID + "\x00" + containerID
+}
+
+func (h *WebSocketHandler) getOrCreateContainerStatsHub(key, containerID string, base context.Context) *wshub.Hub {
+	if existing, ok := h.containerStatsHubs.Load(key); ok {
+		if hub, localOk := existing.(*wshub.Hub); localOk {
+			return hub
+		}
+	}
+
+	hub := wshub.NewHub(64)
+	actual, loaded := h.containerStatsHubs.LoadOrStore(key, hub)
+	if loaded {
+		if existingHub, ok := actual.(*wshub.Hub); ok {
+			return existingHub
+		}
+		// type assertion failure is impossible in practice, but avoid running
+		// an unregistered hub if it somehow occurs
+		return hub
+	}
+
+	h.runContainerStatsHub(key, containerID, base, hub)
+	return hub
+}
+
+// runContainerStatsHub owns the producer for one environment/container pair. The
+// hub outlives individual requests, so it must not cancel with them, but it must
+// keep their values: the request context carries the target Docker daemon.
+func (h *WebSocketHandler) runContainerStatsHub(key, containerID string, base context.Context, hub *wshub.Hub) {
+	ctx, cancel := newHubContext(base)
 	var cleanupTimer *time.Timer
 	var cleanupTimerMu sync.Mutex
 
@@ -82,7 +114,7 @@ func (h *WebSocketHandler) runContainerStatsHub(containerID string, hub *wshub.H
 			if cleanupTimer != timer || hub.Len() > 0 {
 				return
 			}
-			h.containerStatsHubs.CompareAndDelete(containerID, hub)
+			h.containerStatsHubs.CompareAndDelete(key, hub)
 			slog.DebugContext(ctx, "container stats hub idle, cleaning up upstream stream", "containerId", containerID)
 			cleanupTimer = nil
 			cancel()
@@ -106,7 +138,7 @@ func (h *WebSocketHandler) runContainerStatsHub(containerID string, hub *wshub.H
 		defer close(statsChan)
 
 		err := h.containerService.StreamStats(ctx, containerID, statsChan)
-		h.containerStatsHubs.CompareAndDelete(containerID, hub)
+		h.containerStatsHubs.CompareAndDelete(key, hub)
 		if err == nil || errors.Is(err, context.Canceled) || ctx.Err() != nil {
 			cancel()
 			return

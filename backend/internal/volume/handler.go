@@ -22,6 +22,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
@@ -228,7 +229,9 @@ func (h *VolumeHandler) CreateVolume(ctx context.Context, input *CreateVolumeInp
 
 // RenameVolume renames an unused Docker volume.
 func (h *VolumeHandler) RenameVolume(ctx context.Context, input *RenameVolumeInput) (*handlerutil.Out[*volume.Volume], error) {
-	if input.EnvironmentID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so its
+	// volumes are renamed through the local service with the environment's daemon in context.
+	if input.EnvironmentID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		if h.environmentService == nil {
 			return nil, huma.Error500InternalServerError("environment service not available")
 		}

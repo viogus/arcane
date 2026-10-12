@@ -35,6 +35,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/s3"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/httpx"
 )
@@ -114,7 +115,7 @@ func TestRenameVolumeRejectsInvalidAndProtectedNames(t *testing.T) {
 
 func applyVolumeBackupMigrations(t *testing.T, gormDB *gorm.DB) {
 	t.Helper()
-	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql"} {
+	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql", "096_add_volume_backup_policy_environment.sql", "098_add_volume_backup_environment.sql"} {
 		migration, err := os.ReadFile("../../resources/migrations/sqlite/" + name)
 		require.NoError(t, err)
 		require.NoError(t, gormDB.Exec(strings.Split(string(migration), "-- +goose Down")[0]).Error)
@@ -170,6 +171,131 @@ func TestListBackupsPaginatedByManagementType(t *testing.T) {
 	for _, entry := range volumeRows {
 		require.Equal(t, backup.ManagementTypeVolume, entry.Type)
 	}
+}
+
+func TestListBackupsIsolatesHistoryPerEnvironment(t *testing.T) {
+	gormDB, err := gorm.Open(sqlite.Open("file:volume-backup-environments?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	applyVolumeBackupMigrations(t, gormDB)
+	service := &VolumeService{db: &database.DB{DB: gormDB}}
+	store := service.backupStore()
+
+	// Two daemons can each own a volume called "app-data"; the same name must not mix histories.
+	managerRecord := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(t.Context(), managerRecord))
+	remoteCtx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-remote"})
+	remoteRecord := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(remoteCtx, remoteRecord))
+
+	managerRows, total, err := service.listBackups(t.Context(), "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, managerRows, 1)
+	require.Equal(t, managerRecord.ID, managerRows[0].ID)
+
+	remoteRows, total, err := service.listBackups(remoteCtx, "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, remoteRows, 1)
+	require.Equal(t, remoteRecord.ID, remoteRows[0].ID)
+
+	// Completion goes through Save, which must not blank the stored environment (the DTO has no
+	// field for it) and thereby drop the row out of its own environment's history.
+	managerRecord.Status = string(VolumeBackupStatusFailed)
+	require.NoError(t, store.Save(t.Context(), managerRecord))
+	var stored VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", managerRecord.ID).First(&stored).Error)
+	require.Equal(t, "0", stored.EnvironmentID)
+	managerRows, total, err = service.listBackups(t.Context(), "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, managerRows, 1)
+
+	// Rows written by the manager default to "0" and stay invisible to a remote environment.
+	require.NoError(t, gormDB.Create(&VolumeBackup{VolumeName: "app-data", Status: VolumeBackupStatusSucceeded}).Error)
+	remoteRows, total, err = service.listBackups(remoteCtx, "app-data", pagination.QueryParams{})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, total)
+	require.Len(t, remoteRows, 1)
+
+	// Every callback an environment-scoped route reaches must stay inside its environment: a guessed id
+	// from the other daemon must not be readable, failable, listable or deletable.
+	remoteRunning := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusRunning)}
+	require.NoError(t, store.Create(remoteCtx, remoteRunning))
+	managerRunning := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusRunning)}
+	require.NoError(t, store.Create(t.Context(), managerRunning))
+
+	_, err = store.Run(t.Context(), remoteRunning.ID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	run, err := store.Run(remoteCtx, remoteRunning.ID)
+	require.NoError(t, err)
+	require.Equal(t, remoteRunning.ID, run.ID)
+
+	// Fail reports no error for a row it cannot see, so the untouched row is the proof.
+	require.NoError(t, store.Fail(remoteCtx, managerRunning.ID, "not ours"))
+	var untouched VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", managerRunning.ID).First(&untouched).Error)
+	require.Equal(t, VolumeBackupStatusRunning, untouched.Status)
+	require.Empty(t, untouched.Error)
+
+	require.NoError(t, store.Fail(remoteCtx, remoteRunning.ID, "remote failed"))
+	var failedRemote VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", remoteRunning.ID).First(&failedRemote).Error)
+	require.Equal(t, VolumeBackupStatusFailed, failedRemote.Status)
+
+	runs, err := store.Runs(remoteCtx, []string{managerRunning.ID, remoteRunning.ID})
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	require.Equal(t, remoteRunning.ID, runs[0].ID)
+
+	managerPolicy := &volumetypes.Backup{VolumeName: "app-data", PolicyID: "policy-1", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(t.Context(), managerPolicy))
+	remotePolicy := &volumetypes.Backup{VolumeName: "app-data", PolicyID: "policy-1", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(remoteCtx, remotePolicy))
+	latestManager, err := store.Latest(t.Context(), "policy-1")
+	require.NoError(t, err)
+	require.Equal(t, managerPolicy.ID, latestManager.ID)
+	latestRemote, err := store.Latest(remoteCtx, "policy-1")
+	require.NoError(t, err)
+	require.Equal(t, remotePolicy.ID, latestRemote.ID)
+
+	// Delete reports no error for a row it cannot see, so the surviving row is the proof.
+	require.NoError(t, store.Delete(remoteCtx, managerPolicy.ID))
+	var surviving VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", managerPolicy.ID).First(&surviving).Error)
+	require.NoError(t, store.Delete(remoteCtx, remotePolicy.ID))
+	require.ErrorIs(t, gormDB.Where("id = ?", remotePolicy.ID).First(&VolumeBackup{}).Error, gorm.ErrRecordNotFound)
+}
+
+// The startup reconciler resumes a workflow that does not record its environment, so it closes the
+// row by id alone — while still refusing to rewrite a backup that already finished.
+func TestFailRunningByIDClosesResumedBackupWithoutEnvironment(t *testing.T) {
+	gormDB, err := gorm.Open(sqlite.Open("file:volume-backup-fail-running?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	applyVolumeBackupMigrations(t, gormDB)
+	service := &VolumeService{db: &database.DB{DB: gormDB}}
+	store := service.backupStore()
+
+	remoteCtx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-remote"})
+	resumed := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusRunning)}
+	require.NoError(t, store.Create(remoteCtx, resumed))
+
+	// Without an environment target the scoped lookup cannot see the row the reconciler resumes.
+	_, err = store.Run(t.Context(), resumed.ID)
+	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.NoError(t, store.FailRunningByID(t.Context(), resumed.ID, "Backup did not run"))
+
+	var stored VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", resumed.ID).First(&stored).Error)
+	require.Equal(t, VolumeBackupStatusFailed, stored.Status)
+	require.Equal(t, "Backup did not run", stored.Error)
+
+	finished := &volumetypes.Backup{VolumeName: "app-data", Status: string(VolumeBackupStatusSucceeded)}
+	require.NoError(t, store.Create(remoteCtx, finished))
+	require.NoError(t, store.FailRunningByID(t.Context(), finished.ID, "Backup did not run"))
+	var finishedStored VolumeBackup
+	require.NoError(t, gormDB.Where("id = ?", finished.ID).First(&finishedStored).Error)
+	require.Equal(t, VolumeBackupStatusSucceeded, finishedStored.Status)
 }
 
 func newVolumeWorkspaceTestDockerClient(t *testing.T, server *httptest.Server) *client.Client {

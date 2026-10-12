@@ -456,11 +456,11 @@ func TestUpdaterService_DockerClientAdapter(t *testing.T) {
 		svc, err := NewUpdaterService(nil, nil, nil, nil, nil, nil, events, nil, nil, nil, nil, nil, nil, nil)
 		require.NoError(t, err)
 		end := svc.engine.BeginContainerUpdate("updating-container")
-		require.True(t, events.ShouldSuppressDaemonEvent("container", "updating-container", "", ""))
-		require.False(t, events.ShouldSuppressDaemonEvent("container", "unrelated-container", "", ""))
-		require.False(t, events.ShouldSuppressDaemonEvent("image", "updating-container", "", ""))
+		require.True(t, events.ShouldSuppressDaemonEvent(context.Background(), "container", "updating-container", "", ""))
+		require.False(t, events.ShouldSuppressDaemonEvent(context.Background(), "container", "unrelated-container", "", ""))
+		require.False(t, events.ShouldSuppressDaemonEvent(context.Background(), "image", "updating-container", "", ""))
 		end()
-		require.False(t, events.ShouldSuppressDaemonEvent("container", "updating-container", "", ""))
+		require.False(t, events.ShouldSuppressDaemonEvent(context.Background(), "container", "updating-container", "", ""))
 	})
 
 	t.Run("delegates to configured docker service", func(t *testing.T) {

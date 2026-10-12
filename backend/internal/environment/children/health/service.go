@@ -27,10 +27,26 @@ func New(httpClient *http.Client, dockerService *docker.DockerClientService) *Se
 	return &Service{httpClient: httpClient, dockerService: dockerService}
 }
 
+// Target describes the environment being probed.
+type Target struct {
+	// ID is the environment UUID ("0" is the manager's own environment).
+	ID string
+	// APIURL is the agent base URL, used for agent and edge environments.
+	APIURL string
+	// IsEdge selects tunnel-based probing.
+	IsEdge bool
+	// CustomURL forces a direct HTTP probe against APIURL (connection test with an override).
+	CustomURL bool
+	// DockerHost is the Docker API endpoint of a "docker-host" environment, probed with a Docker ping.
+	DockerHost string
+	// DockerHostToken is the bearer token for that endpoint, when it requires authentication.
+	DockerHostToken string
+}
+
 // Probe reports "online", "offline" or "error" for one environment. A custom
 // API URL always probes directly over HTTP.
-func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customURL bool, authenticated func(context.Context) (int, error)) (string, error) {
-	if id == "0" && !customURL {
+func (s *Service) Probe(ctx context.Context, target Target, authenticated func(context.Context) (int, error)) (string, error) {
+	if target.ID == "0" && !target.CustomURL {
 		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		defer cancel()
 
@@ -41,17 +57,20 @@ func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customUR
 		}
 		return "online", nil
 	}
-	if isEdge && !customURL {
+	if target.DockerHost != "" && !target.CustomURL {
+		return s.probeDockerHostInternal(ctx, target.DockerHost, target.DockerHostToken)
+	}
+	if target.IsEdge && !target.CustomURL {
 		// The probe is standing tunnel demand, keeping idle poll-mode tunnels
 		// open across check cycles instead of letting them flap.
-		edge.TouchTunnelDemand(id, edge.DefaultTunnelDemandTTL)
-		if !edge.HasActiveTunnel(id) {
-			if _, ok := edge.RequestTunnelAndWait(ctx, id, edge.DefaultTunnelDemandTTL, edge.DefaultTunnelAcquireTimeout()).Get(); !ok {
+		edge.TouchTunnelDemand(target.ID, edge.DefaultTunnelDemandTTL)
+		if !edge.HasActiveTunnel(target.ID) {
+			if _, ok := edge.RequestTunnelAndWait(ctx, target.ID, edge.DefaultTunnelDemandTTL, edge.DefaultTunnelAcquireTimeout()).Get(); !ok {
 				return "offline", errors.New("edge agent is not connected")
 			}
 		}
 	}
-	if !customURL {
+	if !target.CustomURL {
 		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 
@@ -68,7 +87,7 @@ func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customUR
 		}
 	}
 
-	baseURL, err := httpx.NormalizeBaseURL(apiURL)
+	baseURL, err := httpx.NormalizeBaseURL(target.APIURL)
 	if err != nil {
 		return "offline", fmt.Errorf("invalid environment API URL: %w", err)
 	}
@@ -89,4 +108,20 @@ func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customUR
 		return "online", nil
 	}
 	return "error", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+}
+
+// probeDockerHostInternal pings a "docker-host" environment's Docker API endpoint. The manager
+// talks to that daemon directly, so Docker API reachability is the entire health signal.
+func (s *Service) probeDockerHostInternal(ctx context.Context, host, token string) (string, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	dockerClient, err := s.dockerService.GetHostClient(reqCtx, host, token)
+	if err != nil {
+		return "offline", fmt.Errorf("failed to connect to Docker host %q: %w", host, err)
+	}
+	if _, pingErr := dockerClient.Ping(reqCtx, client.PingOptions{}); pingErr != nil {
+		return "offline", fmt.Errorf("docker ping failed for %q: %w", host, pingErr)
+	}
+	return "online", nil
 }

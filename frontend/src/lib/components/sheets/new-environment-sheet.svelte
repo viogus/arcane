@@ -12,7 +12,7 @@
 	import * as ResponsiveDialog from '#lib/components/ui/responsive-dialog/index.js';
 	import { Spinner } from '#lib/components/ui/spinner/index.js';
 	import * as Tabs from '#lib/components/ui/tabs/index.js';
-	import { RemoteEnvironmentIcon, EdgeConnectionIcon, DownloadIcon } from '#lib/icons/index.js';
+	import { RemoteEnvironmentIcon, EdgeConnectionIcon, DockerBrandIcon, DownloadIcon } from '#lib/icons/index.js';
 	import { m } from '#lib/paraglide/messages.js';
 	import { queryKeys } from '#lib/query/query-keys.js';
 	import { isSessionCancelledError, withSessionSignal } from '#lib/services/api-service.js';
@@ -30,7 +30,7 @@
 	let { open = $bindable(false), onEnvironmentCreated }: NewEnvironmentSheetProps = $props();
 	const queryClient = useQueryClient();
 
-	type ConnectionMode = 'direct' | 'edge';
+	type ConnectionMode = 'direct' | 'edge' | 'dockerHost';
 	let connectionMode = $state<ConnectionMode>('direct');
 
 	let createdEnvironment = $state<{
@@ -47,10 +47,23 @@
 
 	let isLoadingSnippets = $state(false);
 	const createEnvironmentMutation = createMutation(() => ({
-		mutationFn: (variables: { dto: CreateEnvironmentDTO; apiUrl: string; isEdge: boolean; useMTLS: boolean }) =>
-			environmentManagementService.create(variables.dto),
+		mutationFn: (variables: {
+			dto: CreateEnvironmentDTO;
+			apiUrl: string;
+			isEdge: boolean;
+			useMTLS: boolean;
+			mode?: ConnectionMode;
+		}) => environmentManagementService.create(variables.dto),
 		onSuccess: async (created, variables) => {
 			await queryClient.invalidateQueries({ queryKey: queryKeys.environments.all });
+
+			// Docker host environments never pair an Arcane agent, so there is
+			// no bootstrap command or API key step to show.
+			if (variables.mode === 'dockerHost') {
+				// handleDone() closes the sheet, and the parent page raises the success toast.
+				handleDone();
+				return;
+			}
 
 			if (created.apiKey) {
 				createdEnvironment = {
@@ -117,6 +130,13 @@
 		name: z.string().min(1, m.environments_name_required()).max(25, m.environments_name_too_long())
 	});
 
+	// Docker host mode requires a name and a Docker API endpoint
+	const dockerHostFormSchema = z.object({
+		name: z.string().min(1, m.environments_name_required()).max(25, m.environments_name_too_long()),
+		dockerHost: z.string().min(1, m.environments_docker_host_required()),
+		dockerHostToken: z.string()
+	});
+
 	const directForm = createForm<typeof directFormSchema>(directFormSchema, {
 		name: '',
 		apiUrl: ''
@@ -127,6 +147,13 @@
 		name: ''
 	});
 	let edgeInputs = $derived(edgeForm.inputs);
+
+	const dockerHostForm = createForm<typeof dockerHostFormSchema>(dockerHostFormSchema, {
+		name: '',
+		dockerHost: '',
+		dockerHostToken: ''
+	});
+	let dockerHostInputs = $derived(dockerHostForm.inputs);
 
 	// Reset on open/close
 
@@ -165,6 +192,21 @@
 		};
 
 		createEnvironmentMutation.mutate({ dto, apiUrl: '', isEdge: true, useMTLS: edgeMTLSEnabled });
+	}
+
+	function handleDockerHostSubmit() {
+		const data = dockerHostForm.validate();
+		if (!data) return;
+
+		const dockerHostToken = data.dockerHostToken.trim();
+		const dto: CreateEnvironmentDTO = {
+			name: data.name,
+			dockerHost: data.dockerHost,
+			// Only sent when the endpoint actually requires authentication.
+			...(dockerHostToken ? { dockerHostToken } : {})
+		};
+
+		createEnvironmentMutation.mutate({ dto, apiUrl: '', isEdge: false, useMTLS: false, mode: 'dockerHost' });
 	}
 
 	function handleDone() {
@@ -218,8 +260,16 @@
 <ResponsiveDialog.Root
 	bind:open
 	variant="sheet"
-	title={createdEnvironment ? m.environments_created_title() : m.environments_create_new_agent()}
-	description={createdEnvironment ? m.environments_created_description() : m.environments_create_new_agent_description()}
+	title={createdEnvironment
+		? m.environments_created_title()
+		: connectionMode === 'dockerHost'
+			? m.environments_create_new_docker_host()
+			: m.environments_create_new_agent()}
+	description={createdEnvironment
+		? m.environments_created_description()
+		: connectionMode === 'dockerHost'
+			? m.environments_create_new_docker_host_description()
+			: m.environments_create_new_agent_description()}
 	contentClass="sm:max-w-2xl"
 >
 	{#snippet children()}
@@ -294,7 +344,7 @@
 				</div>
 			{:else}
 				<Tabs.Root bind:value={connectionMode} class="w-full">
-					<Tabs.List class="grid w-full grid-cols-2">
+					<Tabs.List class="grid w-full grid-cols-3">
 						<Tabs.Trigger value="direct" class="flex items-center">
 							<RemoteEnvironmentIcon class="size-4" />
 							Direct
@@ -302,6 +352,10 @@
 						<Tabs.Trigger value="edge" class="flex items-center">
 							<EdgeConnectionIcon class="size-4" />
 							Edge
+						</Tabs.Trigger>
+						<Tabs.Trigger value="dockerHost" class="flex items-center">
+							<DockerBrandIcon class="size-4" />
+							{m.environments_docker_host_label()}
 						</Tabs.Trigger>
 					</Tabs.List>
 
@@ -362,6 +416,42 @@
 								disabled={isSubmittingNewAgent}
 								loading={isSubmittingNewAgent}
 								customLabel={m.environments_generate_config()}
+							/>
+						</form>
+					</Tabs.Content>
+
+					<Tabs.Content value="dockerHost" class="mt-4">
+						<p class="mb-4 text-sm text-muted-foreground">
+							{m.environments_docker_host_desc()}
+						</p>
+						<form onsubmit={preventDefault(handleDockerHostSubmit)} class="space-y-4">
+							<FormInput
+								label={m.common_name()}
+								placeholder={m.environments_production_docker()}
+								bind:input={dockerHostInputs.name}
+							/>
+
+							<FormInput
+								label={m.environments_docker_host_label()}
+								placeholder={m.environments_docker_host_placeholder()}
+								bind:input={dockerHostInputs.dockerHost}
+							/>
+
+							<FormInput
+								type="password"
+								label={m.environments_docker_host_token_label()}
+								placeholder={m.environments_docker_host_token_placeholder()}
+								helpText={m.environments_docker_host_token_help()}
+								bind:input={dockerHostInputs.dockerHostToken}
+							/>
+
+							<ArcaneButton
+								action="confirm"
+								type="submit"
+								class="w-full"
+								disabled={isSubmittingNewAgent}
+								loading={isSubmittingNewAgent}
+								customLabel={m.common_create()}
 							/>
 						</form>
 					</Tabs.Content>
