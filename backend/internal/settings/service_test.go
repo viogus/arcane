@@ -28,7 +28,7 @@ func setupSettingsTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&SettingVariable{}))
+	require.NoError(t, db.AutoMigrate(&SettingVariable{}, &EnvironmentSetting{}))
 	return &database.DB{DB: db}
 }
 
@@ -777,7 +777,7 @@ func BenchmarkSettingsService_GetSettings(b *testing.B) {
 	if err != nil {
 		require.FailNowf(b, "benchmark database setup failed", "%v", err)
 	}
-	if autoMigrateErr := db.AutoMigrate(&SettingVariable{}); autoMigrateErr != nil {
+	if autoMigrateErr := db.AutoMigrate(&SettingVariable{}, &EnvironmentSetting{}); autoMigrateErr != nil {
 		require.FailNowf(b, "benchmark database migration failed", "%v", autoMigrateErr)
 	}
 	settingsDB := &database.DB{DB: db}

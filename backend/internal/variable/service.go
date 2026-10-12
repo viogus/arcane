@@ -50,6 +50,9 @@ const (
 // and materializes each environment's effective set into that environment's
 // .env.global file: locally via template.TemplateService, remotely via the existing
 // agent variables endpoint.
+//
+// Remote pushes only target agent-backed environments: a docker-host environment is served
+// in-process by the manager and has no agent on the other side to accept the request.
 type VariableService struct {
 	db                            *database.DB
 	proxyEnvironmentJSON          func(context.Context, string, string, string, []byte, any) error
@@ -370,8 +373,9 @@ func (s *VariableService) syncTargetsInternal(ctx context.Context) []environment
 		slog.ErrorContext(ctx, "Failed to list environments for global variable sync", "error", err)
 		remotes = nil
 	}
+	// Docker-host environments are served in-process by the manager and have no agent to receive the push.
 	return append([]environment.Environment{{ID: environment.LocalEnvironmentID}}, slices.DeleteFunc(remotes, func(remote environment.Environment) bool {
-		return strings.TrimSpace(kit.FromPtr(remote.AccessToken)) == ""
+		return remote.IsDockerHost() || strings.TrimSpace(kit.FromPtr(remote.AccessToken)) == ""
 	})...)
 }
 

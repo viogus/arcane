@@ -21,7 +21,7 @@
 		} else if (environmentStore.selected.isEdge) {
 			return 'Edge connection';
 		} else {
-			return environmentStore.selected.apiUrl;
+			return environmentStore.selected.dockerHost || environmentStore.selected.apiUrl;
 		}
 	}
 </script>

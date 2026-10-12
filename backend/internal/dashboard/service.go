@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -20,7 +22,6 @@ import (
 	"github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/client"
 	"go.getarcane.app/docker"
-	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/cgroup"
 	"go.getarcane.app/updater/labels"
 	"go.opentelemetry.io/otel/attribute"
@@ -40,6 +41,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/version"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/vulnerability"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
@@ -67,10 +69,63 @@ type DashboardService struct {
 	volumeService        *volume.VolumeService
 	podmanService        *podman.Service
 
-	// Shared, immutable snapshot builds indexed by [includeTables][debugAllGood][iconCatalog];
-	// full snapshots resolve icons per catalog, so each catalog gets its own entry.
+	// Shared, immutable snapshot builds indexed by environment and [includeTables][debugAllGood][iconCatalog];
+	// full snapshots resolve icons per catalog, so each catalog gets its own entry. Docker-host
+	// environments are served in-process, so their snapshots must not be shared with the local one.
 	snapshotFlight singleflight.Group
-	snapshotCache  [2][2][2]atomic.Pointer[dashboardSnapshotCacheEntry]
+	snapshotMu     sync.Mutex
+	snapshotCache  map[string]*atomic.Pointer[dashboardSnapshotCacheEntry]
+}
+
+// dockerEnvironmentIDInternal returns the environment the current request is served for. Requests
+// reach handler code for docker-host environments in-process, carrying their id through the context.
+func dockerEnvironmentIDInternal(ctx context.Context) string {
+	if target, ok := envcontext.TargetFromContext(ctx); ok && target.EnvironmentID != "" {
+		return target.EnvironmentID
+	}
+	return environment.LocalEnvironmentID
+}
+
+// snapshotSlotInternal returns the cache slot for one environment and snapshot shape, creating it on demand.
+func (s *DashboardService) snapshotSlotInternal(envID string, tables, debug, icons bool) *atomic.Pointer[dashboardSnapshotCacheEntry] {
+	key := strings.Join([]string{
+		envID,
+		strconv.FormatBool(tables),
+		strconv.FormatBool(debug),
+		strconv.FormatBool(icons),
+	}, ":")
+	s.snapshotMu.Lock()
+	defer s.snapshotMu.Unlock()
+	if s.snapshotCache == nil {
+		s.snapshotCache = make(map[string]*atomic.Pointer[dashboardSnapshotCacheEntry])
+	}
+	slot, ok := s.snapshotCache[key]
+	if !ok {
+		// Slots are never removed explicitly, so environments that were deleted (or that simply
+		// stopped being served) would otherwise pin their last snapshot for the process lifetime.
+		// A new slot is rare, and every entry dropped here is past its TTL and would be rebuilt.
+		pruneExpiredSnapshotSlotsInternal(s.snapshotCache)
+		slot = &atomic.Pointer[dashboardSnapshotCacheEntry]{}
+		s.snapshotCache[key] = slot
+	}
+	return slot
+}
+
+// pruneExpiredSnapshotSlotsInternal drops cached snapshots that are past their TTL. The caller
+// holds snapshotMu.
+func pruneExpiredSnapshotSlotsInternal(cache map[string]*atomic.Pointer[dashboardSnapshotCacheEntry]) {
+	for key, slot := range cache {
+		entry := slot.Load()
+		// A nil entry means the snapshot is still being built, since the builder runs outside
+		// snapshotMu. Deleting that slot would orphan the build's result, and an empty slot holds
+		// nothing worth reclaiming.
+		if entry == nil {
+			continue
+		}
+		if time.Since(entry.builtAt) >= dashboardSnapshotCacheTTL {
+			delete(cache, key)
+		}
+	}
 }
 
 type dashboardSnapshotCacheEntry struct {
@@ -119,15 +174,18 @@ func (s *DashboardService) GetSnapshot(ctx context.Context, options DashboardAct
 		catalog = iconcatalog.Normalize(project.IconCatalogForContext(ctx))
 	}
 
-	tables := kit.Ternary(includeTables, 1, 0)
-	debug := kit.Ternary(options.DebugAllGood, 1, 0)
-	icons := kit.Ternary(catalog == iconcatalog.CatalogDashboardIcons, 1, 0)
-	slot := &s.snapshotCache[tables][debug][icons]
+	envID := dockerEnvironmentIDInternal(ctx)
+	slot := s.snapshotSlotInternal(
+		envID,
+		includeTables,
+		options.DebugAllGood,
+		catalog == iconcatalog.CatalogDashboardIcons,
+	)
 	if entry := slot.Load(); entry != nil && time.Since(entry.builtAt) < dashboardSnapshotCacheTTL {
 		return entry.snapshot, nil
 	}
 
-	key := strconv.FormatBool(includeTables) + ":" + strconv.FormatBool(options.DebugAllGood) + ":" + catalog
+	key := envID + ":" + strconv.FormatBool(includeTables) + ":" + strconv.FormatBool(options.DebugAllGood) + ":" + catalog
 	result, err, _ := s.snapshotFlight.Do(key, func() (any, error) {
 		// Re-check so a caller queued behind the winner reuses its fresh entry.
 		if entry := slot.Load(); entry != nil && time.Since(entry.builtAt) < dashboardSnapshotCacheTTL {
@@ -159,7 +217,7 @@ func (s *DashboardService) buildSnapshot(ctx context.Context, options DashboardA
 		return nil, errors.New("docker service not available")
 	}
 
-	dockerSnapshot, err := s.dockerService.GetSnapshot(ctx, environment.LocalEnvironmentID)
+	dockerSnapshot, err := s.dockerService.GetSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -240,8 +298,20 @@ func (s *DashboardService) buildSnapshot(ctx context.Context, options DashboardA
 		return nil, err
 	}
 
-	var versionInfo *versiontypes.Info
-	if s.versionService != nil {
+	var (
+		versionInfo   *versiontypes.Info
+		dockerVersion string
+	)
+	if envcontext.IsDockerHostTarget(ctx) {
+		// A docker-host environment runs no Arcane agent, so there is no application version
+		// to report for it: the card shows the daemon version the manager talks to instead.
+		version, versionErr := s.dockerService.GetServerVersion(ctx)
+		if versionErr != nil {
+			slog.DebugContext(ctx, "Failed to read Docker version for dashboard snapshot", "error", versionErr)
+		} else {
+			dockerVersion = version
+		}
+	} else if s.versionService != nil {
 		versionInfo = s.versionService.GetAppVersionInfo(ctx)
 	}
 
@@ -263,6 +333,7 @@ func (s *DashboardService) buildSnapshot(ctx context.Context, options DashboardA
 		Settings:          dashboard.SnapshotSettings{},
 		VersionInfo:       versionInfo,
 		PodCount:          s.podmanService.PodCount(ctx).ToPointer(),
+		DockerVersion:     dockerVersion,
 	}, nil
 }
 
@@ -414,7 +485,7 @@ func (s *DashboardService) ObserveInventory(meter metric.Meter) error {
 	_, err := meter.RegisterCallback(func(ctx context.Context, o metric.Observer) error {
 		ctx, cancel := context.WithTimeout(ctx, dashboardInventoryCollectTimeout)
 		defer cancel()
-		snapshot, err := s.dockerService.GetSnapshot(ctx, environment.LocalEnvironmentID)
+		snapshot, err := s.dockerService.GetSnapshot(ctx)
 		if err != nil {
 			slog.DebugContext(ctx, "Skipping Docker inventory metrics", "error", err)
 			return nil

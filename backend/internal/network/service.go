@@ -222,7 +222,7 @@ func (s *NetworkService) buildTopology(ctx context.Context) (*networktypes.Topol
 }
 
 func (s *NetworkService) CreateNetwork(ctx context.Context, name string, options client.NetworkCreateOptions, user usertypes.Actor) (*network.CreateResponse, error) {
-	defer s.eventService.BeginDockerResourceSuppressionWindow("network", "", name)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "network", "", name)()
 	response, err := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.NetworkCreateResult, error) {
 		return dockerClient.NetworkCreate(ctx, name, options)
 	})
@@ -252,7 +252,7 @@ func (s *NetworkService) RemoveNetwork(ctx context.Context, id string, user user
 	})
 	networkName := kit.Ternary(err == nil, networkInfo.Network.Name, id)
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("network", id, networkName)()
+	defer s.eventService.BeginDockerResourceSuppressionWindow(ctx, "network", id, networkName)()
 	if _, networkRemoveErr := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.NetworkRemoveResult, error) {
 		return dockerClient.NetworkRemove(ctx, id, client.NetworkRemoveOptions{})
 	}); networkRemoveErr != nil {

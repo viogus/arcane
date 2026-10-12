@@ -10,6 +10,7 @@ import (
 
 	st "github.com/getarcaneapp/arcane/types/v2/scheduler"
 
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 	scheduleutil "github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/schedule"
 )
@@ -114,10 +115,22 @@ func (js *jobSchedulerInternal) GetJob(id string) (st.Job, bool) {
 }
 func (js *jobSchedulerInternal) HasJob(id string) bool { _, ok := js.GetJob(id); return ok }
 func (js *jobSchedulerInternal) GetJobRuntimeState(id string) (st.JobRuntimeState, bool) {
-	if !js.HasJob(id) {
+	return js.getJobRuntimeStateInternal(js.context, "0", id)
+}
+
+// GetJobRuntimeStateFor reports the schedule installed for one environment's namespace.
+func (js *jobSchedulerInternal) GetJobRuntimeStateFor(ctx context.Context, environmentID, jobID string) (st.JobRuntimeState, bool) {
+	return js.getJobRuntimeStateInternal(ctx, environmentID, jobID)
+}
+
+func (js *jobSchedulerInternal) getJobRuntimeStateInternal(ctx context.Context, environmentID, jobID string) (st.JobRuntimeState, bool) {
+	if !js.HasJob(jobID) {
 		return st.JobRuntimeState{}, false
 	}
-	record, err := js.coordinator.ScheduleState(js.context, id)
+	if js.coordinator == nil {
+		return st.JobRuntimeState{}, false
+	}
+	record, err := js.coordinator.ScheduleStateFor(ctx, environmentID, jobID)
 	if err != nil {
 		return st.JobRuntimeState{}, true
 	}
@@ -144,8 +157,10 @@ func (js *jobSchedulerInternal) StartScheduler(ctx context.Context) error {
 		js.mu.RLock()
 		_, watching := js.watchers[record.JobID]
 		js.mu.RUnlock()
-		if record.EnvironmentID == "0" && record.Schedule != "" && !js.HasJob(record.JobID) && !watching {
-			if removeErr := js.coordinator.Remove(ctx, record.JobID); removeErr != nil {
+		if record.Schedule != "" && !js.HasJob(record.JobID) && !watching {
+			// Remove the stale record from the namespace it was checkpointed in, not the manager's.
+			removeCtx := envcontext.WithTarget(ctx, envcontext.Target{EnvironmentID: record.EnvironmentID})
+			if removeErr := js.coordinator.Remove(removeCtx, record.JobID); removeErr != nil {
 				return removeErr
 			}
 		}
@@ -160,11 +175,17 @@ func (js *jobSchedulerInternal) StartScheduler(ctx context.Context) error {
 }
 
 func (js *jobSchedulerInternal) installInternal(ctx context.Context, job st.Job) error {
+	environmentID := js.environmentForJobInternal(ctx, job)
+	// Keep any daemon endpoint already carried by ctx so schedule evaluation still sees the
+	// environment's own settings without losing the target a docker-host request arrived with.
+	target, _ := envcontext.TargetFromContext(ctx)
+	target.EnvironmentID = environmentID
+	evalCtx := envcontext.WithTarget(ctx, target)
 	next := time.Time{}
-	schedule := job.Schedule(ctx)
+	schedule := job.Schedule(evalCtx)
 	should := true
 	if conditional, ok := job.(st.ConditionalJob); ok {
-		should = conditional.ShouldSchedule(ctx)
+		should = conditional.ShouldSchedule(evalCtx)
 	}
 	if should {
 		parsed, err := cronScheduleParser.Parse(schedule)
@@ -176,7 +197,21 @@ func (js *jobSchedulerInternal) installInternal(ctx context.Context, job st.Job)
 	if !should {
 		schedule = ""
 	}
-	return js.coordinator.Checkpoint(ctx, job.Name(), schedule, next)
+	return js.coordinator.CheckpointFor(evalCtx, environmentID, job.Name(), schedule, next)
+}
+
+// environmentForJobInternal names the scheduling namespace a job's schedule belongs to: the job's
+// own scope when it declares one, otherwise the environment carried by ctx, otherwise the manager.
+func (js *jobSchedulerInternal) environmentForJobInternal(ctx context.Context, job st.Job) string {
+	if scoped, ok := job.(st.EnvironmentScopedJob); ok {
+		if environmentID := scoped.EnvironmentID(); environmentID != "" {
+			return environmentID
+		}
+	}
+	if environmentID := envcontext.EnvironmentIDFromContext(ctx); environmentID != "" {
+		return environmentID
+	}
+	return "0"
 }
 
 func (js *jobSchedulerInternal) AddJob(ctx context.Context, job st.Job) error {
@@ -196,13 +231,38 @@ func (js *jobSchedulerInternal) RescheduleJob(ctx context.Context, job st.Job) e
 	return js.AddJob(ctx, job)
 }
 
+// ClearJobScheduleFor unschedules one environment's record for a job while leaving the job
+// registered for every other environment, as when a docker-host environment is disabled or deleted.
+func (js *jobSchedulerInternal) ClearJobScheduleFor(ctx context.Context, environmentID, jobID string) error {
+	if environmentID == "" {
+		environmentID = "0"
+	}
+	js.mu.RLock()
+	_, registered := js.jobsByID[jobID]
+	// Bus watchers (image-polling) hold no registry entry yet still checkpoint one schedule per
+	// environment, so forgetting an environment must clear those records too.
+	_, watched := js.allWatchers[jobID]
+	started := js.started
+	js.mu.RUnlock()
+	if (!registered && !watched) || !started {
+		return nil
+	}
+	return js.coordinator.CheckpointFor(ctx, environmentID, jobID, "", time.Time{})
+}
+
 func (js *jobSchedulerInternal) RemoveJob(ctx context.Context, id string) {
 	js.mu.Lock()
+	job := js.jobsByID[id]
 	delete(js.jobsByID, id)
 	started := js.started
 	js.mu.Unlock()
 	if started {
-		if err := js.coordinator.Remove(ctx, id); err != nil {
+		environmentID := "0"
+		if job != nil {
+			environmentID = js.environmentForJobInternal(ctx, job)
+		}
+		removeCtx := envcontext.WithTarget(ctx, envcontext.Target{EnvironmentID: environmentID})
+		if err := js.coordinator.Remove(removeCtx, id); err != nil {
 			slog.ErrorContext(ctx, "Unschedule failed", "job", id, "error", err)
 		}
 	}

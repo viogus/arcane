@@ -38,7 +38,7 @@
 		if (environmentStore.selected.id === '0') {
 			return settingsStore.current?.dockerHost || 'unix:///var/run/docker.sock';
 		} else {
-			return environmentStore.selected.apiUrl;
+			return environmentStore.selected.dockerHost || environmentStore.selected.apiUrl;
 		}
 	}
 </script>

@@ -28,6 +28,7 @@
 	import {
 		type CompactTablePrefs,
 		type FieldSpec,
+		type FilterOption,
 		type GroupedData,
 		type GroupSelectionState,
 		type SelectionModifiers,
@@ -84,6 +85,7 @@
 		groupCollapsedState = $bindable<Record<string, boolean>>({}),
 		onGroupToggle,
 		imageNameFilterOptions,
+		environmentFilterOptions = [],
 		// Expandable row props
 		expandedRowContent,
 		emptyState
@@ -134,6 +136,8 @@
 		groupCollapsedState?: Record<string, boolean>;
 		onGroupToggle?: (groupName: string) => void;
 		imageNameFilterOptions?: string[];
+		/** Options for the `environmentId` column filter (per-environment attribution). */
+		environmentFilterOptions?: FilterOption[];
 		// Expandable row props
 		expandedRowContent?: Snippet<[{ row: ArcaneRow<TData>; item: TData }]>;
 		/** First-use empty state, shown when the collection is empty and no search or filter is active. */
@@ -833,6 +837,7 @@
 					{customViewOptions}
 					{customToolbarActions}
 					{imageNameFilterOptions}
+					{environmentFilterOptions}
 					{wrapText}
 					onToggleWrapText={toggleWrapText}
 					{isFiltered}

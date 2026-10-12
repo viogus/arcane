@@ -8,6 +8,7 @@ import (
 
 	schedulertypes "github.com/getarcaneapp/arcane/types/v2/scheduler"
 
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 )
 
@@ -82,6 +83,13 @@ func (r *Registry) Register(ctx context.Context, entityID string, schedule func(
 func (r *Registry) Add(ctx context.Context, job schedulertypes.Job) {
 	if r.scheduler == nil {
 		return
+	}
+	// Record the environment whose schedule namespace owns the job before the lifecycle context
+	// replaces ctx, because the scheduler installs the job's schedule in that environment.
+	if environmentID := envcontext.EnvironmentIDFromContext(ctx); environmentID != "" {
+		if setter, ok := job.(schedulertypes.EnvironmentScopeSetter); ok {
+			setter.SetEnvironmentScope(environmentID)
+		}
 	}
 	schedulerCtx := r.Context(ctx)
 	if err := r.scheduler.AddJob(schedulerCtx, job); err != nil {

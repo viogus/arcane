@@ -194,6 +194,7 @@ func newImageUpdateWatcherForTest(t *testing.T,
 		projectService:     backfiller,
 		trigger:            make(chan struct{}, 1),
 		scheduleRefresh:    make(chan struct{}, 1),
+		environmentTrigger: make(chan struct{}, 1),
 		location:           time.UTC,
 		debounce:           10 * time.Millisecond,
 		backfillRetry:      10 * time.Millisecond,
@@ -384,7 +385,7 @@ func TestImageUpdateWatcher_RunNowReturnsContainedScanPanicInternal(t *testing.T
 	// Wait for durable startup admission and the startup scan itself to finish,
 	// not just for the scanner to start; RunNow rejects a scan still running.
 	require.Eventually(t, func() bool {
-		return scanner.countInternal() == 1 && watcher.triggerGeneration.Load() == watcher.acknowledgedGeneration.Load() && !watcher.scanRunning.Load()
+		return scanner.countInternal() == 1 && watcher.triggerGeneration.Load() == watcher.acknowledgedGeneration.Load() && !watcher.scanRunningInternal("0")
 	}, time.Second, time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -638,4 +639,75 @@ func TestImageUpdateWatcher_RunNowWaitsForMetadataReadiness(t *testing.T) {
 	defer cancel()
 	require.ErrorIs(t, watcher.RunNow(ctx), context.DeadlineExceeded)
 	require.Zero(t, scanner.countInternal())
+}
+
+// refreshBlockingSettingsFakeInternal blocks the first pollingInterval read so a test can issue a
+// refresh request while a refresh is already in flight.
+type refreshBlockingSettingsFakeInternal struct {
+	mu        sync.Mutex
+	calls     int
+	firstCall chan struct{}
+	release   chan struct{}
+	once      sync.Once
+}
+
+func (s *refreshBlockingSettingsFakeInternal) GetBoolSetting(_ context.Context, _ string, fallback bool) bool {
+	return fallback
+}
+
+func (s *refreshBlockingSettingsFakeInternal) GetStringSetting(ctx context.Context, _, defaultValue string) string {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 && s.firstCall != nil {
+		s.once.Do(func() { close(s.firstCall) })
+		select {
+		case <-s.release:
+		case <-ctx.Done():
+		}
+	}
+	return defaultValue
+}
+
+func (s *refreshBlockingSettingsFakeInternal) countInternal() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// TestImageUpdateWatcher_RefreshScheduleRequestIsNeverDropped pins the refresh contract: the wake-up
+// channel carries one token, so coalesced requests must stay pending in the flag the event loop
+// drains, and a request made while a refresh is in flight must produce another refresh pass.
+func TestImageUpdateWatcher_RefreshScheduleRequestIsNeverDropped(t *testing.T) {
+	watcher := newImageUpdateWatcherForTest(t, &imageUpdateScannerFakeInternal{}, &pollingSettingReaderFakeInternal{enabled: true}, bus.NewDockerEventBus(), nil)
+
+	watcher.RefreshSchedule()
+	watcher.RefreshSchedule()
+	require.Len(t, watcher.scheduleRefresh, 1, "wake-ups are coalesced into a single token")
+	require.True(t, watcher.refreshPending.Load(), "a coalesced refresh request must stay pending")
+
+	// Draining the flag consumes the coalesced request: the event loop runs one pass per drained token,
+	// so a single drain must leave nothing pending.
+	require.True(t, watcher.refreshPending.Swap(false), "a coalesced refresh request must produce one refresh pass")
+	require.False(t, watcher.refreshPending.Load())
+
+	// A request made after a completed refresh must be observed again instead of being swallowed by the
+	// refresh that just finished.
+	watcher.RefreshSchedule()
+	require.True(t, watcher.refreshPending.Swap(false), "a request made after a completed refresh must run a new refresh")
+	require.False(t, watcher.refreshPending.Load())
+}
+
+func TestImageUpdateWatcher_RefreshDuringInFlightRefreshRunsAgain(t *testing.T) {
+	settings := &refreshBlockingSettingsFakeInternal{firstCall: make(chan struct{}), release: make(chan struct{})}
+	watcher := newImageUpdateWatcherForTest(t, &imageUpdateScannerFakeInternal{}, settings, bus.NewDockerEventBus(), nil)
+	startImageUpdateWatcherForTestInternal(t, watcher)
+
+	<-settings.firstCall
+	watcher.RefreshSchedule()
+	close(settings.release)
+
+	require.Eventually(t, func() bool { return settings.countInternal() >= 2 }, time.Second, 5*time.Millisecond)
+	require.False(t, watcher.refreshPending.Load(), "the drain loop must clear the pending request")
 }

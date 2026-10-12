@@ -41,9 +41,16 @@ export function buildOverviewSummary(items: DashboardEnvironmentOverview[]): Das
 }
 
 export function getRoleBadge(environment: Environment): { text: string; variant: 'primary' | 'gray' } {
-	return environment.id === LOCAL_DOCKER_ENVIRONMENT_ID
-		? { text: m.manager(), variant: 'primary' }
-		: { text: m.agent(), variant: 'gray' };
+	if (environment.id === LOCAL_DOCKER_ENVIRONMENT_ID) {
+		return { text: m.manager(), variant: 'primary' };
+	}
+
+	// A docker-host environment is spoken to directly over the Docker API; no Arcane agent runs there.
+	if (environment.dockerHost) {
+		return { text: m.docker_title(), variant: 'gray' };
+	}
+
+	return { text: m.agent(), variant: 'gray' };
 }
 
 export function getResolvedStatusLabel(environment: Environment): string {
@@ -108,6 +115,44 @@ export function getCpuMetricLabel(stats: SystemStats | null): string {
 export function getCapacityLabel(used: number | undefined, total: number | undefined): string {
 	if (used === undefined || total === undefined || total <= 0) return '--';
 	return `${bytes.format(used, { unitSeparator: ' ' }) ?? '-'} / ${bytes.format(total, { unitSeparator: ' ' }) ?? '-'}`;
+}
+
+export interface CapacityMetric {
+	value: string;
+	label: string;
+	meterValue: number | null;
+}
+
+// A docker-host environment is read straight through the remote Docker API, which reports the
+// containers' memory usage and the host's memory capacity but no host disk capacity. The tiles
+// therefore show what the API can actually answer instead of a full-host agent reading.
+export function getMemoryMetricDisplay(stats: SystemStats | null, isDockerHostEnvironment: boolean): CapacityMetric {
+	const metric = getMemoryMetric(stats);
+	const capacity = getCapacityLabel(stats?.memoryUsage, stats?.memoryTotal);
+
+	return {
+		value: formatPercent(metric),
+		label: isDockerHostEnvironment && capacity !== '--' ? `${m.dashboard_meter_containers()} · ${capacity}` : capacity,
+		meterValue: metric
+	};
+}
+
+export function getDiskMetricDisplay(stats: SystemStats | null, isDockerHostEnvironment: boolean): CapacityMetric {
+	if (isDockerHostEnvironment) {
+		return {
+			value: stats?.diskUsage ? (bytes.format(stats.diskUsage, { unitSeparator: ' ' }) ?? '--') : '--',
+			label: m.dashboard_meter_docker_data(),
+			meterValue: null
+		};
+	}
+
+	const metric = getDiskMetric(stats);
+
+	return {
+		value: formatPercent(metric),
+		label: getCapacityLabel(stats?.diskUsage, stats?.diskTotal),
+		meterValue: metric
+	};
 }
 
 export function getGpuMetric(stats: SystemStats | null): number | null {

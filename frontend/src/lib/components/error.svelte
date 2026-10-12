@@ -59,7 +59,7 @@
 		} else {
 			return m.error_connection_remote_environment_desc({
 				name: environmentStore.selected?.name || 'Unknown',
-				url: environmentStore.selected?.apiUrl || 'Unknown URL'
+				url: environmentStore.selected?.dockerHost || environmentStore.selected?.apiUrl || 'Unknown URL'
 			});
 		}
 	});

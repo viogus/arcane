@@ -41,6 +41,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume/children/backup/children/restore"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/volumehelper"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow"
@@ -61,6 +62,9 @@ type Store struct {
 	Latest            func(ctx context.Context, policyID string) (*volume.Backup, error)
 	List              func(ctx context.Context, volumeName string, params pagination.QueryParams) ([]volume.Backup, int64, error)
 	RemoteSnapshotIDs func(ctx context.Context, destinationID string) ([]string, error)
+	// FailRunningByID closes a running row by id alone. Only the startup reconciler uses it: a
+	// workflow resumed from disk does not record which environment it ran in.
+	FailRunningByID func(ctx context.Context, backupID, message string) error
 }
 
 // Dependencies are the persistence, runtime, and helper-container operations volume backups use.
@@ -239,8 +243,13 @@ func (s *Service) RemovePolicies(ctx context.Context, volumeName string) {
 }
 
 // RenamePolicies moves a renamed volume's backup policies inside the caller's transaction.
-func (s *Service) RenamePolicies(tx *gorm.DB, oldName, newName string) error {
-	return s.policies.Rename(tx, oldName, newName)
+func (s *Service) RenamePolicies(ctx context.Context, tx *gorm.DB, oldName, newName string) error {
+	return s.policies.Rename(ctx, tx, oldName, newName)
+}
+
+// PurgeEnvironment drops every backup policy a deleted environment owned.
+func (s *Service) PurgeEnvironment(ctx context.Context, environmentID string) error {
+	return s.policies.PurgeEnvironment(ctx, environmentID)
 }
 
 // backupEntry converts a backup row to its API entry for policy last runs and accepted manual starts.
@@ -954,7 +963,7 @@ func (s *Service) StartBackup(ctx context.Context, environmentID, volumeName str
 	if err != nil {
 		return volume.BackupEntry{}, err
 	}
-	release := s.deps.Engine.Hold(backup.VolumeAdmissionScope, volumeName, entry.ID, lease)
+	release := s.deps.Engine.Hold(backup.VolumeAdmissionScope, volumeAdmissionIDInternal(environmentID, volumeName), entry.ID, lease)
 	input := manualBackupInput{Checkpoint: plan, VolumeName: volumeName, Requester: requester}
 	activityID, err := s.flow.Submit(ctx, s.backupWorkflow, input, activitylib.StartRequest{
 		EnvironmentID: environmentID, ResourceType: new("volume"), ResourceID: new(volumeName), ResourceName: new(volumeName), StartedBy: &user,
@@ -996,10 +1005,10 @@ func (s *Service) watchBackup(ctx context.Context, backupID, instanceID string) 
 	if err != nil || outcome.Status == scheduler.Succeeded {
 		return
 	}
-	if current, loadErr := s.deps.Store.Run(ctx, backupID); loadErr == nil && current.Status == backuptypes.VolumeBackupStatusRunning {
-		if failErr := s.deps.Store.Fail(ctx, backupID, cmp.Or(outcome.Message, "Backup did not run")); failErr != nil {
-			slog.WarnContext(ctx, "Failed to close a volume backup whose workflow ended early", "backupId", backupID, "error", failErr)
-		}
+	// The workflow is resumed from disk without the environment it ran in, so close the row through
+	// the status-guarded reconciler update instead of the environment-scoped store.
+	if failErr := s.deps.Store.FailRunningByID(ctx, backupID, cmp.Or(outcome.Message, "Backup did not run")); failErr != nil {
+		slog.WarnContext(ctx, "Failed to close a volume backup whose workflow ended early", "backupId", backupID, "error", failErr)
 	}
 }
 
@@ -1040,7 +1049,7 @@ func (s *Service) ReconcileBackup(ctx context.Context, previous scheduler.Run, v
 			}
 			return outcome, backup.ErrBackupSettled
 		}
-		lease, admitted, acquireErr := s.deps.Engine.AcquireRun(ctx, backup.VolumeAdmissionScope, volumeName, "")
+		lease, admitted, acquireErr := s.deps.Engine.AcquireRun(ctx, backup.VolumeAdmissionScope, volumeAdmissionIDInternal(envcontext.EnvironmentIDOrDefault(ctx), volumeName), "")
 		if acquireErr != nil {
 			return outcome, acquireErr
 		}
@@ -1136,7 +1145,7 @@ func (s *Service) runManualBackup(ctx context.Context, t flow.Task) (_ any, err 
 		return target.ID == input.VolumeName && len(target.RecoveryData) > 0
 	})
 	if !resuming {
-		lease, admitted, acquireErr := s.deps.Engine.AcquireRun(ctx, backup.VolumeAdmissionScope, input.VolumeName, input.Checkpoint.BackupID)
+		lease, admitted, acquireErr := s.deps.Engine.AcquireRun(ctx, backup.VolumeAdmissionScope, volumeAdmissionIDInternal(envcontext.EnvironmentIDOrDefault(ctx), input.VolumeName), input.Checkpoint.BackupID)
 		if acquireErr != nil {
 			return nil, acquireErr
 		}

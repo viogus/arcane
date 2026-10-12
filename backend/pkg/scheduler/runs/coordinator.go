@@ -21,6 +21,7 @@ import (
 	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/kv"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/jobcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis"
@@ -157,14 +158,23 @@ func separateTrigger(trigger string) bool {
 	}
 }
 
-// Checkpoint records the next due occurrence atomically with overdue recovery.
+// Checkpoint records the next due occurrence atomically with overdue recovery. The checkpoint lands
+// in the namespace of the environment carried by ctx, so schedules installed while serving a
+// docker-host environment stay separate from the manager's own schedules.
 func (q *Coordinator) Checkpoint(ctx context.Context, jobID, schedule string, next time.Time) error {
+	return q.CheckpointFor(ctx, environmentForCheckpointInternal(ctx), jobID, schedule, next)
+}
+
+// CheckpointFor records the next due occurrence in one environment's namespace.
+func (q *Coordinator) CheckpointFor(ctx context.Context, environmentID, jobID, schedule string, next time.Time) error {
+	environmentID = cmp.Or(environmentID, "0")
 	q.mu.Lock()
-	first := !q.checkpointed[jobID]
+	checkpointKey := environmentID + "\x00" + jobID
+	first := !q.checkpointed[checkpointKey]
 	q.mu.Unlock()
 	recovered := false
 	var recoveredRun st.Run
-	err := q.mutate(ctx, "0", jobID, func(record *st.QueueRecord) error {
+	err := q.mutate(ctx, environmentID, jobID, func(record *st.QueueRecord) error {
 		recovered = false
 		recoveredRun = st.Run{}
 		now := time.Now().UTC()
@@ -175,7 +185,7 @@ func (q *Coordinator) Checkpoint(ctx context.Context, jobID, schedule string, ne
 				recoveredRun = st.Run{
 					ID:            uuid.New().String(),
 					JobID:         jobID,
-					EnvironmentID: "0",
+					EnvironmentID: environmentID,
 					Trigger:       "recovery",
 					Status:        st.Queued,
 					CreatedAt:     now,
@@ -194,7 +204,7 @@ func (q *Coordinator) Checkpoint(ctx context.Context, jobID, schedule string, ne
 	})
 	if err == nil {
 		q.mu.Lock()
-		q.checkpointed[jobID] = true
+		q.checkpointed[checkpointKey] = true
 		q.mu.Unlock()
 		if recovered {
 			q.observeRun(ctx, recoveredRun)
@@ -205,14 +215,26 @@ func (q *Coordinator) Checkpoint(ctx context.Context, jobID, schedule string, ne
 }
 
 func (q *Coordinator) Remove(ctx context.Context, jobID string) error {
-	if err := q.Checkpoint(ctx, jobID, "", time.Time{}); err != nil {
+	environmentID := environmentForCheckpointInternal(ctx)
+	if err := q.CheckpointFor(ctx, environmentID, jobID, "", time.Time{}); err != nil {
 		return err
 	}
+	checkpointKey := environmentID + "\x00" + jobID
 	q.mu.Lock()
-	delete(q.checkpointed, jobID)
+	delete(q.checkpointed, checkpointKey)
 	q.mu.Unlock()
-	_, err := q.service.Invoke(ctx, coordinatorType, kit.SHA256Hex("0\x00"+jobID), "remove", nil)
+	_, err := q.service.Invoke(ctx, coordinatorType, kit.SHA256Hex(checkpointKey), "remove", nil)
 	return err
+}
+
+// environmentForCheckpointInternal names the scheduling namespace a checkpoint belongs to. Work
+// served for an environment carries that environment's target in context; everything else (the
+// manager's own jobs, background actors and lifecycle work) uses the manager's namespace.
+func environmentForCheckpointInternal(ctx context.Context) string {
+	if environmentID := envcontext.EnvironmentIDFromContext(ctx); environmentID != "" {
+		return environmentID
+	}
+	return "0"
 }
 
 // Start validates persisted state on ctx and starts dispatching on appCtx. Repeated calls
@@ -358,6 +380,29 @@ func (q *Coordinator) pass(ctx context.Context, all, retain bool) (busy, pending
 	return busy, pendingActivity, pruned, err
 }
 
+const (
+	// retryBackoffBaseInternal is the first delay before re-running a failed attempt; it doubles per
+	// attempt up to the cap.
+	retryBackoffBaseInternal = 5 * time.Second
+	retryBackoffCapInternal  = 5 * time.Minute
+	// waitingRetryDelayInternal is the delay before re-running an attempt that only could not reach
+	// its daemon yet. It is deliberately not exponential: an environment that comes back seconds
+	// after a run went to Waiting should be served then, not when the backoff cap (or the next
+	// schedule occurrence) says so.
+	waitingRetryDelayInternal = 10 * time.Second
+)
+
+// retryDelayInternal spaces out the next attempt of a non-terminal run. A Retrying run exhausted its
+// attempt against a reachable daemon, so it backs off; a Waiting run has done no work yet, so it is
+// polled on a short fixed cadence.
+func retryDelayInternal(status st.RunStatus, attemptCount int) time.Duration {
+	if status == st.Waiting {
+		return waitingRetryDelayInternal
+	}
+	delay := retryBackoffBaseInternal * time.Duration(1<<min(max(attemptCount-1, 0), 6))
+	return min(delay, retryBackoffCapInternal)
+}
+
 func (q *Coordinator) persistOutcome(ctx context.Context, run st.Run, outcome st.Outcome) error {
 	// Keep the execution slot while retrying, but release it after a bounded backoff.
 	wait := time.Second
@@ -386,8 +431,7 @@ func (q *Coordinator) persistOutcome(ctx context.Context, run st.Run, outcome st
 			current.UpdatedAt = now
 			current.Outcome = merged
 			if outcome.Status == st.Retrying || outcome.Status == st.Waiting {
-				delay := 5 * time.Second * time.Duration(1<<min(run.AttemptCount-1, 6))
-				delay = min(delay, 5*time.Minute)
+				delay := retryDelayInternal(outcome.Status, run.AttemptCount)
 				var jitter [1]byte
 				if _, jitterErr := io.ReadFull(rand.Reader, jitter[:]); jitterErr != nil {
 					// Keep the unjittered backoff when randomness is unavailable.
