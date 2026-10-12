@@ -21,7 +21,7 @@ type dockerHostEventProviderInternal interface {
 
 // dockerHostEventReconcileInterval bounds how long a newly enabled docker-host environment waits for
 // its daemon events to be recorded.
-const dockerHostEventReconcileInterval = 15 * time.Second
+const dockerHostEventReconcileInterval = 30 * time.Second
 
 type dockerHostEventSubscriptionInternal struct {
 	cancel      context.CancelFunc
