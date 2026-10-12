@@ -4,10 +4,19 @@ import "time"
 
 // Create trims and NFC-normalizes tagged display fields.
 type Create struct {
-	// ApiUrl is the URL of the environment API.
+	// ApiUrl is the URL of the environment API. Required for agent-backed
+	// environments; omit it when DockerHost is set.
 	//
-	// Required: true
-	ApiUrl string `json:"apiUrl" binding:"required,url"`
+	// Required: false
+	ApiUrl string `json:"apiUrl,omitempty" binding:"omitempty,url"`
+
+	// DockerHost is the Docker API endpoint, for example
+	// tcp://10.0.0.5:2375 or unix:///var/run/docker.sock. Setting it creates a
+	// "docker-host" environment that the manager talks to directly, without an
+	// agent.
+	//
+	// Required: false
+	DockerHost *string `json:"dockerHost,omitempty"`
 
 	// Name of the environment.
 	//
@@ -40,6 +49,11 @@ type Update struct {
 	//
 	// Required: false
 	ApiUrl *string `json:"apiUrl,omitzero" binding:"omitempty,url"`
+
+	// DockerHost is the Docker API endpoint for a "docker-host" environment.
+	//
+	// Required: false
+	DockerHost *string `json:"dockerHost,omitzero"`
 
 	// Name of the environment.
 	//
@@ -140,6 +154,12 @@ type Environment struct {
 	//
 	// Required: false
 	IsEdge bool `json:"isEdge"`
+
+	// DockerHost is set for "docker-host" environments, where the manager talks
+	// to the Docker API directly instead of proxying to an agent.
+	//
+	// Required: false
+	DockerHost *string `json:"dockerHost,omitempty"`
 
 	// LastSeen is the last successful manager-side health/contact timestamp.
 	//

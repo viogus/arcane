@@ -340,6 +340,7 @@
 					settings: snapshot.settings,
 					versionInfo: snapshot.versionInfo,
 					podCount: snapshot.podCount,
+					dockerVersion: snapshot.dockerVersion,
 					snapshotState: 'ready',
 					snapshotError: state.streamError ? resolveSnapshotErrorMessage(state) : undefined
 				};
@@ -552,6 +553,13 @@
 			const isCurrent = currentEnvironmentId === environment.id;
 			const [useButton, ...menuButtons] = getEnvironmentActionButtons(loadedItem, isCurrent);
 			const vInfo = loadedItem.versionInfo;
+			// Docker-host environments run no Arcane agent, so they report the daemon version instead.
+			let versionText: string | null = null;
+			if (environment.dockerHost) {
+				versionText = loadedItem.dockerVersion || null;
+			} else if (vInfo) {
+				versionText = vInfo.displayVersion || vInfo.currentTag || vInfo.currentVersion || 'unknown';
+			}
 			const actionItemCount = (kind: DashboardActionItemKind) =>
 				loadedItem.actionItems.items.find((item) => item.kind === kind)?.count ?? 0;
 			return {
@@ -569,7 +577,7 @@
 				memory: getMemoryMetric(stats),
 				disk: getDiskMetric(stats),
 				statsStatus: getLiveStatsStatus(environment),
-				versionText: vInfo ? vInfo.displayVersion || vInfo.currentTag || vInfo.currentVersion || 'unknown' : null,
+				versionText,
 				updateAvailable: !!vInfo?.updateAvailable,
 				useButton,
 				menuButtons

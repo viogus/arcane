@@ -111,19 +111,16 @@ func (h *SwarmHandler) ListTasks(ctx context.Context, input *ListSwarmTasksInput
 
 // GetSwarmStatus returns the current swarm cluster metadata for an environment.
 //
-// It delegates to the swarm service to inspect the local swarm state and maps
-// service-layer failures to the API's HTTP error model.
+// It delegates to the swarm service to inspect the swarm state of the daemon the
+// request is scoped to, so a docker-host environment reports its own daemon
+// rather than the manager's.
 //
 // ctx carries request-scoped cancellation and auth context.
 // input identifies the environment whose swarm metadata should be returned.
 //
 // Returns the current swarm information when swarm mode is available.
-// Returns a mapped HTTP error when swarm inspection fails.
 func (h *SwarmHandler) GetSwarmStatus(ctx context.Context, input *GetSwarmStatusInput) (*handlerutil.Out[swarm.RuntimeStatus], error) {
-	enabled, err := h.swarmService.IsEnabled(ctx)
-	if err != nil {
-		return nil, huma.Error500InternalServerError("failed to read swarm status")
-	}
+	enabled := h.swarmService.IsEnabledForContext(ctx)
 
 	return &handlerutil.Out[swarm.RuntimeStatus]{
 		Body: base.ApiResponse[swarm.RuntimeStatus]{

@@ -14,6 +14,7 @@ import (
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/s3"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
@@ -184,4 +185,89 @@ func TestBackupPolicyDestinationLookupFailure(t *testing.T) {
 func (s *volumeBackupPolicyScheduler) Submit(_ context.Context, request scheduler.Request) (scheduler.Run, error) {
 	s.submitted = append(s.submitted, request)
 	return scheduler.Run{ID: request.RunID, JobID: request.JobID, EnvironmentID: request.EnvironmentID, Status: scheduler.Queued}, nil
+}
+
+func TestVolumeBackupPolicy_IsolatesPoliciesPerEnvironment(t *testing.T) {
+	gormDB, err := gorm.Open(sqlite.Open("file:volume-backup-environments?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, gormDB.AutoMigrate(&VolumeBackupPolicy{}, &s3.S3Destination{}))
+	service := NewService(Dependencies{
+		DB:             &database.DB{DB: gormDB},
+		LatestRun:      noLatestRun,
+		S3Destinations: s3.NewS3DestinationService(&database.DB{DB: gormDB}, func(context.Context, string) error { return nil }),
+	})
+
+	managerCollection, err := service.UpdateBackupPolicies(t.Context(), "app-data", []volume.UpdateBackupPolicy{{
+		Schedule: "0 0 2 * * *", LocalEnabled: true,
+	}})
+	require.NoError(t, err)
+	require.Len(t, managerCollection.Policies, 1)
+
+	remoteCtx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-remote"})
+	remoteCollection, err := service.UpdateBackupPolicies(remoteCtx, "app-data", []volume.UpdateBackupPolicy{{
+		Schedule: "0 0 4 * * *", LocalEnabled: true,
+	}})
+	require.NoError(t, err)
+	require.Len(t, remoteCollection.Policies, 1)
+
+	// The same volume name keeps one independent policy per environment.
+	managerAgain, err := service.GetBackupPolicies(t.Context(), "app-data")
+	require.NoError(t, err)
+	require.Len(t, managerAgain.Policies, 1)
+	require.Equal(t, "0 0 2 * * *", managerAgain.Policies[0].Schedule)
+
+	remoteAgain, err := service.GetBackupPolicies(remoteCtx, "app-data")
+	require.NoError(t, err)
+	require.Len(t, remoteAgain.Policies, 1)
+	require.Equal(t, "0 0 4 * * *", remoteAgain.Policies[0].Schedule)
+
+	// A policy of another environment is not addressable by ID.
+	foreign, err := service.Policy(t.Context(), "app-data", remoteAgain.Policies[0].ID)
+	require.NoError(t, err)
+	require.Nil(t, foreign)
+	foreign, err = service.Policy(remoteCtx, "app-data", managerAgain.Policies[0].ID)
+	require.NoError(t, err)
+	require.Nil(t, foreign)
+
+	// HasEnabledBackupPolicy and Remove only touch the caller's environment.
+	enabled, err := service.HasEnabledBackupPolicy(remoteCtx, "app-data")
+	require.NoError(t, err)
+	require.False(t, enabled)
+	service.Remove(t.Context(), "app-data")
+	remaining, err := service.GetBackupPolicies(remoteCtx, "app-data")
+	require.NoError(t, err)
+	require.Len(t, remaining.Policies, 1)
+}
+
+func TestVolumeBackupPolicy_PurgeEnvironmentDropsOnlyThatEnvironment(t *testing.T) {
+	gormDB, err := gorm.Open(sqlite.Open("file:volume-backup-purge-environment?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, gormDB.AutoMigrate(&VolumeBackupPolicy{}, &s3.S3Destination{}))
+	service := NewService(Dependencies{
+		DB:             &database.DB{DB: gormDB},
+		LatestRun:      noLatestRun,
+		S3Destinations: s3.NewS3DestinationService(&database.DB{DB: gormDB}, func(context.Context, string) error { return nil }),
+	})
+
+	_, err = service.UpdateBackupPolicies(t.Context(), "app-data", []volume.UpdateBackupPolicy{{
+		Schedule: "0 0 2 * * *", LocalEnabled: true,
+	}})
+	require.NoError(t, err)
+
+	remoteCtx := envcontext.WithTarget(t.Context(), envcontext.Target{EnvironmentID: "env-purged"})
+	_, err = service.UpdateBackupPolicies(remoteCtx, "app-data", []volume.UpdateBackupPolicy{{
+		Schedule: "0 0 4 * * *", LocalEnabled: true,
+	}})
+	require.NoError(t, err)
+
+	require.NoError(t, service.PurgeEnvironment(t.Context(), "env-purged"))
+
+	purged, err := service.GetBackupPolicies(remoteCtx, "app-data")
+	require.NoError(t, err)
+	require.Empty(t, purged.Policies)
+
+	kept, err := service.GetBackupPolicies(t.Context(), "app-data")
+	require.NoError(t, err)
+	require.Len(t, kept.Policies, 1)
+	require.Equal(t, "0 0 2 * * *", kept.Policies[0].Schedule)
 }

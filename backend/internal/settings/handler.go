@@ -27,6 +27,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/telemetry"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/edge"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/workspace"
@@ -127,7 +128,9 @@ func (h *SettingsHandler) appendRuntimeSettings(settingsDto []settings.PublicSet
 
 // GetPublicSettings returns public settings for an environment.
 func (h *SettingsHandler) GetPublicSettings(ctx context.Context, input *GetPublicSettingsInput) (*GetPublicSettingsOutput, error) {
-	if input.EnvironmentID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so
+	// its settings are the manager's own.
+	if input.EnvironmentID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		settingsDto, err := h.proxyRemoteJSON.JSON[[]settings.PublicSetting](ctx, input.EnvironmentID, http.MethodGet, "/api/environments/0/settings/public", nil)
 		if err != nil {
 			return nil, err
@@ -142,7 +145,8 @@ func (h *SettingsHandler) GetPublicSettings(ctx context.Context, input *GetPubli
 		return nil, huma.Error500InternalServerError("Failed to map settings")
 	}
 
-	return &GetPublicSettingsOutput{Body: h.appendRuntimeSettings(settingsDto, false)}, nil
+	// An environment-scoped read shows the values that environment actually uses.
+	return &GetPublicSettingsOutput{Body: h.settingsService.applyEnvironmentOverridesInternal(ctx, h.appendRuntimeSettings(settingsDto, false))}, nil
 }
 
 // GetSettings returns all settings for an environment.
@@ -151,7 +155,9 @@ func (h *SettingsHandler) GetSettings(ctx context.Context, input *GetSettingsInp
 	isAdmin := ps.IsGlobalAdmin()
 	visibility := kit.Ternary(isAdmin, SettingVisibilityAll, SettingVisibilityNonAdmin)
 
-	if input.EnvironmentID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so
+	// its settings are the manager's own.
+	if input.EnvironmentID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		settingsDto, err := h.proxyRemoteJSON.JSON[[]settings.PublicSetting](ctx, input.EnvironmentID, http.MethodGet, "/api/environments/0/settings", nil)
 		if err != nil {
 			return nil, err
@@ -178,7 +184,8 @@ func (h *SettingsHandler) GetSettings(ctx context.Context, input *GetSettingsInp
 		return nil, huma.Error500InternalServerError("Failed to map settings")
 	}
 
-	return &GetSettingsOutput{Body: h.appendRuntimeSettings(settingsDto, true)}, nil
+	// An environment-scoped read shows the values that environment actually uses.
+	return &GetSettingsOutput{Body: h.settingsService.applyEnvironmentOverridesInternal(ctx, h.appendRuntimeSettings(settingsDto, true))}, nil
 }
 
 // UpdateSettings updates settings for an environment.
@@ -221,7 +228,9 @@ func (h *SettingsHandler) UpdateSettings(ctx context.Context, input *UpdateSetti
 		}
 	}
 
-	if input.EnvironmentID != "0" {
+	// A docker-host environment is served by this process: it has no agent to proxy to, so
+	// its settings are the manager's own.
+	if input.EnvironmentID != "0" && !envcontext.IsDockerHostTarget(ctx) {
 		if update.AuthLocalEnabled != nil || update.OidcEnabled != nil || update.AuthSessionTimeout != nil || update.AuthPasswordPolicy != nil ||
 			update.OidcClientId != nil || update.OidcClientSecret != nil || update.OidcIssuerUrl != nil || update.OidcScopes != nil ||
 			update.OidcMergeAccounts != nil || update.OidcSkipTlsVerify != nil || update.OidcAutoRedirectToProvider != nil ||

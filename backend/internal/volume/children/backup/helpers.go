@@ -25,6 +25,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/volumehelper"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
@@ -324,9 +325,16 @@ func (s *Service) remoteRusticRepository(ctx context.Context, destinationID, ins
 	}, nil
 }
 
+// volumeAdmissionIDInternal scopes a volume name to its environment. The admission engine is
+// process-wide while volumes belong to an environment, so two environments may each back up a
+// volume with the same name.
+func volumeAdmissionIDInternal(environmentID, volumeName string) string {
+	return environmentID + "\x00" + volumeName
+}
+
 // acquireVolumeRun takes the volume's run lease, failing with AlreadyRunning while another backup operation holds it.
 func (s *Service) acquireVolumeRun(ctx context.Context, volumeName string) (*runs.Lease, error) {
-	lease, admitted, err := s.deps.Engine.TryAcquireRun(ctx, backup.VolumeAdmissionScope, volumeName)
+	lease, admitted, err := s.deps.Engine.TryAcquireRun(ctx, backup.VolumeAdmissionScope, volumeAdmissionIDInternal(envcontext.EnvironmentIDOrDefault(ctx), volumeName))
 	if err != nil {
 		return nil, err
 	}

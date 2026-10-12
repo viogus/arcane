@@ -10,6 +10,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/env"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 )
 
@@ -129,10 +130,21 @@ func (h *VariableHandler) GetSyncStatus(_ context.Context, _ *GetGlobalVariableS
 	}, nil
 }
 
+// dockerHostVariablesUnsupportedMessageInternal explains why a docker-host environment has no
+// materialized global variables: .env.global belongs to the host that runs Arcane, and only an
+// agent materializes its own environment's copy.
+const dockerHostVariablesUnsupportedMessageInternal = "global variables are not materialized for docker-host environments"
+
 // GetMaterializedVariables returns the environment's materialized .env.global
-// content (local file for environment "0", proxied to the agent otherwise).
+// content. The local environment is served from this process and every other
+// environment is proxied to its agent. A docker-host environment has no agent to
+// proxy to and no materialization of its own, so it is refused rather than served
+// the manager's file under another environment's id.
 func (h *VariableHandler) GetMaterializedVariables(ctx context.Context, input *GetGlobalVariablesInput) (*handlerutil.Out[[]env.Variable], error) {
 	if input.EnvironmentID != "0" {
+		if envcontext.IsDockerHostTarget(ctx) {
+			return nil, huma.Error400BadRequest(dockerHostVariablesUnsupportedMessageInternal)
+		}
 		response, err := h.proxyRemoteJSON.JSON[base.ApiResponse[[]env.Variable]](ctx, input.EnvironmentID, http.MethodGet, "/api/environments/0/templates/variables", nil)
 		if err != nil {
 			return nil, err
@@ -154,9 +166,15 @@ func (h *VariableHandler) GetMaterializedVariables(ctx context.Context, input *G
 }
 
 // UpdateMaterializedVariables replaces the environment's materialized
-// .env.global content (local file for environment "0", proxied otherwise).
+// .env.global content. The local environment is served from this process and every
+// other environment is proxied to its agent. A docker-host environment has no agent
+// to proxy to and no materialization of its own, so it is refused rather than
+// writing the manager's file under another environment's id.
 func (h *VariableHandler) UpdateMaterializedVariables(ctx context.Context, input *UpdateGlobalVariablesInput) (*handlerutil.Out[base.MessageResponse], error) {
 	if input.EnvironmentID != "0" {
+		if envcontext.IsDockerHostTarget(ctx) {
+			return nil, huma.Error400BadRequest(dockerHostVariablesUnsupportedMessageInternal)
+		}
 		response, err := h.proxyRemoteJSON.JSON[base.ApiResponse[base.MessageResponse]](ctx, input.EnvironmentID, http.MethodPut, "/api/environments/0/templates/variables", input.Body)
 		if err != nil {
 			return nil, err

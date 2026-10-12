@@ -14,77 +14,63 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/user"
 	"go.getarcane.app/kit/pkg"
 
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 )
 
-// ApplyStatuses merges durable runs for one environment into jobs. The local
-// environment also gains dynamic children and scheduler worker health.
+// ApplyStatuses merges durable runs for one environment into jobs. Environments this process
+// serves itself (the local manager and docker-host environments) also gain dynamic children and
+// scheduler worker health, because their schedules live in this process's scheduler.
 func ApplyStatuses(ctx context.Context, coordinator *runs.Coordinator, controller scheduler.JobController, environmentID string, jobs []jobschedule.JobStatus) ([]jobschedule.JobStatus, error) {
-	records, err := coordinator.Records(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("load durable job status: %w", err)
-	}
 	runsByJob := make(map[string][]scheduler.Run)
-	for _, record := range records {
-		if record.EnvironmentID == environmentID {
-			runsByJob[record.JobID] = append(runsByJob[record.JobID], record.Runs...)
+	if coordinator != nil {
+		records, err := coordinator.Records(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("load durable job status: %w", err)
+		}
+		for _, record := range records {
+			if record.EnvironmentID == environmentID {
+				runsByJob[record.JobID] = append(runsByJob[record.JobID], record.Runs...)
+			}
 		}
 	}
 	jobScheduler, hasScheduler := controller.(scheduler.JobScheduler)
-	jobs, dynamicChildren := appendDynamicJobStatuses(ctx, controller, environmentID, jobs)
+	servedInProcess := environmentID == "0" || envcontext.IsDockerHostTarget(ctx)
+	if servedInProcess && hasScheduler {
+		jobs = appendDynamicJobStatuses(ctx, jobScheduler, environmentID, jobs)
+	}
 
 	statuses := make([]jobschedule.JobStatus, 0, len(jobs))
 	for _, job := range jobs {
 		status := ApplyRunStatus(job, runsByJob[job.ID])
-		workerHealth, nextRun := func() (*scheduler.WorkerHealth, *time.Time) {
-			if environmentID != "0" || !hasScheduler {
-				return status.WorkerHealth, status.NextRun
-			}
-			if health, found := jobScheduler.WatcherHealth(status.ID); found {
-				return &health, status.NextRun
-			}
-			registered, found := jobScheduler.GetJob(status.ID)
-			if !found {
-				return status.WorkerHealth, status.NextRun
-			}
-			if conditional, ok := registered.(scheduler.ConditionalJob); ok && !conditional.ShouldSchedule(ctx) {
-				return status.WorkerHealth, status.NextRun
-			}
-			if state, stateFound := jobScheduler.GetJobRuntimeState(status.ID); !stateFound || !state.Scheduled {
-				return &scheduler.WorkerHealth{
-					Status:    "needs_attention",
-					LastError: "Job has no installed schedule",
-					UpdatedAt: time.Now().UTC(),
-				}, nil
-			}
-			return status.WorkerHealth, status.NextRun
-		}()
-		var children []jobschedule.JobStatus
-		for _, child := range slices.Concat(status.Children, dynamicChildren[status.ID]) {
-			children = append(children, ApplyRunStatus(child, runsByJob[child.ID]))
+		if servedInProcess && hasScheduler {
+			setRuntimeHealth(ctx, jobScheduler, environmentID, &status)
 		}
-		statuses = append(statuses, jobschedule.JobStatus{ //exhaustruct:enforce
-			CurrentRun:     status.CurrentRun,
-			LastRun:        status.LastRun,
-			LastSuccess:    status.LastSuccess,
-			LastError:      status.LastError,
-			WorkerHealth:   workerHealth,
-			Children:       children,
-			ID:             status.ID,
-			Name:           status.Name,
-			Description:    status.Description,
-			Category:       status.Category,
-			Schedule:       status.Schedule,
-			NextRun:        nextRun,
-			Enabled:        status.Enabled,
-			ManagerOnly:    status.ManagerOnly,
-			IsContinuous:   status.IsContinuous,
-			CanRunManually: status.CanRunManually,
-			Prerequisites:  status.Prerequisites,
-			SettingsKey:    status.SettingsKey,
-		})
+		for index := range status.Children {
+			status.Children[index] = ApplyRunStatus(status.Children[index], runsByJob[status.Children[index].ID])
+		}
+		statuses = append(statuses, status)
 	}
 	return statuses, nil
+}
+
+func setRuntimeHealth(ctx context.Context, jobScheduler scheduler.JobScheduler, environmentID string, status *jobschedule.JobStatus) {
+	if health, found := jobScheduler.WatcherHealth(status.ID); found {
+		status.WorkerHealth = &health
+		return
+	}
+	registered, found := jobScheduler.GetJob(status.ID)
+	if !found {
+		return
+	}
+	if conditional, ok := registered.(scheduler.ConditionalJob); ok && !conditional.ShouldSchedule(ctx) {
+		return
+	}
+	state, found := jobScheduler.GetJobRuntimeStateFor(ctx, environmentID, status.ID)
+	if !found || !state.Scheduled {
+		status.NextRun = nil
+		status.WorkerHealth = &scheduler.WorkerHealth{Status: "needs_attention", LastError: "Job has no installed schedule", UpdatedAt: time.Now().UTC()}
+	}
 }
 
 func runExecutionTime(run scheduler.Run) time.Time {
@@ -231,47 +217,41 @@ func ApplyRunStatus(status jobschedule.JobStatus, jobRuns []scheduler.Run) jobsc
 	}
 }
 
-func appendDynamicJobStatuses(
-	ctx context.Context,
-	controller scheduler.JobController,
-	environmentID string,
-	jobs []jobschedule.JobStatus,
-) ([]jobschedule.JobStatus, map[string][]jobschedule.JobStatus) {
-	jobScheduler, hasScheduler := controller.(scheduler.JobScheduler)
-	if environmentID != "0" || !hasScheduler {
-		return jobs, nil
+func appendDynamicJobStatuses(ctx context.Context, jobScheduler scheduler.JobScheduler, environmentID string, jobs []jobschedule.JobStatus) []jobschedule.JobStatus {
+	parentIndices := make(map[string]int, len(jobs))
+	for index, status := range jobs {
+		parentIndices[status.ID] = index
 	}
 	registered := jobScheduler.ListRegisteredJobs()
 	slices.SortFunc(registered, func(left, right scheduler.Job) int {
 		return strings.Compare(left.Name(), right.Name())
 	})
-	dynamicChildren := make(map[string][]jobschedule.JobStatus)
 	for _, registeredJob := range registered {
 		parentID, _, dynamic := strings.Cut(registeredJob.Name(), ":")
-		parentIndex := slices.IndexFunc(jobs, func(job jobschedule.JobStatus) bool { return job.ID == parentID })
-		if !dynamic || parentID == "environment-health" {
-			if registeredJob.Name() == "environment-health:0" && parentIndex >= 0 {
-				jobs[parentIndex] = dynamicJobStatus(ctx, jobScheduler, registeredJob, jobs[parentIndex].Name, "monitoring", true)
+		if !dynamic {
+			continue
+		}
+		if parentID == "environment-health" {
+			if registeredJob.Name() == "environment-health:"+environmentID {
+				if index, exists := parentIndices[parentID]; exists {
+					health := dynamicJobStatus(ctx, jobScheduler, environmentID, registeredJob, "monitoring", true)
+					health.Name = jobs[index].Name
+					jobs[index] = health
+				}
 			}
 			continue
 		}
-		category, managerOnly, supported := func() (string, bool, bool) {
-			switch parentID {
-			case "gitops-sync":
-				return "sync", false, true
-			case "system-backup":
-				return "maintenance", true, true
-			case "volume-backup":
-				return "maintenance", false, true
-			default:
-				return "", false, false
-			}
-		}()
+		if !jobBelongsToEnvironmentInternal(registeredJob, environmentID) {
+			continue
+		}
+		category, managerOnly, supported := dynamicJobCategory(parentID)
 		if !supported {
 			continue
 		}
-		if parentIndex < 0 {
+		parentIndex, exists := parentIndices[parentID]
+		if !exists {
 			parentIndex = len(jobs)
+			parentIndices[parentID] = parentIndex
 			jobs = append(jobs, jobschedule.JobStatus{
 				ID:            parentID,
 				Name:          parentID,
@@ -285,26 +265,54 @@ func appendDynamicJobStatuses(
 			return child.ID == registeredJob.Name()
 		})
 		if !duplicate {
-			dynamicChildren[parentID] = append(dynamicChildren[parentID], dynamicJobStatus(ctx, jobScheduler, registeredJob, registeredJob.Name(), category, managerOnly))
+			jobs[parentIndex].Children = append(jobs[parentIndex].Children, dynamicJobStatus(ctx, jobScheduler, environmentID, registeredJob, category, managerOnly))
 		}
 	}
-	return jobs, dynamicChildren
+	return jobs
 }
 
-func dynamicJobStatus(ctx context.Context, jobScheduler scheduler.JobScheduler, job scheduler.Job, name, category string, managerOnly bool) jobschedule.JobStatus {
-	state, scheduled := jobScheduler.GetJobRuntimeState(job.Name())
-	return jobschedule.JobStatus{
-		ID:       job.Name(),
-		Name:     name,
-		Category: category,
-		Schedule: kit.Ternary(scheduled, state.Schedule, job.Schedule(ctx)),
-		NextRun:  state.NextRun,
-		Enabled: func() bool {
-			conditional, ok := job.(scheduler.ConditionalJob)
-			return !ok || conditional.ShouldSchedule(ctx)
-		}(),
+func dynamicJobStatus(ctx context.Context, jobScheduler scheduler.JobScheduler, environmentID string, job scheduler.Job, category string, managerOnly bool) jobschedule.JobStatus {
+	child := jobschedule.JobStatus{
+		ID:             job.Name(),
+		Name:           job.Name(),
+		Category:       category,
+		Schedule:       job.Schedule(ctx),
+		Enabled:        true,
 		ManagerOnly:    managerOnly,
 		CanRunManually: true,
 		Prerequisites:  []jobschedule.JobPrerequisite{},
 	}
+	if conditional, ok := job.(scheduler.ConditionalJob); ok {
+		child.Enabled = conditional.ShouldSchedule(ctx)
+	}
+	if state, ok := jobScheduler.GetJobRuntimeStateFor(ctx, environmentID, child.ID); ok {
+		child.Schedule = state.Schedule
+		child.NextRun = state.NextRun
+	}
+	return child
+}
+
+func dynamicJobCategory(parentID string) (category string, managerOnly, supported bool) {
+	switch parentID {
+	case "gitops-sync":
+		return "sync", false, true
+	case "system-backup":
+		return "maintenance", true, true
+	case "volume-backup":
+		return "maintenance", false, true
+	default:
+		return "", false, false
+	}
+}
+
+// jobBelongsToEnvironmentInternal reports whether a dynamic job's schedule namespace belongs to
+// the environment whose job list is being built. Jobs with no declared scope (and manager-scoped
+// jobs) belong to the manager's own catalog, which every environment surfaces.
+func jobBelongsToEnvironmentInternal(job scheduler.Job, environmentID string) bool {
+	scoped, ok := job.(scheduler.EnvironmentScopedJob)
+	if !ok {
+		return true
+	}
+	scope := scoped.EnvironmentID()
+	return scope == "" || scope == "0" || scope == environmentID
 }

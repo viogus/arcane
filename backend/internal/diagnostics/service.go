@@ -373,6 +373,16 @@ func (s *DiagnosticsService) CollectAllActors(ctx context.Context) []system.Acto
 	if err != nil {
 		slog.WarnContext(ctx, "Failed to list environments for actor diagnostics", "error", err)
 	}
+	// Docker-host environments are served in-process from the manager, so their actors are the local
+	// ones reported above: there is no remote component to inspect.
+	remoteEnvironments := make([]environment.Environment, 0, len(remotes))
+	for _, remote := range remotes {
+		if remote.IsDockerHost() {
+			continue
+		}
+		remoteEnvironments = append(remoteEnvironments, remote)
+	}
+	remotes = remoteEnvironments
 	out := make([]system.ActorDiagnostics, len(remotes)+1)
 	out[0] = local
 	var wg sync.WaitGroup

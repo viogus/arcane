@@ -54,7 +54,7 @@ func setupSettingsTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &kv.KVEntry{}, &activity.Activity{}, &activity.ActivityMessage{}))
+	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &settings.EnvironmentSetting{}, &kv.KVEntry{}, &activity.Activity{}, &activity.ActivityMessage{}))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
@@ -95,7 +95,7 @@ func newJobServiceForTest(t *testing.T, db *database.DB, settingsService *settin
 		environment.NewEnvironmentService(db, http.DefaultClient, nil, nil, settingsService, nil),
 		activity.NewActivityService(db, settingsService),
 	)
-	service.SetScheduler(t.Context(), newFakeJobScheduler())
+	service.SetScheduler(t.Context(), newFakeJobSchedulerInternal())
 	return service
 }
 
@@ -176,7 +176,7 @@ func TestJobService_ListJobs_UsesRuntimeScheduleAndNextRun(t *testing.T) {
 	require.NoError(t, err)
 
 	nextRun := time.Date(2026, time.July, 10, 8, 0, 0, 0, time.UTC)
-	fakeScheduler := newFakeJobScheduler("auto-update")
+	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
 	fakeScheduler.runtimeStates["auto-update"] = scheduler.JobRuntimeState{
 		Schedule:  "0 0 8 * * *",
 		NextRun:   &nextRun,
@@ -359,7 +359,7 @@ func TestJobService_UpdateJobSchedules_ReschedulesChangedJob(t *testing.T) {
 	require.NoError(t, err)
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobScheduler("auto-update")
+	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -378,7 +378,7 @@ func TestJobService_UpdateJobSchedules_DeprecatedPollingIntervalDoesNotReschedul
 	require.NoError(t, err)
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobScheduler("auto-update")
+	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	updated, err := jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -401,7 +401,7 @@ func TestJobService_UpdateJobSchedules_UsesLifecycleContextForReschedule(t *test
 	requestCtx, cancelRequest := context.WithCancel(t.Context())
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobScheduler("auto-update")
+	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
 	jobSvc.SetScheduler(lifecycleCtx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(requestCtx, jobschedule.Update{
@@ -426,7 +426,7 @@ func TestJobService_UpdateJobSchedules_RejectsInvalidCronWithoutChangingSetting(
 	require.NoError(t, settingsSvc.LoadDatabaseSettings(ctx))
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobScheduler()
+	fakeScheduler := newFakeJobSchedulerInternal()
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -462,7 +462,7 @@ func TestJobService_UpdateJobSchedules_RestoresPreviousScheduleWhenRescheduleFai
 	require.NoError(t, settingsSvc.LoadDatabaseSettings(ctx))
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := &fakeJobScheduler{
+	fakeScheduler := &fakeJobSchedulerInternal{
 		jobs:          map[string]scheduler.Job{"auto-update": fakeJob{name: "auto-update"}},
 		runtimeStates: map[string]scheduler.JobRuntimeState{},
 		rescheduleErr: errors.New("scheduler unavailable"),
@@ -488,7 +488,7 @@ func TestJobService_UpdateJobSchedules_SkipsManagerOnlyJobsInAgentMode(t *testin
 	require.NoError(t, err)
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{AgentMode: true})
-	fakeScheduler := newFakeJobScheduler("environment-health")
+	fakeScheduler := newFakeJobSchedulerInternal("environment-health")
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -507,7 +507,7 @@ func TestJobService_UpdateJobSchedules_DelegatesEnvironmentHealthReschedule(t *t
 	require.NoError(t, err)
 
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobScheduler()
+	fakeScheduler := newFakeJobSchedulerInternal()
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	rescheduled := 0
@@ -528,7 +528,7 @@ func TestJobService_Submit_PersistsImageUpdateWatcherRun(t *testing.T) {
 	db := setupSettingsTestDB(t)
 	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
-	fakeScheduler := newFakeJobScheduler()
+	fakeScheduler := newFakeJobSchedulerInternal()
 	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 	require.NoError(t, db.AutoMigrate(&userdomain.User{}, &role.Role{}, &role.UserRoleAssignment{}))
@@ -565,29 +565,51 @@ func findJobStatusByID(t *testing.T, jobs []jobschedule.JobStatus, id string) jo
 	return jobschedule.JobStatus{}
 }
 
-func newFakeJobScheduler(jobIDs ...string) *fakeJobScheduler {
+type fakeJobSchedulerInternal struct {
+	jobs               map[string]scheduler.Job
+	runtimeStates      map[string]scheduler.JobRuntimeState
+	rescheduled        []string
+	rescheduleContexts []context.Context
+	rescheduleErr      error
+	busWatcherRuns     []string
+	busWatcherContexts []context.Context
+	cleared            []string
+	clearErr           error
+}
+
+func newFakeJobSchedulerInternal(jobIDs ...string) *fakeJobSchedulerInternal {
 	jobs := make(map[string]scheduler.Job, len(jobIDs))
 	for _, jobID := range jobIDs {
 		jobs[jobID] = fakeJob{name: jobID}
 	}
 
-	return &fakeJobScheduler{
+	return &fakeJobSchedulerInternal{
 		jobs:          jobs,
 		runtimeStates: make(map[string]scheduler.JobRuntimeState),
 	}
 }
 
-func (s *fakeJobScheduler) GetJob(jobID string) (scheduler.Job, bool) {
+func (s *fakeJobSchedulerInternal) GetJob(jobID string) (scheduler.Job, bool) {
 	job, ok := s.jobs[jobID]
 	return job, ok
 }
 
-func (s *fakeJobScheduler) GetJobRuntimeState(jobID string) (scheduler.JobRuntimeState, bool) {
+func (s *fakeJobSchedulerInternal) GetJobRuntimeState(jobID string) (scheduler.JobRuntimeState, bool) {
 	state, ok := s.runtimeStates[jobID]
 	return state, ok
 }
 
-func (s *fakeJobScheduler) RescheduleJob(ctx context.Context, job scheduler.Job) error {
+func (s *fakeJobSchedulerInternal) GetJobRuntimeStateFor(_ context.Context, _ string, jobID string) (scheduler.JobRuntimeState, bool) {
+	state, ok := s.runtimeStates[jobID]
+	return state, ok
+}
+
+func (s *fakeJobSchedulerInternal) ClearJobScheduleFor(_ context.Context, environmentID, jobID string) error {
+	s.cleared = append(s.cleared, environmentID+"|"+jobID)
+	return s.clearErr
+}
+
+func (s *fakeJobSchedulerInternal) RescheduleJob(ctx context.Context, job scheduler.Job) error {
 	s.rescheduled = append(s.rescheduled, job.Name())
 	s.rescheduleContexts = append(s.rescheduleContexts, ctx)
 	if s.rescheduleErr != nil {
@@ -601,7 +623,7 @@ func (s *fakeJobScheduler) RescheduleJob(ctx context.Context, job scheduler.Job)
 	return nil
 }
 
-func (s *fakeJobScheduler) RunBusWatcherNow(ctx context.Context, watcherID string) error {
+func (s *fakeJobSchedulerInternal) RunBusWatcherNow(ctx context.Context, watcherID string) error {
 	s.busWatcherRuns = append(s.busWatcherRuns, watcherID)
 	s.busWatcherContexts = append(s.busWatcherContexts, ctx)
 	return nil
@@ -637,7 +659,7 @@ func newJobActivityTestService(t *testing.T) (*JobService, *activity.ActivitySer
 		environment.NewEnvironmentService(db, http.DefaultClient, nil, nil, settingsService, nil),
 		activities,
 	)
-	svc.SetScheduler(t.Context(), newFakeJobScheduler())
+	svc.SetScheduler(t.Context(), newFakeJobSchedulerInternal())
 	return svc, activities, db
 }
 
@@ -942,7 +964,7 @@ func TestJobActivityRestartRepairsFailedProjection(t *testing.T) {
 		environment.NewEnvironmentService(db, http.DefaultClient, nil, nil, svc.settings, nil),
 		activities,
 	)
-	restarted.SetScheduler(ctx, newFakeJobScheduler())
+	restarted.SetScheduler(ctx, newFakeJobSchedulerInternal())
 	require.NoError(t, restarted.runs.Start(ctx, ctx))
 	t.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)

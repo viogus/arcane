@@ -254,12 +254,20 @@ func newRouter(p RouterParams) (*echo.Echo, *edge.TunnelServer) {
 	))
 	handlerAppCtx := handlerutil.NewActivityAppContext(ctx)
 
-	envResolver := func(ctx context.Context, id string) (string, *string, bool, error) {
+	envResolver := func(ctx context.Context, id string) (middleware.EnvironmentTarget, error) {
 		env, err := deps.Environment.Service().GetEnvironmentByIDCached(ctx, id)
-		if err != nil || env == nil {
-			return "", nil, false, err
+		if err != nil {
+			return middleware.EnvironmentTarget{}, err
 		}
-		return env.ApiUrl, env.AccessToken, env.Enabled, nil
+		if env == nil {
+			return middleware.EnvironmentTarget{}, errors.New("environment not found: " + id)
+		}
+		return middleware.EnvironmentTarget{
+			ApiURL:      env.ApiUrl,
+			AccessToken: env.AccessToken,
+			Enabled:     env.Enabled,
+			DockerHost:  env.DockerHostURL(),
+		}, nil
 	}
 
 	// Register public webhook trigger endpoint before auth middleware (token in URL is the sole auth)

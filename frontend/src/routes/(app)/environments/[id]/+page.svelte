@@ -41,6 +41,7 @@
 	import { queryKeys } from '#lib/query/query-keys.js';
 	import { environmentManagementService } from '#lib/services/env-mgmt-service.js';
 	import { settingsService } from '#lib/services/settings-service.js';
+	import { systemService } from '#lib/services/system-service.js';
 	import { environmentStore } from '#lib/stores/environment.store.svelte.js';
 	import { featureStore } from '#lib/stores/features.store.svelte.js';
 	import type { Environment, EnvironmentStatus } from '#lib/types/environment.js';
@@ -97,18 +98,35 @@
 	let statusOverride = $state<EnvironmentStatus | null>(null);
 	let currentStatus = $derived(resolveEnvironmentStatus(runtimeEnvironment, statusOverride));
 	let isCurrentlyOnline = $derived(isEnvironmentOnline(runtimeEnvironment, statusOverride));
+	let isDockerHostEnvironment = $derived(
+		runtimeEnvironment.id !== '0' && !runtimeEnvironment.isEdge && !!runtimeEnvironment.dockerHost
+	);
 
 	const versionQuery = createQuery(() => {
 		const environmentId = environment.id;
 		return {
 			queryKey: queryKeys.system.versionInfo(environmentId),
 			queryFn: () => environmentManagementService.getVersion(environmentId),
-			enabled: environmentId !== '0' && isCurrentlyOnline,
+			enabled: environmentId !== '0' && !isDockerHostEnvironment && isCurrentlyOnline,
 			retry: false
 		};
 	});
 	const remoteVersion = $derived(versionQuery.data ?? null);
 	const isLoadingVersion = $derived(versionQuery.isFetching);
+
+	// A docker-host environment runs no Arcane of its own, so the version it reports is the
+	// Docker engine version the manager talks to directly.
+	const dockerInfoQuery = createQuery(() => {
+		const environmentId = environment.id;
+		return {
+			queryKey: queryKeys.system.dockerInfo(environmentId),
+			queryFn: () => systemService.getDockerInfoForEnvironment(environmentId),
+			enabled: isDockerHostEnvironment && isCurrentlyOnline,
+			retry: false
+		};
+	});
+	const dockerVersion = $derived(dockerInfoQuery.data?.ServerVersion ?? null);
+	const isLoadingDockerVersion = $derived(dockerInfoQuery.isFetching);
 
 	let isCurrentlyStandby = $derived(currentStatus === 'standby');
 	// Settings tabs stay listed while offline so the selected tab survives a temporary outage.
@@ -195,7 +213,8 @@
 
 		if (environment.id !== '0') {
 			// Edge environments manage mTLS downloads and API key regeneration in the Connection & Edge tab.
-			if (!runtimeEnvironment.isEdge) {
+			// Docker host environments talk straight to the Docker API, so there is no agent API key to rotate.
+			if (!runtimeEnvironment.isEdge && !isDockerHostEnvironment) {
 				actions.push({
 					id: 'regenerate-api-key',
 					action: 'base',
@@ -304,6 +323,7 @@
 		name: loadedEnvironment.name,
 		enabled: loadedEnvironment.enabled,
 		apiUrl: loadedEnvironment.apiUrl,
+		dockerHost: loadedEnvironment.dockerHost ?? '',
 		accessToken: '',
 		pollingEnabled: settings?.pollingEnabled ?? false,
 		imageEventWatcherEnabled: settings?.imageEventWatcherEnabled ?? false,
@@ -371,6 +391,7 @@
 		const environmentId = environment.id;
 		const submittedInputs = formInputs;
 		const apiUrlChanged = formData.apiUrl !== environment.apiUrl;
+		const dockerHostChanged = formData.dockerHost !== (environment.dockerHost ?? '');
 		const changedFeatures = featureDefinitions.filter(
 			(feature) => formData[feature.settingKey] !== currentSettings[feature.settingKey]
 		);
@@ -381,7 +402,7 @@
 		) {
 			throw new Error(m.features_unavailable());
 		}
-		if (formData.name !== environment.name || formData.enabled !== environment.enabled || apiUrlChanged) {
+		if (formData.name !== environment.name || formData.enabled !== environment.enabled || apiUrlChanged || dockerHostChanged) {
 			const update = environmentUpdateSchema.parse({
 				...formData,
 				accessToken: directRemoteUrlChanged ? formData.accessToken : undefined
@@ -402,6 +423,7 @@
 			'name',
 			'enabled',
 			'apiUrl',
+			'dockerHost',
 			'accessToken',
 			...featureDefinitions.map((feature) => feature.settingKey)
 		];
@@ -520,7 +542,8 @@
 				...currentSettings,
 				name: environment.name,
 				enabled: environment.enabled,
-				apiUrl: environment.apiUrl
+				apiUrl: environment.apiUrl,
+				dockerHost: environment.dockerHost ?? ''
 			}),
 			onSave: saveEnvironmentSettings,
 			successMessage: m.common_update_success({ resource: m.resource_environment_cap() }),
@@ -531,7 +554,6 @@
 	let directRemoteUrlChanged = $derived(
 		environment.id !== '0' && !environment.isEdge && formInputs.apiUrl.value !== environment.apiUrl
 	);
-
 	beforeNavigate((navigation) => {
 		if (navigation.willUnload || (navigation.to && navigation.to.url.pathname !== navigation.from?.url.pathname)) {
 			clearAccessToken();
@@ -606,7 +628,15 @@
 			const operationResult = await tryCatch(
 				(async () => {
 					isTestingConnection = true;
-					const customUrl = formInputs.apiUrl.value !== environment.apiUrl ? formInputs.apiUrl.value : undefined;
+					// Docker-host environments have no apiUrl; the endpoint the user may have edited
+					// lives in the dockerHost field instead.
+					const customUrl = isDockerHostEnvironment
+						? (formInputs.dockerHost.value ?? '') !== (environment.dockerHost ?? '')
+							? (formInputs.dockerHost.value ?? '')
+							: undefined
+						: formInputs.apiUrl.value !== environment.apiUrl
+							? formInputs.apiUrl.value
+							: undefined;
 					const result = await environmentManagementService.testConnection(environment.id, customUrl);
 
 					const nextStatus = result.status as EnvironmentStatus;
@@ -706,12 +736,19 @@
 			<EnvironmentStatusSummary
 				environment={runtimeEnvironment}
 				{currentStatus}
+				{dockerVersion}
+				isDockerHost={isDockerHostEnvironment}
+				{isLoadingDockerVersion}
 				{isLoadingVersion}
 				{remoteVersion}
 				{versionInformation}
 			/>
 		</div>
-		{@render apiUrlLine()}
+		{#if isDockerHostEnvironment}
+			{@render dockerHostLine()}
+		{:else}
+			{@render apiUrlLine()}
+		{/if}
 	</div>
 {/snippet}
 
@@ -779,6 +816,49 @@
 				disabled={settingsForm.isLoading}
 			/>
 		</div>
+	{/if}
+{/snippet}
+
+{#snippet dockerHostLine()}
+	<div class="flex min-w-0 items-center gap-1">
+		{#if isEditingApiUrl}
+			<Input
+				id="docker-host"
+				type="text"
+				bind:value={formInputs.dockerHost.value}
+				mono
+				size="sm"
+				class="h-7 w-full max-w-md"
+				aria-invalid={!!formInputs.dockerHost.error}
+				placeholder={m.environments_docker_host_placeholder()}
+				autofocus
+				onkeydown={(e) => {
+					if (e.key === 'Enter') {
+						e.preventDefault();
+						isEditingApiUrl = false;
+					}
+					if (e.key === 'Escape') {
+						formInputs.dockerHost.value = environment.dockerHost ?? '';
+						isEditingApiUrl = false;
+					}
+				}}
+				onblur={() => (isEditingApiUrl = false)}
+			/>
+		{:else}
+			<button
+				type="button"
+				class="min-w-0 truncate rounded px-1 py-0.5 text-left font-mono text-xs text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
+				title={m.environments_docker_host_label()}
+				onclick={() => (isEditingApiUrl = true)}
+			>
+				{formInputs.dockerHost.value || m.environments_docker_host_placeholder()}
+			</button>
+		{/if}
+		<CopyButton text={formInputs.dockerHost.value} size="icon" class="size-6 shrink-0" />
+		<span class="shrink-0 font-mono text-xs text-muted-foreground/70">#{environment.id}</span>
+	</div>
+	{#if formInputs.dockerHost.error}
+		<p class="mt-1 text-xs text-destructive">{formInputs.dockerHost.error}</p>
 	{/if}
 {/snippet}
 

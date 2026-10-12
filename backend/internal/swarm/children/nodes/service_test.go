@@ -26,7 +26,7 @@ func setupSwarmServiceTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &environment.Environment{}))
+	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &settings.EnvironmentSetting{}, &environment.Environment{}))
 	return &database.DB{DB: db}
 }
 
@@ -136,7 +136,7 @@ func TestService_FetchSwarmNodeIdentityViaEdge_UsesEnvironmentAccessToken(t *tes
 		&accessToken,
 	)
 
-	svc := NewService(nil, nil, nil, nil, envSvc)
+	svc := NewService(nil, nil, nil, nil, nil, envSvc)
 
 	identity, err := svc.fetchSwarmNodeIdentityViaEdge(ctx, "env-1")
 	require.NoError(t, err)

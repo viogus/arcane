@@ -59,14 +59,22 @@ type SettingsService struct {
 	// rebuilt whenever config is stored so reads are a pointer load.
 	effectiveConfig atomic.Pointer[Settings]
 	envOverrides    []settingsEnvOverride
-	writes          sync.Mutex
-	effectsMu       sync.Mutex
-	effects         []func()
-	effectsWake     chan struct{}
-	effectsDone     chan struct{}
-	effectsClosed   bool
-	lifecycleCtx    context.Context
-	changes         *concurrency.Signal[[]libarcane.SettingUpdate]
+	// environmentSettings caches per-environment setting overrides as
+	// environmentID -> key -> value, rebuilt by LoadDatabaseSettings.
+	environmentSettings atomic.Pointer[map[string]map[string]string]
+	// environmentSettingKeys holds the keys eligible for per-environment overrides,
+	// guarded by environmentSettingKeysMu; unregistered keys are ignored by both the
+	// read and the write path.
+	environmentSettingKeys   map[string]struct{}
+	environmentSettingKeysMu sync.RWMutex
+	writes                   sync.Mutex
+	effectsMu                sync.Mutex
+	effects                  []func()
+	effectsWake              chan struct{}
+	effectsDone              chan struct{}
+	effectsClosed            bool
+	lifecycleCtx             context.Context
+	changes                  *concurrency.Signal[[]libarcane.SettingUpdate]
 }
 
 type settingsEnvOverride struct {
@@ -87,6 +95,9 @@ func NewSettingsService(ctx context.Context, db *database.DB, appConfig *config.
 		lifecycleCtx: ctx,
 		changes:      concurrency.NewSignal[[]libarcane.SettingUpdate](),
 	}
+	// Register the default overridable keys before loading settings so the override
+	// cache is populated with the keys eligible for per-environment overrides.
+	svc.SetEnvironmentSettingKeys(EnvironmentSettingKeys())
 	fields, _ := getSettingsFieldCacheInternal()
 	for _, field := range fields {
 		if !slices.Contains(splitSettingAttrsInternal(field.attrs), "envOverride") {
@@ -197,6 +208,10 @@ func (s *SettingsService) LoadDatabaseSettings(ctx context.Context) error {
 	defer queryCancel()
 	if err := s.db.WithContext(queryCtx).Find(&stored).Error; err != nil {
 		return fmt.Errorf("failed to load configuration from the database: %w", err)
+	}
+
+	if err := s.loadEnvironmentSettingsInternal(queryCtx); err != nil {
+		return err
 	}
 
 	dst := DefaultSettingsConfig()
@@ -502,6 +517,12 @@ func (s *SettingsService) UpdateSettings(ctx context.Context, updates settings.U
 	if err := normalization.Normalize(&updates); err != nil {
 		return nil, err
 	}
+	// An environment-scoped request may only change its own registered overrides;
+	// drop every other key before it can reach the global in-memory snapshot. This
+	// runs before prepareUpdateValues, which mutates cfg for every provided key.
+	if environmentIDFromContextInternal(ctx) != "" {
+		updates = s.filterEnvironmentSettingUpdatesInternal(updates)
+	}
 	s.writes.Lock()
 	defer s.writes.Unlock()
 	if err := ctx.Err(); err != nil {
@@ -582,6 +603,9 @@ func (s *SettingsService) UpdateSettings(ctx context.Context, updates settings.U
 		changes = append(changes, libarcane.SettingUpdate{Key: value.Key, Value: value.Value})
 	}
 	result := s.GetSettingsConfig().ToSettingVariableSlice(SettingVisibilityNonAdmin, false)
+	// An environment-scoped update returns the effective values for that environment,
+	// so the caller never sees the manager's values for the keys it just overrode.
+	result = s.applyEnvironmentOverridesToSettingVariablesInternal(ctx, result)
 	s.publishSettingsChanges(changes)
 	return result, nil
 }
@@ -673,8 +697,37 @@ func (s *SettingsService) prepareUpdateValues(updates settings.Update, cfg, defa
 }
 
 func (s *SettingsService) persistSettings(ctx context.Context, values []SettingVariable) error {
+	if err := s.writeSettingValuesInternal(ctx, values); err != nil {
+		return err
+	}
+
+	if err := s.LoadDatabaseSettings(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("failed to refresh settings cache: %w", err)
+	}
+	return nil
+}
+
+// writeSettingValuesInternal persists values in a single transaction. When ctx carries
+// an environment target, only registered keys are written, as that environment's
+// overrides; unregistered keys are ignored rather than falling through to globals.
+// Callers must hold s.writes.
+func (s *SettingsService) writeSettingValuesInternal(ctx context.Context, values []SettingVariable) error {
+	if environmentID := environmentIDFromContextInternal(ctx); environmentID != "" {
+		accepted := make([]SettingVariable, 0, len(values))
+		for _, value := range values {
+			if s.isEnvironmentSettingKeyInternal(value.Key) {
+				accepted = append(accepted, value)
+			}
+		}
+		return s.writeEnvironmentSettingValuesInternal(ctx, environmentID, accepted)
+	}
+
+	if len(values) == 0 {
+		return nil
+	}
+
 	_, byKey := getSettingsFieldCacheInternal()
-	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, setting := range values {
 			if setting.Key == "oidcProviderName" {
 				setting.Value = normalization.Text(setting.Value, true, true)
@@ -691,14 +744,7 @@ func (s *SettingsService) persistSettings(ctx context.Context, values []SettingV
 			}
 		}
 		return nil
-	}); err != nil {
-		return err
-	}
-
-	if err := s.LoadDatabaseSettings(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("failed to refresh settings cache: %w", err)
-	}
-	return nil
+	})
 }
 
 // retiredSettingValues lists former defaults that startup replaces
@@ -898,9 +944,8 @@ func (s *SettingsService) GetSettingType(key string) string {
 }
 
 func (s *SettingsService) settingValue[T any](ctx context.Context, key string, parse func(string) (T, error)) mo.Option[T] {
-	cfg := s.GetSettingsOrDefaults(ctx)
-	value, _, _, err := cfg.FieldByKey(key)
-	if err != nil || value == "" {
+	value := s.settingValueForEnvironmentInternal(ctx, key)
+	if value == "" {
 		return mo.None[T]()
 	}
 
@@ -909,6 +954,21 @@ func (s *SettingsService) settingValue[T any](ctx context.Context, key string, p
 		return mo.None[T]()
 	}
 	return mo.Some(parsed)
+}
+
+// settingValueForEnvironmentInternal resolves the raw value for key, preferring a
+// registered per-environment override carried on ctx and falling back to the global
+// snapshot otherwise.
+func (s *SettingsService) settingValueForEnvironmentInternal(ctx context.Context, key string) string {
+	if override, ok := s.environmentOverrideInternal(environmentIDFromContextInternal(ctx), key); ok {
+		return override
+	}
+
+	value, _, _, err := s.GetSettingsOrDefaults(ctx).FieldByKey(key)
+	if err != nil {
+		return ""
+	}
+	return value
 }
 
 func (s *SettingsService) GetBoolSetting(ctx context.Context, key string, defaultValue bool) bool {
