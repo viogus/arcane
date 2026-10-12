@@ -112,7 +112,7 @@ func TestLegacyImportSurvivesRestartAndDeduplicates(t *testing.T) {
 	for _, jobID := range []string{"gitops-sync:first", "gitops-sync:second"} {
 		history, listErr := restored.List(t.Context(), "0", jobID, 1, 100)
 		require.NoError(t, listErr)
-		require.Equal(t, 100, history.Total)
+		require.Equal(t, coordinatorTerminalRunsInternal, history.Total)
 		require.Equal(t, st.Failed, history.Runs[0].Status)
 		state, stateErr := restored.ScheduleState(t.Context(), jobID)
 		require.NoError(t, stateErr)

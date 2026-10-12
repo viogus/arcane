@@ -36,6 +36,10 @@ export const ssr = false;
 const spansEnvironments = ({ queryKey }: { queryKey: readonly unknown[] }) =>
 	environmentStore.shown.length > 1 && queryKey.includes(environmentStore.shownKey);
 
+// Layout data that does not change between navigations keeps its value for this
+// long, so clicks do not refetch the version and the 39 KB permission manifest.
+const layoutStaleTime = 60_000;
+
 const queryClient = new QueryClient({
 	defaultOptions: {
 		queries: {
@@ -115,7 +119,8 @@ async function loadRoot({ url, depends }: Parameters<LayoutLoad>[0], releaseSele
 		queryClient.query({
 			...rootQuery,
 			queryKey: queryKeys.system.appVersion(),
-			queryFn: () => versionService.getVersionInformation()
+			queryFn: () => versionService.getVersionInformation(),
+			staleTime: layoutStaleTime
 		})
 	]);
 	const autoLoginConfig =
@@ -168,7 +173,8 @@ async function loadRoot({ url, depends }: Parameters<LayoutLoad>[0], releaseSele
 			queryClient.query({
 				...rootQuery,
 				queryKey: queryKeys.roles.permissionsManifest(),
-				queryFn: () => roleService.getPermissionsManifest()
+				queryFn: () => roleService.getPermissionsManifest(),
+				staleTime: layoutStaleTime
 			})
 		);
 		const environments = await environmentsRequest;

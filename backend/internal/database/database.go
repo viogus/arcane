@@ -48,6 +48,10 @@ const (
 	// Bound prepared statements so variable SQL does not retain an unbounded cache.
 	preparedStmtMaxSize = 256
 	preparedStmtTTL     = 15 * time.Minute
+
+	// truncate the write-ahead log back to this size after each checkpoint; without it SQLite keeps
+	// the log at the size of its busiest window even long after the frames were flushed.
+	sqliteJournalSizeLimit = 64 << 20
 )
 
 var customGormLogger logger.Interface
@@ -472,6 +476,9 @@ func ParseSQLiteConnectionString(connString string) (string, error) {
 		}
 		if !sqliteutil.HasPragma(qs, "synchronous") {
 			qs.Add("_pragma", "synchronous(NORMAL)")
+		}
+		if !sqliteutil.HasPragma(qs, "journal_size_limit") {
+			qs.Add("_pragma", "journal_size_limit("+strconv.Itoa(sqliteJournalSizeLimit)+")")
 		}
 		if qs.Get("_txlock") == "" {
 			qs.Set("_txlock", "immediate")

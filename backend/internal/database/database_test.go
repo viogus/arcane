@@ -1464,7 +1464,7 @@ func TestSQLiteDSN(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "immediate", parsed.Query().Get("_txlock"))
 			require.Equal(t, "shared", parsed.Query().Get("cache"))
-			require.ElementsMatch(t, []string{"foreign_keys(1)", "synchronous(NORMAL)", "busy_timeout(2500)", "journal_mode(WAL)"}, parsed.Query()["_pragma"])
+			require.ElementsMatch(t, []string{"foreign_keys(1)", "synchronous(NORMAL)", "busy_timeout(2500)", "journal_mode(WAL)", "journal_size_limit(67108864)"}, parsed.Query()["_pragma"])
 			require.Empty(t, parsed.Query().Get("_fk"))
 			require.Empty(t, parsed.Query().Get("_foreign_keys"))
 			require.Empty(t, parsed.Query().Get("_busy_timeout"))
@@ -1482,19 +1482,19 @@ func TestSQLiteDSN_ConcurrencyDefaults(t *testing.T) {
 		{
 			name:    "defaults added",
 			input:   "file:arcane.db",
-			pragmas: []string{"foreign_keys(1)", "busy_timeout(10000)", "journal_mode(WAL)", "synchronous(NORMAL)"},
+			pragmas: []string{"foreign_keys(1)", "busy_timeout(10000)", "journal_mode(WAL)", "synchronous(NORMAL)", "journal_size_limit(67108864)"},
 			txlock:  "immediate",
 		},
 		{
 			name:    "explicit values kept",
 			input:   "file:arcane.db?_journal_mode=DELETE&_timeout=500&_txlock=deferred",
-			pragmas: []string{"foreign_keys(1)", "busy_timeout(500)", "journal_mode(DELETE)", "synchronous(NORMAL)"},
+			pragmas: []string{"foreign_keys(1)", "busy_timeout(500)", "journal_mode(DELETE)", "synchronous(NORMAL)", "journal_size_limit(67108864)"},
 			txlock:  "deferred",
 		},
 		{
 			name:    "explicit pragmas kept",
 			input:   "file:arcane.db?_pragma=journal_mode(TRUNCATE)&_pragma=busy_timeout(2000)",
-			pragmas: []string{"foreign_keys(1)", "busy_timeout(2000)", "journal_mode(TRUNCATE)", "synchronous(NORMAL)"},
+			pragmas: []string{"foreign_keys(1)", "busy_timeout(2000)", "journal_mode(TRUNCATE)", "synchronous(NORMAL)", "journal_size_limit(67108864)"},
 			txlock:  "immediate",
 		},
 		{

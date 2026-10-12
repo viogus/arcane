@@ -519,6 +519,11 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 				s.jobs.Unregister(ctx, id)
 				s.edgeTokens.sync(id, "")
 				edge.GetRegistry().Unregister(id)
+				// A disabled docker-host environment is no longer polled, so drop the keep-alive
+				// connection instead of holding it open until the environment changes again.
+				if host := updated.DockerHostURL(); host != "" && s.dockerService != nil {
+					s.dockerService.CloseHostClient(host)
+				}
 			}
 		}
 	}

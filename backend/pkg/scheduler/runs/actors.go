@@ -52,14 +52,14 @@ func (q *Coordinator) Register(runtime *francis.Runtime) error {
 	if err := runtime.RegisterActor(
 		executorType, executorFactory,
 		local.WithCapacityGroup("jobs", 4),
-		local.WithCompletedJobRetention(7*24*time.Hour),
+		local.WithCompletedJobRetention(72*time.Hour),
 	); err != nil {
 		return err
 	}
 	return runtime.RegisterActor(
 		healthExecutorType, executorFactory,
 		local.WithCapacityGroup("jobs-health", 2),
-		local.WithCompletedJobRetention(7*24*time.Hour),
+		local.WithCompletedJobRetention(72*time.Hour),
 	)
 }
 

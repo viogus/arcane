@@ -303,6 +303,16 @@ func (q *Coordinator) prune(ctx context.Context, states []st.CoordinatorState) e
 	return nil
 }
 
+// coordinatorTerminalRunsInternal bounds the terminal runs one coordinator record keeps. The jobs
+// page reads them, but every dispatch pass decodes the whole record and a manager serving several
+// environments keeps one record per job per environment, so a large cap multiplies into the per-pass
+// decode cost (measured: 100 runs made one record ~86 KB).
+const coordinatorTerminalRunsInternal = 25
+
+// coordinatorRunRetentionInternal ages out the rest so a low-frequency job does not keep stale runs
+// forever.
+const coordinatorRunRetentionInternal = 7 * 24 * time.Hour
+
 func pruneRuns(record *st.QueueRecord, now time.Time) bool {
 	changed := false
 	terminal := 0
@@ -311,7 +321,7 @@ func pruneRuns(record *st.QueueRecord, now time.Time) bool {
 			continue
 		}
 		terminal++
-		if terminal <= 100 && now.Sub(run.UpdatedAt) < 7*24*time.Hour {
+		if terminal <= coordinatorTerminalRunsInternal && now.Sub(run.UpdatedAt) < coordinatorRunRetentionInternal {
 			continue
 		}
 		if separateTrigger(run.Trigger) {
