@@ -21,6 +21,8 @@ import (
 	"go.getarcane.app/docker/compat"
 	"go.getarcane.app/docker/types"
 	kit "go.getarcane.app/kit/pkg"
+
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 )
 
 type Client struct {
@@ -132,7 +134,19 @@ type plainComposeClientEntryInternal struct {
 
 var plainComposeClient atomic.Pointer[plainComposeClientEntryInternal]
 
+// composeDockerHostForContextInternal resolves the daemon a Compose operation
+// must run against: the docker-host environment serving the request when there
+// is one, and the caller's config-resolved docker host otherwise. An empty
+// result means the process defaults, i.e. the manager's own daemon.
+func composeDockerHostForContextInternal(ctx context.Context, dockerHost string) string {
+	if host := strings.TrimSpace(envcontext.DockerHostFromContext(ctx)); host != "" {
+		return host
+	}
+	return dockerHost
+}
+
 func plainComposeClientInternal(ctx context.Context, dockerHost string) (*Client, bool, error) {
+	dockerHost = composeDockerHostForContextInternal(ctx, dockerHost)
 	if dockerHost == "" {
 		c, err := NewClient(ctx, "", nil, nil)
 		return c, false, err
