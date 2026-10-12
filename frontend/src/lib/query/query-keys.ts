@@ -51,7 +51,8 @@ export const queryKeys = {
 		logout: () => ['auth', 'logout'] as const,
 		currentUser: () => ['auth', 'current-user'] as const,
 		autoLoginConfig: () => ['auth', 'auto-login-config'] as const,
-		autoLoginAttempt: () => ['auth', 'auto-login-attempt'] as const
+		autoLoginAttempt: () => ['auth', 'auto-login-attempt'] as const,
+		permissionsManifest: () => ['auth', 'permissions-manifest'] as const
 	},
 	settings: {
 		all: ['settings'] as const,

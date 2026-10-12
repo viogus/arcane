@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -320,12 +321,23 @@ func (q *Coordinator) Stop(ctx context.Context) error {
 	}
 }
 
+// heapReleaseIntervalInternal bounds how long pages freed by a pass stay resident. Every pass
+// decodes and re-encodes coordinator state through SQLite, and the runtime hands freed pages back
+// to the OS only gradually, so a small host otherwise sits at its recent allocation high-water
+// mark: measured on a 1 GB router, 205-280 MB resident on a 22-hour-old process with ~1 MB live
+// heap, versus a ~125 MB plateau with this release. A forced collection costs roughly 0.6-4 ms on
+// a fast host (a few ms on the router) and scales with the bytes returned, not with the live heap;
+// it also flattens RSS, so heap profiles and the diagnostics page show the scrubbed picture rather
+// than the raw growth.
+const heapReleaseIntervalInternal = time.Minute
+
 func (q *Coordinator) dispatch(ctx context.Context) {
 	defer close(q.done)
 
 	// Flush every coordinator once while enabled to restore schedule alarms; later passes only cover unfinished work.
 	fullRepair := true
 	nextRetention := time.Now()
+	lastHeapRelease := time.Now()
 	for ctx.Err() == nil {
 		enabled := q.enabled.Load()
 		retain := !time.Now().Before(nextRetention)
@@ -360,6 +372,10 @@ func (q *Coordinator) dispatch(ctx context.Context) {
 		case <-timer.C:
 		}
 		timer.Stop()
+		if time.Since(lastHeapRelease) >= heapReleaseIntervalInternal {
+			lastHeapRelease = time.Now()
+			debug.FreeOSMemory()
+		}
 	}
 }
 
