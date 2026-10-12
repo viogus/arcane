@@ -41,6 +41,13 @@
 	const isRefreshing = $derived(eventsQuery.isFetching && !eventsQuery.isPending);
 
 	async function refresh() {
+		// The table writes its new request options immediately before calling this, but
+		// Svelte has not pushed them into the query observers yet (that happens in a
+		// pre-effect). Refetching now would target the previous query key and store the
+		// new response under it, so the filtered rows would never reach the table.
+		// Flush the pending update first so the refetch is bound to the options we just
+		// applied.
+		await tick();
 		await Promise.all([eventsQuery.refetch(), statsQuery.refetch()]);
 	}
 

@@ -23,6 +23,9 @@ type ListEventsInput struct {
 	Limit    int    `query:"limit" default:"20" doc:"Limit"`
 	Severity string `query:"severity" doc:"Filter by severity"`
 	Type     string `query:"type" doc:"Filter by event type (exact type or category prefix, comma-separated)"`
+	// EnvironmentID filters by the environment an event was attributed to
+	// (comma-separated for multiple); "0" selects the manager's local Docker daemon.
+	EnvironmentID string `query:"environmentId" doc:"Filter by environment ID (exact, comma-separated for multiple)"`
 }
 
 type GetEventStatsInput struct{}
@@ -51,6 +54,9 @@ func (h *EventHandler) ListEvents(ctx context.Context, input *ListEventsInput) (
 	}
 	if input.Type != "" {
 		params.Filters["type"] = input.Type
+	}
+	if input.EnvironmentID != "" {
+		params.Filters["environmentId"] = input.EnvironmentID
 	}
 
 	events, paginationResp, err := h.eventService.ListEventsPaginated(ctx, params)
