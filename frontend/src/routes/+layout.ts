@@ -28,16 +28,20 @@ import type { LayoutLoad } from './$types';
 
 export const ssr = false;
 
+// Layout data that does not change between navigations keeps its value for this
+// long, so clicks do not refetch the version and the 39 KB permission manifest.
+const layoutStaleTime = 60_000;
+
 const queryClient = new QueryClient({
 	defaultOptions: {
 		queries: {
 			enabled: browser,
 			// Covers the gap between a page loader's fetch and the component's
 			// mount so the same query isn't fetched twice in one navigation.
-			staleTime: 2_000,
+			staleTime: 15_000,
 			gcTime: 60 * 1000,
 			refetchOnMount: true,
-			refetchOnWindowFocus: 'always',
+			refetchOnWindowFocus: true,
 			refetchOnReconnect: 'always'
 		}
 	}
@@ -82,7 +86,11 @@ async function loadRoot({ url }: Parameters<LayoutLoad>[0], releaseSelection: ((
 			if (!result.error) return result.data;
 			return isAuthRejectionError(result.error) || isSessionCancelledError(result.error) ? null : userStore.current;
 		}),
-		versionService.getVersionInformation()
+		queryClient.fetchQuery({
+			queryKey: queryKeys.system.appVersion(),
+			queryFn: () => versionService.getVersionInformation(),
+			staleTime: layoutStaleTime
+		})
 	]);
 	const autoLoginConfig =
 		browser && versionInformation.enabledFeatures?.includes('autologin')
@@ -120,7 +128,13 @@ async function loadRoot({ url }: Parameters<LayoutLoad>[0], releaseSelection: ((
 		opened = true;
 		// Initialize environment store (required for settings service)
 		const environmentsRequest = tryCatch(environmentManagementService.getEnvironments({ pagination: { page: 1, limit: -1 } }));
-		const permissionsManifestRequest = dataOrNull(roleService.getPermissionsManifest());
+		const permissionsManifestRequest = dataOrNull(
+			queryClient.fetchQuery({
+				queryKey: queryKeys.auth.permissionsManifest(),
+				queryFn: () => roleService.getPermissionsManifest(),
+				staleTime: layoutStaleTime
+			})
+		);
 		const environments = await environmentsRequest;
 		if (!environments.error) {
 			await environmentStore.initialize(environments.data.data);

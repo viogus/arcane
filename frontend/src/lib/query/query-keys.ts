@@ -36,7 +36,8 @@ export const queryKeys = {
 		all: ['auth'] as const,
 		logout: () => ['auth', 'logout'] as const,
 		autoLoginConfig: () => ['auth', 'auto-login-config'] as const,
-		autoLoginAttempt: () => ['auth', 'auto-login-attempt'] as const
+		autoLoginAttempt: () => ['auth', 'auto-login-attempt'] as const,
+		permissionsManifest: () => ['auth', 'permissions-manifest'] as const
 	},
 	settings: {
 		all: ['settings'] as const,
@@ -104,6 +105,7 @@ export const queryKeys = {
 		deleteSelectedGlobal: () => ['events', 'delete-selected', 'global'] as const
 	},
 	system: {
+		appVersion: () => ['system', 'app-version'] as const,
 		upgradeAvailable: (scope: 'mobile-nav' | 'sidebar') => ['system', 'upgrade-available', scope] as const,
 		environmentUpgradeAvailable: (environmentId: string) =>
 			['system', 'upgrade-available', 'environment', environmentId] as const,
