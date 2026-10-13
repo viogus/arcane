@@ -491,6 +491,14 @@ type Details struct {
 	// Required: true
 	Status string `json:"status"`
 
+	// DeployedHere reports whether the environment the request was made for has
+	// any container (running or stopped) belonging to this project. Project
+	// records are global to the Arcane manager, so this flag is what lets a
+	// client scope the list to a single environment.
+	//
+	// Required: false
+	DeployedHere bool `json:"deployedHere"`
+
 	// DirName is the directory name where the project is stored.
 	//
 	// Required: false

@@ -180,8 +180,10 @@ func ProjectStatus(services []project.RuntimeService) string {
 }
 
 // StatusCounts totals archived, running and stopped projects from live
-// containers, falling back to stored status when Docker is unavailable.
-func (s *Service) StatusCounts(ctx context.Context, records []project.Record) project.StatusCounts {
+// containers, falling back to stored status when Docker is unavailable. With
+// deployedOnly, records without a container in the current environment are
+// skipped so the counts describe the same set as a deployed-filtered list.
+func (s *Service) StatusCounts(ctx context.Context, records []project.Record, deployedOnly bool) project.StatusCounts {
 	counts := project.StatusCounts{TotalProjects: len(records)}
 	active := make([]project.Record, 0, len(records))
 	for _, p := range records {
@@ -201,6 +203,10 @@ func (s *Service) StatusCounts(ctx context.Context, records []project.Record) pr
 		status := p.Status
 		if err == nil {
 			projectContainers := ProjectContainers(p, containersByProject)
+			if deployedOnly && len(projectContainers) == 0 {
+				counts.TotalProjects--
+				continue
+			}
 			services := make([]project.RuntimeService, 0, len(projectContainers))
 			for _, c := range projectContainers {
 				services = append(services, project.RuntimeService{Status: string(c.State)})
@@ -260,6 +266,7 @@ func row(projectsDir, catalog string, p project.Record, snapshot Snapshot) proje
 	}
 
 	projectContainers := ProjectContainers(p, snapshot.byProject)
+	resp.DeployedHere = len(projectContainers) > 0
 	services := make([]project.RuntimeService, 0, len(projectContainers))
 	for _, c := range projectContainers {
 		service := RuntimeServiceFromContainer(catalog, c, projects.ArcaneComposeMetadata{}, snapshot.currentContainerID, snapshot.currentContainerErr)
@@ -572,6 +579,15 @@ func Page(items []project.Details, params pagination.QueryParams, tracked func(i
 						}
 					}
 					return false
+				},
+			},
+			{
+				// deployed=true narrows the global project list to the projects
+				// that own a container in the environment being queried.
+				Key: "deployed",
+				Fn: func(p project.Details, filterValue string) bool {
+					deployed, _ := kit.ParseBool(filterValue)
+					return !deployed || p.DeployedHere
 				},
 			},
 		},

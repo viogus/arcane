@@ -2169,6 +2169,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 	statusFilter := strings.TrimSpace(params.Filters["status"])
 	updatesFilter := strings.TrimSpace(params.Filters["updates"])
 	labelFilter := strings.TrimSpace(params.Filters["label"])
+	deployedFilter := strings.TrimSpace(params.Filters["deployed"])
 	query := s.db.WithContext(ctx).Model(&Project{})
 	if archivedFilter := strings.TrimSpace(params.Filters["archived"]); !strings.EqualFold(archivedFilter, "all") {
 		archived, _ := kit.ParseBool(archivedFilter)
@@ -2184,7 +2185,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 		)
 	}
 
-	if statusFilter == "" && updatesFilter == "" && labelFilter == "" && !strings.EqualFold(strings.TrimSpace(params.Sort), "status") {
+	if statusFilter == "" && updatesFilter == "" && labelFilter == "" && deployedFilter == "" && !strings.EqualFold(strings.TrimSpace(params.Sort), "status") {
 		query = pagination.ApplyFilter(query, "status", params.Filters["status"])
 		var projectsArray []Project
 		paginationResp, err := pagination.PaginateAndSortDB(params, query, &projectsArray)
@@ -3420,12 +3421,12 @@ func (s *ProjectService) StreamProjectLogs(ctx context.Context, projectID string
 	return projectdetails.Logs(ctx, proj.Name, logsChan, follow, tail, since, timestamps)
 }
 
-func (s *ProjectService) GetProjectStatusCounts(ctx context.Context) (projecttypes.StatusCounts, error) {
+func (s *ProjectService) GetProjectStatusCounts(ctx context.Context, deployedOnly bool) (projecttypes.StatusCounts, error) {
 	var projectsList []Project
 	if listProjectsErr := s.db.WithContext(ctx).Find(&projectsList).Error; listProjectsErr != nil {
 		return projecttypes.StatusCounts{}, fmt.Errorf("failed to list projects: %w", listProjectsErr)
 	}
-	return s.listing.StatusCounts(ctx, projectRecords(projectsList)), nil
+	return s.listing.StatusCounts(ctx, projectRecords(projectsList), deployedOnly), nil
 }
 
 // projectListRows builds list rows and persists live-inferred service counts

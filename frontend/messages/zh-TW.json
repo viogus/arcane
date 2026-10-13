@@ -1433,6 +1433,7 @@
   "projects_archive": "存檔",
   "projects_unarchive": "未歸檔",
   "projects_show_archived": "顯示存檔",
+  "projects_show_all_environments": "顯示所有環境",
   "projects_archived_badge": "存檔",
   "projects_archived_count": "存檔專案",
   "projects_archive_requires_stopped": "先停止專案",

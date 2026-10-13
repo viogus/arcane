@@ -1433,6 +1433,7 @@
   "projects_archive": "归档",
   "projects_unarchive": "取消归档",
   "projects_show_archived": "显示已归档项目",
+  "projects_show_all_environments": "显示所有环境",
   "projects_archived_badge": "已归档",
   "projects_archived_count": "已归档的项目",
   "projects_archive_requires_stopped": "请先停止该项目",

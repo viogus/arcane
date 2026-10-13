@@ -15,6 +15,8 @@ export const load: PageLoad = async ({ parent, url }) => {
 	const environments = await environmentStore.getShownEnvironments();
 	const scope = environmentStore.shownKey;
 	const showArchived = url.searchParams.get('archived') === 'true';
+	const showAllEnvironments = url.searchParams.get('allEnvironments') === 'true';
+	const deployedOnly = !showAllEnvironments;
 
 	const projectRequestOptions = resolveInitialTableRequest('arcane-project-table', {
 		pagination: {
@@ -32,6 +34,11 @@ export const load: PageLoad = async ({ parent, url }) => {
 	} else {
 		delete filters['archived'];
 	}
+	if (deployedOnly) {
+		filters['deployed'] = 'true';
+	} else {
+		delete filters['deployed'];
+	}
 	projectRequestOptions.filters = Object.keys(filters).length ? filters : undefined;
 
 	let projects;
@@ -48,9 +55,11 @@ export const load: PageLoad = async ({ parent, url }) => {
 						)
 				}),
 				queryClient.query({
-					queryKey: queryKeys.projects.statusCounts(scope),
+					queryKey: queryKeys.projects.statusCounts(scope, deployedOnly),
 					queryFn: () =>
-						sumAcrossEnvironments(environments, (id, config) => projectService.getProjectStatusCountsForEnvironment(id, config))
+						sumAcrossEnvironments(environments, (id, config) =>
+							projectService.getProjectStatusCountsForEnvironment(id, { deployed: deployedOnly }, config)
+						)
 				}),
 				queryClient.query({
 					queryKey: queryKeys.projects.tags(scope),
@@ -66,5 +75,5 @@ export const load: PageLoad = async ({ parent, url }) => {
 		[projects, projectStatusCounts, projectTags] = operationResult.data;
 	}
 
-	return { scope, projects, projectRequestOptions, projectStatusCounts, projectTags, showArchived };
+	return { scope, projects, projectRequestOptions, projectStatusCounts, projectTags, showArchived, showAllEnvironments };
 };

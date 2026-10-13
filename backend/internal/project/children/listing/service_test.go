@@ -70,7 +70,7 @@ func TestStatusCounts_FallsBackToStoredStatus(t *testing.T) {
 		{Status: project.StatusStopped},
 		{Status: project.StatusUnknown},
 		{Status: project.StatusRunning, IsArchived: true},
-	})
+	}, false)
 
 	assert.Equal(t, project.StatusCounts{TotalProjects: 4, ArchivedProjects: 1, RunningProjects: 1, StoppedProjects: 1}, counts)
 }

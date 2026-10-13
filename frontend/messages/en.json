@@ -1436,6 +1436,7 @@
   "projects_archive": "Archive",
   "projects_unarchive": "Unarchive",
   "projects_show_archived": "Show archived",
+  "projects_show_all_environments": "Show all environments",
   "projects_archived_badge": "Archived",
   "projects_archived_count": "Archived Projects",
   "projects_archive_requires_stopped": "Stop the project first",

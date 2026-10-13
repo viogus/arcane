@@ -501,7 +501,7 @@ func (s *DashboardService) ObserveInventory(meter metric.Meter) error {
 		}
 
 		if s.projectService != nil {
-			if counts, countErr := s.projectService.GetProjectStatusCounts(ctx); countErr != nil {
+			if counts, countErr := s.projectService.GetProjectStatusCounts(ctx, false); countErr != nil {
 				slog.DebugContext(ctx, "Skipping project inventory metrics", "error", countErr)
 			} else {
 				other := counts.TotalProjects - counts.RunningProjects - counts.StoppedProjects - counts.ArchivedProjects
