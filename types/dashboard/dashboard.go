@@ -128,9 +128,17 @@ type Snapshot struct {
 	Settings SnapshotSettings `json:"settings"`
 
 	// VersionInfo is the environment application version metadata when available.
+	// It is absent for docker-host environments, which run no Arcane instance of
+	// their own.
 	//
 	// Required: false
 	VersionInfo *versiontypes.Info `json:"versionInfo,omitempty"`
+
+	// DockerVersion is the Docker engine version of a docker-host environment,
+	// which the manager reads directly over the Docker API.
+	//
+	// Required: false
+	DockerVersion string `json:"dockerVersion,omitempty"`
 }
 
 type StreamEvent struct {

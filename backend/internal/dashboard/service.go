@@ -288,8 +288,20 @@ func (s *DashboardService) buildSnapshot(ctx context.Context, options DashboardA
 		return nil, err
 	}
 
-	var versionInfo *versiontypes.Info
-	if s.versionService != nil {
+	var (
+		versionInfo   *versiontypes.Info
+		dockerVersion string
+	)
+	if envcontext.IsDockerHostTarget(ctx) {
+		// A docker-host environment runs no Arcane agent, so there is no application version
+		// to report for it: the card shows the daemon version the manager talks to instead.
+		version, versionErr := s.dockerService.GetServerVersion(ctx)
+		if versionErr != nil {
+			slog.DebugContext(ctx, "Failed to read Docker version for dashboard snapshot", "error", versionErr)
+		} else {
+			dockerVersion = version
+		}
+	} else if s.versionService != nil {
 		versionInfo = s.versionService.GetAppVersionInfo(ctx)
 	}
 
@@ -310,6 +322,7 @@ func (s *DashboardService) buildSnapshot(ctx context.Context, options DashboardA
 		ActionItems:       *actionItems,
 		Settings:          dashboard.SnapshotSettings{},
 		VersionInfo:       versionInfo,
+		DockerVersion:     dockerVersion,
 	}, nil
 }
 

@@ -82,7 +82,11 @@
 					<div class="flex min-w-0 flex-wrap items-center gap-2">
 						<div class="max-w-full min-w-0 text-base font-semibold tracking-tight break-words">{environment.name}</div>
 						<Badge variant={roleBadge.variant} size="sm">{roleBadge.text}</Badge>
-						{#if versionInfo}
+						{#if isDockerHostEnvironment && overview.dockerVersion}
+							<Badge variant="gray" size="sm" mono title={m.common_docker_version()}>
+								{overview.dockerVersion}
+							</Badge>
+						{:else if versionInfo}
 							<div class="flex items-center">
 								{#if versionInfo.updateAvailable || debugUpgrade}
 									<ArcaneTooltip.Root>

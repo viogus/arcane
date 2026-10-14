@@ -20,9 +20,13 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/image"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/project"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/version"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 )
+
+// dockerHostServerVersionInternal is the Docker engine version the fake docker-host daemon reports.
+const dockerHostServerVersionInternal = "27.3.1"
 
 // newDockerHostTestServerInternal serves just enough of the Docker API to build a dashboard
 // snapshot, including the /_ping negotiation a docker-host client performs on first use.
@@ -39,6 +43,8 @@ func newDockerHostTestServerInternal(t *testing.T, containers []dockercontainer.
 
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case strings.HasSuffix(r.URL.Path, "/version"):
+			_ = json.NewEncoder(w).Encode(map[string]any{"Version": dockerHostServerVersionInternal, "ApiVersion": "1.41"})
 		case strings.HasSuffix(r.URL.Path, "/containers/json"):
 			_ = json.NewEncoder(w).Encode(containers)
 		case strings.HasSuffix(r.URL.Path, "/images/json"):
@@ -71,7 +77,7 @@ func newDashboardDockerHostTestServiceInternal(t *testing.T, localContainers []d
 		settingsSvc,
 		nil,
 		nil,
-		nil,
+		version.NewVersionService(nil, true, "2.16.0-test", "revision", nil, nil, nil, nil),
 		volume.NewVolumeService(db, nil, nil, nil, nil, nil, nil, nil, nil, nil),
 	)
 }
@@ -116,6 +122,10 @@ func TestDashboardSnapshotUsesDockerHostDaemon(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, remoteSnapshot.Containers.Counts.TotalContainers, "the environment-scoped context selects that environment's daemon")
 	require.Equal(t, 1, remoteSnapshot.Containers.Counts.RunningContainers)
+	require.Equal(t, dockerHostServerVersionInternal, remoteSnapshot.DockerVersion, "a docker-host environment reports its own daemon version")
+	require.Nil(t, remoteSnapshot.VersionInfo, "a docker-host environment runs no Arcane instance to report a version for")
+	require.Empty(t, localSnapshot.DockerVersion, "only docker-host targets report a daemon version")
+	require.NotNil(t, localSnapshot.VersionInfo, "the manager's own environment still reports the application version")
 }
 
 // TestDashboardHandler_StreamsDockerHostEnvironmentInProcess reproduces the reported bug: the

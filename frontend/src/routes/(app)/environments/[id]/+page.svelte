@@ -42,6 +42,7 @@
 	import { queryKeys } from '#lib/query/query-keys.js';
 	import { environmentManagementService } from '#lib/services/env-mgmt-service.js';
 	import { settingsService } from '#lib/services/settings-service.js';
+	import { systemService } from '#lib/services/system-service.js';
 	import { environmentStore } from '#lib/stores/environment.store.svelte.js';
 	import { featureStore } from '#lib/stores/features.store.svelte.js';
 	import type { Environment, EnvironmentStatus } from '#lib/types/environment.js';
@@ -97,18 +98,35 @@
 	let statusOverride = $state<EnvironmentStatus | null>(null);
 	let currentStatus = $derived(resolveEnvironmentStatus(runtimeEnvironment, statusOverride));
 	let isCurrentlyOnline = $derived(isEnvironmentOnline(runtimeEnvironment, statusOverride));
+	let isDockerHostEnvironment = $derived(
+		runtimeEnvironment.id !== '0' && !runtimeEnvironment.isEdge && !!runtimeEnvironment.dockerHost
+	);
 
 	const versionQuery = createQuery(() => {
 		const environmentId = environment.id;
 		return {
 			queryKey: queryKeys.system.versionInfo(environmentId),
 			queryFn: () => environmentManagementService.getVersion(environmentId),
-			enabled: environmentId !== '0' && isCurrentlyOnline,
+			enabled: environmentId !== '0' && !isDockerHostEnvironment && isCurrentlyOnline,
 			retry: false
 		};
 	});
 	const remoteVersion = $derived(versionQuery.data ?? null);
 	const isLoadingVersion = $derived(versionQuery.isFetching);
+
+	// A docker-host environment runs no Arcane of its own, so the version it reports is the
+	// Docker engine version the manager talks to directly.
+	const dockerInfoQuery = createQuery(() => {
+		const environmentId = environment.id;
+		return {
+			queryKey: queryKeys.system.dockerInfo(environmentId),
+			queryFn: () => systemService.getDockerInfoForEnvironment(environmentId),
+			enabled: isDockerHostEnvironment && isCurrentlyOnline,
+			retry: false
+		};
+	});
+	const dockerVersion = $derived(dockerInfoQuery.data?.ServerVersion ?? null);
+	const isLoadingDockerVersion = $derived(dockerInfoQuery.isFetching);
 
 	let isCurrentlyStandby = $derived(currentStatus === 'standby');
 	// Settings tabs stay listed while offline so the selected tab survives a temporary outage.
@@ -542,10 +560,6 @@
 	let directRemoteUrlChanged = $derived(
 		environment.id !== '0' && !environment.isEdge && formInputs.apiUrl.value !== environment.apiUrl
 	);
-	let isDockerHostEnvironment = $derived(
-		runtimeEnvironment.id !== '0' && !runtimeEnvironment.isEdge && !!runtimeEnvironment.dockerHost
-	);
-
 	beforeNavigate((navigation) => {
 		if (navigation.willUnload || (navigation.to && navigation.to.url.pathname !== navigation.from?.url.pathname)) {
 			clearAccessToken();
@@ -757,6 +771,9 @@
 			<EnvironmentStatusSummary
 				environment={runtimeEnvironment}
 				{currentStatus}
+				{dockerVersion}
+				isDockerHost={isDockerHostEnvironment}
+				{isLoadingDockerVersion}
 				{isLoadingVersion}
 				{remoteVersion}
 				{versionInformation}

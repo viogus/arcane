@@ -1,7 +1,7 @@
 {
 	"name": "arcane-frontend",
 	"private": true,
-	"version": "2.16.0",
+	"version": "2.16.0+cdf.2",
 	"type": "module",
 	"imports": {
 		"#lib/*": "./src/lib/*"

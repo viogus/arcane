@@ -39,9 +39,16 @@ export function buildOverviewSummary(items: DashboardEnvironmentOverview[]): Das
 }
 
 export function getRoleBadge(environment: Environment): { text: string; variant: 'primary' | 'gray' } {
-	return environment.id === LOCAL_DOCKER_ENVIRONMENT_ID
-		? { text: m.manager(), variant: 'primary' }
-		: { text: m.agent(), variant: 'gray' };
+	if (environment.id === LOCAL_DOCKER_ENVIRONMENT_ID) {
+		return { text: m.manager(), variant: 'primary' };
+	}
+
+	// A docker-host environment is spoken to directly over the Docker API; no Arcane agent runs there.
+	if (environment.dockerHost) {
+		return { text: m.docker_title(), variant: 'gray' };
+	}
+
+	return { text: m.agent(), variant: 'gray' };
 }
 
 export function getResolvedStatusLabel(environment: Environment): string {

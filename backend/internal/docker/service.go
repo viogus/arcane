@@ -527,6 +527,17 @@ func (s *DockerClientService) listNetworks(ctx context.Context) ([]network.Summa
 	})
 }
 
+// GetServerVersion returns the Docker engine version of the environment carried by ctx.
+func (s *DockerClientService) GetServerVersion(ctx context.Context) (string, error) {
+	return callAPI(ctx, s, func(apiCtx context.Context, dockerClient *client.Client) (string, error) {
+		version, err := dockerClient.ServerVersion(apiCtx, client.ServerVersionOptions{})
+		if err != nil {
+			return "", fmt.Errorf("failed to get Docker version: %w", err)
+		}
+		return version.Version, nil
+	})
+}
+
 // GetSnapshot builds a Docker snapshot for the environment carried by ctx; the caller selects the
 // environment through the context rather than a separate parameter.
 func (s *DockerClientService) GetSnapshot(ctx context.Context) (*dashboard.DockerSnapshot, error) {
