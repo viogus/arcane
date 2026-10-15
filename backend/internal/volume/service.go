@@ -162,6 +162,12 @@ func (s *VolumeService) BackupStorageMount(ctx context.Context, dockerClient *cl
 	return s.backup.StorageMount(ctx, dockerClient, target, readOnly)
 }
 
+// BackupRepositoryExists reports whether a local backup repository exists on this environment; when
+// it does not, no backup was ever stored here and local repository maintenance is a no-op.
+func (s *VolumeService) BackupRepositoryExists(ctx context.Context) (bool, error) {
+	return s.backup.LocalRepositoryExists(ctx)
+}
+
 // HasEnabledBackupPolicy reports whether a volume-level schedule takes precedence over centralized backups.
 func (s *VolumeService) HasEnabledBackupPolicy(ctx context.Context, volumeName string) (bool, error) {
 	return s.backup.HasEnabledBackupPolicy(ctx, volumeName)

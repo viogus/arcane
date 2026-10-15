@@ -730,6 +730,19 @@ func (s *Service) PruneLocalRepository(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Without the volume service the repository mount cannot be resolved; nothing to prune.
+	if s.volumeService == nil {
+		slog.DebugContext(ctx, "system service: skipping local repository prune; volume service unavailable")
+		return nil
+	}
+	exists, err := s.volumeService.BackupRepositoryExists(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		slog.DebugContext(ctx, "system service: skipping local repository prune; no local backup repository")
+		return nil
+	}
 	dockerClient, err := s.dockerService.GetClient(ctx)
 	if err != nil {
 		return err
