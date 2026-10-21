@@ -49,6 +49,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/vulnerability"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/vuln"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
@@ -173,6 +174,13 @@ func (s *Service) startPatch(
 	// the environment resolves to here, while ctx still carries the target.
 	// Empty means the manager's own daemon, whose host the process variable already holds.
 	scopedHost := s.dockerService.HostForContext(ctx)
+	// Copa resolves the daemon through DOCKER_HOST and Docker's own credential store, and neither
+	// carries the bearer token a docker-host environment may require. Refuse the patch instead of
+	// redirecting BuildKit at a daemon it cannot authenticate against.
+	if envcontext.DockerHostTokenFromContext(ctx) != "" {
+		return nil, nil, common.Classify(common.ErrUnavailable,
+			errors.New("image patching is not supported for a docker-host environment that requires a bearer token"))
+	}
 
 	var existing ImagePatchRecord
 	if recordID != "" {
