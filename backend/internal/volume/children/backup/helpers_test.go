@@ -332,3 +332,62 @@ func TestVolumeBackupContainerLifecycleWaitsForRunningComposeReplacement(t *test
 	require.Empty(t, remaining)
 	require.Equal(t, []string{"stop:old-id"}, operations)
 }
+
+func TestLocalRepositoryExists(t *testing.T) {
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    bool
+		wantErr bool
+	}{
+		{
+			name: "missing backup volume means no local repository",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusNotFound)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{"message": "get " + r.URL.Path + ": no such volume"}))
+			},
+			want: false,
+		},
+		{
+			name: "existing backup volume means local repository present",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"Name": "arcane-backups", "Driver": "local"}))
+			},
+			want: true,
+		},
+		{
+			name: "daemon failure is surfaced instead of guessing",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				assert.NoError(t, json.NewEncoder(w).Encode(map[string]string{"message": "daemon unavailable"}))
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(tt.handler)
+			t.Cleanup(server.Close)
+			dockerClient, err := client.New(client.WithHost(server.URL), client.WithAPIVersion("1.41"))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = dockerClient.Close() })
+
+			gormDB, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
+			require.NoError(t, err)
+			dockerService := docker.NewDockerClientService(t.Context(), &database.DB{DB: gormDB}, &config.Config{}, nil).WithClient(dockerClient)
+			service := NewService(Dependencies{Docker: dockerService, BackupVolumeName: "arcane-backups"})
+
+			got, err := service.LocalRepositoryExists(t.Context())
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got)
+		})
+	}
+}

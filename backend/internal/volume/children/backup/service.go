@@ -702,6 +702,14 @@ func (s *Service) deleteRusticBackups(ctx context.Context, entries []*volume.Bac
 
 // PruneLocalRepository frees the data of deleted local volume backups once Rustic's keep-delete window passes.
 func (s *Service) PruneLocalRepository(ctx context.Context) error {
+	exists, err := s.LocalRepositoryExists(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		slog.DebugContext(ctx, "volume service: skipping local repository prune; no local backup repository", "backupVolume", s.deps.BackupVolumeName)
+		return nil
+	}
 	dockerClient, err := s.deps.Docker.GetClient(ctx)
 	if err != nil {
 		return err
