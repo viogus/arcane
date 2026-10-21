@@ -705,6 +705,9 @@ func (s *WebhookService) dockerHostActionContextInternal(ctx context.Context, en
 	return envcontext.WithTarget(ctx, envcontext.Target{
 		EnvironmentID: env.ID,
 		DockerHost:    env.DockerHostURL(),
+		// A tunnel in front of the daemon rejects unauthenticated calls, and this path rebuilds the
+		// target from the stored row, so the token has to be decrypted here too.
+		DockerHostToken: env.DecryptedDockerHostToken(ctx),
 	}), true
 }
 

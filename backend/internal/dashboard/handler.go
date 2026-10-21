@@ -333,6 +333,9 @@ func (h *DashboardHandler) fetchInProcessDashboardSnapshotInternal(ctx context.C
 	envCtx := envcontext.WithTarget(ctx, envcontext.Target{
 		EnvironmentID: environmentID,
 		DockerHost:    localEnvironment.DockerHostURL(),
+		// The daemon behind a tunnel needs its bearer token; this target is rebuilt from the stored
+		// environment, not carried over from a request.
+		DockerHostToken: localEnvironment.DecryptedDockerHostToken(ctx),
 	})
 
 	snapshot, err := h.dashboardService.GetSnapshot(envCtx, DashboardActionItemsOptions{
