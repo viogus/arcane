@@ -50,6 +50,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/rustic"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/entityjobs"
@@ -408,6 +409,9 @@ func (s *Service) recoveryKey(ctx context.Context, supplied string) (string, err
 }
 
 func (s *Service) CreateBackup(ctx context.Context, user usertypes.Actor, trigger string, request backuptypes.CreateSystemBackupRequest) (*backuptypes.SystemBackupRun, error) {
+	if rustic.Disabled() {
+		return nil, rustic.ErrDisabled
+	}
 	lease, err := s.acquireRun(ctx)
 	if err != nil {
 		return nil, err
@@ -422,6 +426,9 @@ func (s *Service) CreateBackup(ctx context.Context, user usertypes.Actor, trigge
 
 // prepareBackup resolves the run's destinations from its policy or destination enum, creates the run row, and records its checkpoint.
 func (s *Service) prepareBackup(ctx context.Context, trigger string, request backuptypes.CreateSystemBackupRequest) (*preparedSystemBackup, error) {
+	if rustic.Disabled() {
+		return nil, rustic.ErrDisabled
+	}
 	if !s.SupportedDatabaseProvider() {
 		return nil, errors.New("arcane system recovery currently requires the SQLite database provider")
 	}
@@ -1574,6 +1581,9 @@ func (s *Service) projectsSetting(ctx context.Context) string {
 
 // StartBackup prepares a manual backup, then submits its workflow.
 func (s *Service) StartBackup(ctx context.Context, user usertypes.Actor, request backuptypes.CreateSystemBackupRequest) (*backuptypes.SystemBackupRun, error) {
+	if rustic.Disabled() {
+		return nil, rustic.ErrDisabled
+	}
 	requester := backup.NewRequester(ctx, user, "0", authz.PermSystemBackupsManage)
 	if err := s.engine.Authorize(ctx, requester); err != nil {
 		return nil, err

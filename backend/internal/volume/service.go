@@ -318,9 +318,13 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 				Pluck("remote_snapshot_id", &knownIDs).Error
 			return knownIDs, err
 		},
+		// Scoped to the environment: the manager's database is shared, so another environment's runs
+		// must not make this one start a Rustic helper against a repository it never created.
 		CountLocal: func(ctx context.Context) (int64, error) {
 			var count int64
-			err := s.db.WithContext(ctx).Model(&VolumeBackup{}).Where("local_snapshot_id <> ''").Count(&count).Error
+			err := s.db.WithContext(ctx).Model(&VolumeBackup{}).
+				Where("environment_id = ? AND local_snapshot_id <> ''", volumeBackupEnvironmentID(ctx)).
+				Count(&count).Error
 			return count, err
 		},
 	}

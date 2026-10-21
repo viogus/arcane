@@ -42,6 +42,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
 	activitylib "github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/activity"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/rustic"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/volumehelper"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow"
@@ -325,6 +326,9 @@ func (s *Service) resolveBackupPlan(ctx context.Context, volumeName, trigger str
 }
 
 func (s *Service) CreateBackup(ctx context.Context, volumeName string, user usertypes.Actor, trigger string, request volume.CreateBackupRequest) (*volume.Backup, error) {
+	if rustic.Disabled() {
+		return nil, rustic.ErrDisabled
+	}
 	trigger = cmp.Or(trigger, backuptypes.VolumeBackupTriggerManual)
 	plan, err := s.resolveBackupPlan(ctx, volumeName, trigger, request, nil)
 	if err != nil {
@@ -340,6 +344,9 @@ func (s *Service) CreateBackup(ctx context.Context, volumeName string, user user
 
 // CreateSystemManagedBackup runs the existing volume backup workflow with a transient centralized policy.
 func (s *Service) CreateSystemManagedBackup(ctx context.Context, volumeName string, user usertypes.Actor, trigger, policyID string, policy backuptypes.UpdateBackupPolicy) (*volume.Backup, error) {
+	if rustic.Disabled() {
+		return nil, rustic.ErrDisabled
+	}
 	if !strings.HasPrefix(policyID, backuptypes.SystemVolumePolicyPrefix) {
 		return nil, errors.New("invalid system-managed volume backup policy id")
 	}
@@ -369,6 +376,9 @@ func (s *Service) CreateSystemManagedBackup(ctx context.Context, volumeName stri
 
 // prepareBackup admits the run, persists its row, and records plan (now carrying the row ID) as the checkpoint.
 func (s *Service) prepareBackup(ctx context.Context, volumeName, trigger, policyID string, plan *backupPlan) (*volume.Backup, *runs.Lease, error) {
+	if rustic.Disabled() {
+		return nil, nil, rustic.ErrDisabled
+	}
 	lease, err := s.acquireVolumeRun(ctx, volumeName)
 	if err != nil {
 		return nil, nil, err
@@ -957,6 +967,9 @@ func (s *Service) MigrateRepositoryPasswords(ctx context.Context, previousKey, n
 
 // StartBackup persists a running backup and submits its workflow.
 func (s *Service) StartBackup(ctx context.Context, environmentID, volumeName string, user usertypes.Actor, request volume.CreateBackupRequest) (volume.BackupEntry, error) {
+	if rustic.Disabled() {
+		return volume.BackupEntry{}, rustic.ErrDisabled
+	}
 	plan, err := s.resolveBackupPlan(ctx, volumeName, backuptypes.VolumeBackupTriggerManual, request, nil)
 	if err != nil {
 		return volume.BackupEntry{}, err

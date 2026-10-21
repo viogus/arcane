@@ -73,6 +73,11 @@ func runRestoreInternal(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("inspect Arcane container: %w", err)
 	}
+	if rusticruntime.Disabled() {
+		// The helper stages every restore through Rustic, so a disabled engine has
+		// nothing to pull or run; fail before Arcane is stopped.
+		return rusticruntime.ErrDisabled
+	}
 	if _, imageInspectErr := dockerClient.ImageInspect(ctx, rusticImage); imageInspectErr != nil {
 		reader, pullErr := dockerClient.ImagePull(ctx, rusticImage, client.ImagePullOptions{})
 		if pullErr != nil {

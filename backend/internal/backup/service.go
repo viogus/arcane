@@ -599,6 +599,9 @@ func (e *Engine) RekeyRepositories(ctx context.Context, dockerClient *client.Cli
 // Replicate copies one snapshot into another repository through a temporary volume, never the live data.
 // Rustic's native `copy` needs a TOML profile for the target, which the env-only Repository cannot express.
 func (e *Engine) Replicate(ctx context.Context, dockerClient *client.Client, from Repository, fromSnapshotID string, to Repository, password, label string, tags ...string) (Snapshot, error) {
+	if rustic.Disabled() {
+		return Snapshot{}, rustic.ErrDisabled
+	}
 	temporaryVolume := "arcane-rustic-copy-" + uuid.New().String()
 	if _, err := dockerClient.VolumeCreate(ctx, client.VolumeCreateOptions{Name: temporaryVolume, Labels: volumehelper.Labels()}); err != nil {
 		return Snapshot{}, fmt.Errorf("failed to create temporary Rustic copy volume: %w", err)
@@ -626,6 +629,9 @@ func (e *Engine) Replicate(ctx context.Context, dockerClient *client.Client, fro
 }
 
 func (e *Engine) run(ctx context.Context, dockerClient *client.Client, repository Repository, password string, command []string, extraMounts ...mount.Mount) (string, error) {
+	if rustic.Disabled() {
+		return "", rustic.ErrDisabled
+	}
 	unlock, err := e.lockRepository(ctx, repository.ID)
 	if err != nil {
 		return "", err
@@ -636,6 +642,11 @@ func (e *Engine) run(ctx context.Context, dockerClient *client.Client, repositor
 
 // runContainer runs one Rustic command; callers hold the repository lock.
 func (e *Engine) runContainer(ctx context.Context, dockerClient *client.Client, repository Repository, password string, command []string, extraMounts ...mount.Mount) (string, error) {
+	// Check the kill switch before the inspect so a disabled engine never pulls
+	// the Rustic image or provisions its cache volume.
+	if rustic.Disabled() {
+		return "", rustic.ErrDisabled
+	}
 	if _, err := dockerClient.ImageInspect(ctx, rustic.DefaultImage); err != nil {
 		if pullErr := e.imageService.PullImage(ctx, rustic.DefaultImage, io.Discard, user.SystemUser, nil); pullErr != nil {
 			return "", fmt.Errorf("failed to pull official Rustic image: %w", pullErr)
