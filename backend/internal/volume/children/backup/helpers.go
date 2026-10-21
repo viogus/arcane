@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/containerd/errdefs"
 	usertypes "github.com/getarcaneapp/arcane/types/v2/user"
 	"github.com/getarcaneapp/arcane/types/v2/volume"
 	"github.com/moby/moby/api/types/container"
@@ -111,6 +112,32 @@ func (s *Service) StorageMount(ctx context.Context, dockerClient *client.Client,
 		}
 	}
 	return mount.Mount{Type: mount.TypeVolume, Source: s.deps.BackupVolumeName, Target: target, ReadOnly: readOnly}, nil
+}
+
+// LocalRepositoryExists reports whether a local backup repository is present on this environment.
+// A missing repository means no backup was ever stored here, so repository maintenance has nothing
+// to do and must not start a Rustic helper container: starting one would pull the Rustic image.
+func (s *Service) LocalRepositoryExists(ctx context.Context) (bool, error) {
+	dockerClient, err := s.deps.Docker.GetClient(ctx)
+	if err != nil {
+		return false, err
+	}
+	if dockerClient == nil {
+		return false, nil
+	}
+	// A repository mirrored from Arcane's own /backups mount lives on a host path, so treat it as
+	// present instead of guessing from the named volume.
+	if inspect, inspectErr := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient); inspectErr == nil &&
+		docker.MountForDestination(inspect.Mounts, "/backups", "/repository") != nil {
+		return true, nil
+	}
+	if _, inspectErr := dockerClient.VolumeInspect(ctx, s.deps.BackupVolumeName, client.VolumeInspectOptions{}); inspectErr != nil {
+		if errdefs.IsNotFound(inspectErr) {
+			return false, nil
+		}
+		return false, inspectErr
+	}
+	return true, nil
 }
 
 func (s *Service) stopRunningContainersForBackup(ctx context.Context, volumeName string, user usertypes.Actor, refuseArcaneWriters bool) ([]container.Summary, error) {

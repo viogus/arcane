@@ -909,6 +909,14 @@ func (s *Service) PruneLocalRepository(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	exists, err := s.volumeService.BackupRepositoryExists(ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		slog.DebugContext(ctx, "system service: skipping local repository prune; no local backup repository")
+		return nil
+	}
 	dockerClient, err := s.dockerService.GetClient(ctx)
 	if err != nil {
 		return err
