@@ -249,9 +249,9 @@ func TestDashboardService_GetSnapshot_ReturnsDashboardSnapshot(t *testing.T) {
 
 	require.ElementsMatch(t, []dashboard.ActionItem{
 		{Kind: dashboard.ActionItemKindStoppedContainers, Count: 1, Severity: dashboard.ActionItemSeverityWarning},
-		{Kind: dashboard.ActionItemKindImageUpdates, Count: 3, Severity: dashboard.ActionItemSeverityWarning},
+		{Kind: dashboard.ActionItemKindImageUpdates, Count: 2, Severity: dashboard.ActionItemSeverityWarning},
 		{Kind: dashboard.ActionItemKindExpiringKeys, Count: 1, Severity: dashboard.ActionItemSeverityWarning},
-	}, snapshot.ActionItems.Items, "the excluded stopped container, the moving-tag container, and the project each count once")
+	}, snapshot.ActionItems.Items, "the excluded stopped container and the moving-tag container each count once; a project with no containers in this environment is not counted")
 }
 
 func TestDashboardService_GetSnapshot_DebugAllGoodOnlyClearsActionItems(t *testing.T) {

@@ -2448,12 +2448,19 @@ func (s *ProjectService) CountProjectsWithPendingUpdates(ctx context.Context, al
 		}
 	}
 
-	// Runtime container IDs keep tag-policy updates scoped to their project.
+	// Project records are global to the manager, so only stacks this environment runs can
+	// report an update here; counting the rest repeats every project in each environment.
+	// Runtime container IDs also keep tag-policy updates scoped to their project.
+	deployed := make([]Project, 0, len(activeProjects))
 	details := make([]projecttypes.Details, 0, len(activeProjects))
 	containersByProject := listing.GroupComposeContainersByProject(allContainers)
 	for _, proj := range activeProjects {
-		var runtimeServices []projecttypes.RuntimeService
-		for _, c := range listing.ProjectContainers(projectRecord(proj), containersByProject) {
+		projectContainers := listing.ProjectContainers(projectRecord(proj), containersByProject)
+		if len(projectContainers) == 0 {
+			continue
+		}
+		runtimeServices := make([]projecttypes.RuntimeService, 0, len(projectContainers))
+		for _, c := range projectContainers {
 			runtimeServices = append(runtimeServices, projecttypes.RuntimeService{
 				Name:            docker.ComposeServiceLabel(c.Labels),
 				ContainerID:     c.ID,
@@ -2462,10 +2469,11 @@ func (s *ProjectService) CountProjectsWithPendingUpdates(ctx context.Context, al
 				ContainerLabels: c.Labels,
 			})
 		}
+		deployed = append(deployed, proj)
 		details = append(details, projecttypes.Details{ID: proj.ID, RuntimeServices: runtimeServices})
 	}
 	count := 0
-	for _, d := range s.enrichProjectsWithUpdateInfo(ctx, activeProjects, details, false, nil) {
+	for _, d := range s.enrichProjectsWithUpdateInfo(ctx, deployed, details, false, nil) {
 		if kit.FromPtr(d.UpdateInfo).HasUpdate {
 			count++
 		}
