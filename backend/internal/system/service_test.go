@@ -241,7 +241,7 @@ func TestSystemBackupPoliciesRegisterIndependentJobs(t *testing.T) {
 		nil,
 		nil,
 		nil,
-		backup.NewEngine(gate, nil),
+		backup.NewEngine(gate, nil, false),
 		s3Destinations,
 		recoveryKeys,
 		nil,

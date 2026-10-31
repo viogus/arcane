@@ -240,7 +240,7 @@ func (h *DashboardHandler) runRemoteDashboardStreamPollerInternal(ctx context.Co
 		if currentEnvironment.IsDockerHost() {
 			// A docker-host environment is served in-process by the manager, so there is no agent
 			// endpoint to proxy to: build the snapshot against that environment's daemon instead.
-			snapshot, err = h.fetchInProcessDashboardSnapshotInternal(pollCtx, environmentID, currentEnvironment, debugAllGood)
+			snapshot, err = h.fetchInProcessDashboardSnapshotInternal(pollCtx, currentEnvironment, debugAllGood)
 		} else {
 			snapshot, err = h.fetchRemoteDashboardSnapshotInternal(pollCtx, currentEnvironment, debugAllGood)
 			if err != nil && isDashboardEndpointMissingInternal(err) {
@@ -329,7 +329,11 @@ func (h *DashboardHandler) fetchRemoteDashboardSnapshotInternal(ctx context.Cont
 // itself over the Docker API (a docker-host environment). There is no agent to proxy to, so the
 // snapshot comes from the same service the REST handler uses, with the target environment carried
 // through the context so the snapshot is taken against that environment's daemon.
-func (h *DashboardHandler) fetchInProcessDashboardSnapshotInternal(ctx context.Context, environmentID string, localEnvironment environment.Environment, debugAllGood bool) (*dashboard.Snapshot, error) {
+func (h *DashboardHandler) fetchInProcessDashboardSnapshotInternal(
+	ctx context.Context,
+	localEnvironment environment.Environment,
+	debugAllGood bool,
+) (*dashboard.Snapshot, error) {
 	envCtx := envcontext.WithTarget(ctx, localEnvironment.RuntimeTarget(ctx))
 
 	snapshot, err := h.dashboardService.GetSnapshot(envCtx, DashboardActionItemsOptions{

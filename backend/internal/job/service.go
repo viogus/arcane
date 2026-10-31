@@ -676,8 +676,8 @@ func (s *JobService) Submit(ctx context.Context, request scheduler.Request) (sch
 		// A docker-host environment is served by this process, so its jobs are validated and
 		// executed like local work instead of being handed to an agent.
 		case env.IsDockerHost():
-			if err := s.validateLocalJob(ctx, request.JobID); err != nil {
-				return scheduler.Run{}, err
+			if validateErr := s.validateLocalJob(ctx, request.JobID); validateErr != nil {
+				return scheduler.Run{}, validateErr
 			}
 		case !dynamicRemote && (!ok || metadata.ManagerOnly || !metadata.CanRunManually):
 			return scheduler.Run{}, errors.New("job is not remotely runnable")

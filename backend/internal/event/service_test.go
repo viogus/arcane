@@ -382,7 +382,7 @@ func TestIngestAgentEventAuthenticatedEnvironment(t *testing.T) {
 			require.Equal(t, "remote-environment", *recorded.EnvironmentID)
 			require.Equal(t, "System", *recorded.Username)
 			require.Equal(t, req.Metadata, recorded.Metadata)
-			require.False(t, svc.ShouldSuppressDaemonEvent(context.Background(), "container", "container-id", "web", "demo"))
+			require.False(t, svc.ShouldSuppressDaemonEvent(t.Context(), "container", "container-id", "web", "demo"))
 			var persisted Event
 			require.NoError(t, db.First(&persisted).Error)
 			require.Equal(t, "remote-environment", *persisted.EnvironmentID)
@@ -395,7 +395,7 @@ func TestIngestAgentEventAuthenticatedEnvironment(t *testing.T) {
 			recorded, err = svc.IngestAgentEvent(t.Context(), "remote-environment", req)
 			require.NoError(t, err)
 			require.Equal(t, "operator", *recorded.Username)
-			require.False(t, svc.ShouldSuppressDaemonEvent(context.Background(), "container", "container-id", "web", "demo"))
+			require.False(t, svc.ShouldSuppressDaemonEvent(t.Context(), "container", "container-id", "web", "demo"))
 		})
 	}
 }
@@ -751,7 +751,7 @@ func TestDaemonSuppressionAndFailureAllowLaterObservations(t *testing.T) {
 				}))
 			}
 			if !failure {
-				svc.MarkDockerExpectation(context.Background(), "container", "web", "")
+				svc.MarkDockerExpectation(t.Context(), "container", "web", "")
 			}
 			svc.RecordDockerEvent(t.Context(), msg)
 			require.NoError(t, svc.Stop(t.Context()))
@@ -918,7 +918,7 @@ func TestCreateEventCorrelationEligibility(t *testing.T) {
 				},
 			)
 			require.NoError(t, err)
-			require.Equal(t, tc.want, svc.ShouldSuppressDaemonEvent(context.Background(), strings.SplitN(string(tc.eventType), ".", 2)[0], "id", "", ""))
+			require.Equal(t, tc.want, svc.ShouldSuppressDaemonEvent(t.Context(), strings.SplitN(string(tc.eventType), ".", 2)[0], "id", "", ""))
 		})
 	}
 }

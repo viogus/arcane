@@ -29,7 +29,7 @@ import (
 func Run(ctx context.Context, dockerClient *client.Client, password string, command, environment []string, mounts []mount.Mount, networkMode container.NetworkMode) (string, error) {
 	// Last line of defence: even a caller that skipped its own check must not
 	// provision the cache volume or start a container while the engine is off.
-	if Disabled() {
+	if DisabledFromEnv() {
 		return "", ErrDisabled
 	}
 	if _, err := dockerClient.VolumeCreate(ctx, client.VolumeCreateOptions{Name: CacheVolume, Labels: volumehelper.Labels()}); err != nil {

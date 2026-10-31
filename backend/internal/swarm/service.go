@@ -154,6 +154,11 @@ func (s *SwarmService) GetSwarmInfo(ctx context.Context) (*swarmtypes.SwarmInfo,
 }
 
 func (s *SwarmService) InitSwarm(ctx context.Context, req swarmtypes.SwarmInitRequest) (*swarmtypes.SwarmInitResponse, error) {
+	if !req.ForceNewCluster {
+		if err := s.ensureSwarmInactive(ctx); err != nil {
+			return nil, err
+		}
+	}
 	spec, err := decodeSwarmSpec(req.Spec)
 	if err != nil {
 		return nil, err
@@ -205,6 +210,10 @@ func (s *SwarmService) JoinSwarm(ctx context.Context, req swarmtypes.SwarmJoinRe
 // persisting the manager's global swarm flag. nodes.Service uses it to join a
 // docker-host environment in-process against that environment's own daemon.
 func (s *SwarmService) joinSwarmInternal(ctx context.Context, req swarmtypes.SwarmJoinRequest) error {
+	if err := s.ensureSwarmInactive(ctx); err != nil {
+		return err
+	}
+
 	if _, swarmJoinErr := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.SwarmJoinResult, error) {
 		return dockerClient.SwarmJoin(ctx, client.SwarmJoinOptions{
 			ListenAddr:    cmp.Or(strings.TrimSpace(req.ListenAddr), defaultSwarmListenAddr),
@@ -459,6 +468,19 @@ func (s *SwarmService) ensureSwarmActive(ctx context.Context) (system.Info, erro
 		return system.Info{}, common.Classify(common.ErrSwarmNotEnabled, errors.New("Swarm mode is not enabled")) //nolint:staticcheck // Preserve the existing error message.
 	}
 	return info, nil
+}
+
+func (s *SwarmService) ensureSwarmInactive(ctx context.Context) error {
+	info, err := s.getDockerInfo(ctx)
+	if err != nil {
+		return err
+	}
+	switch info.Swarm.LocalNodeState {
+	case swarm.LocalNodeStateActive, swarm.LocalNodeStatePending, swarm.LocalNodeStateLocked:
+		return common.Classify(common.ErrConflict, errors.New("this node is already part of a swarm"))
+	default:
+		return nil
+	}
 }
 
 func (s *SwarmService) getDockerInfo(ctx context.Context) (system.Info, error) {

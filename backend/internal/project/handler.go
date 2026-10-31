@@ -405,7 +405,7 @@ func (h *ProjectHandler) DownProject(ctx context.Context, input *DownProjectInpu
 			if errors.Is(err, common.ErrProjectArchived) || errors.Is(err, common.ErrProjectEnvUnreadable) {
 				return huma.Error400BadRequest(err.Error())
 			}
-			return huma.Error500InternalServerError("Failed to bring down project: " + err.Error())
+			return huma.NewError(common.ToAPIError(err).HTTPStatus(), "Failed to bring down project: "+err.Error())
 		},
 	})
 }
@@ -588,7 +588,7 @@ func (h *ProjectHandler) DestroyProject(ctx context.Context, input *DestroyProje
 			return h.projectService.DestroyProject(runtimeCtx, projectID, mo.PointerToOption(kit.FromPtr(input.Body).RemoveFiles).OrElse(true), kit.FromPtr(input.Body).RemoveVolumes, user)
 		},
 		Error: func(err error) error {
-			return huma.Error500InternalServerError("Failed to destroy project: " + err.Error())
+			return huma.NewError(common.ToAPIError(err).HTTPStatus(), "Failed to destroy project: "+err.Error())
 		},
 	})
 }
@@ -677,6 +677,7 @@ func (h *ProjectHandler) UpdateProject(ctx context.Context, input *UpdateProject
 				IsArchived:         details.IsArchived,
 				HasBuildDirective:  details.HasBuildDirective,
 				RedeployDisabled:   details.RedeployDisabled,
+				DeployedHere:       details.DeployedHere,
 				ConfigurationError: details.ConfigurationError,
 			},
 		},
@@ -797,7 +798,7 @@ func (h *ProjectHandler) ArchiveProject(ctx context.Context, input *ArchiveProje
 		if errors.Is(archiveProjectErr, common.ErrProjectMustBeStopped) {
 			return nil, huma.Error400BadRequest(archiveProjectErr.Error())
 		}
-		return nil, huma.Error500InternalServerError("Failed to archive project: " + archiveProjectErr.Error())
+		return nil, huma.NewError(common.ToAPIError(archiveProjectErr).HTTPStatus(), "Failed to archive project: "+archiveProjectErr.Error())
 	}
 
 	return handlerutil.MessageOutput("Project archived successfully", ""), nil
@@ -814,7 +815,7 @@ func (h *ProjectHandler) UnarchiveProject(ctx context.Context, input *UnarchiveP
 	}
 
 	if unarchiveProjectErr := h.projectService.UnarchiveProject(ctx, input.ProjectID, *user); unarchiveProjectErr != nil {
-		return nil, huma.Error500InternalServerError("Failed to unarchive project: " + unarchiveProjectErr.Error())
+		return nil, huma.NewError(common.ToAPIError(unarchiveProjectErr).HTTPStatus(), "Failed to unarchive project: "+unarchiveProjectErr.Error())
 	}
 
 	return handlerutil.MessageOutput("Project unarchived successfully", ""), nil

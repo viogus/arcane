@@ -127,8 +127,14 @@ func TestDaemonSuppressionIsScopedToEnvironment(t *testing.T) {
 	require.False(t, svc.ShouldSuppressDaemonEvent(t.Context(), "container", containerID, "web", ""))
 
 	// The daemon that was not acted on still reports its container; the acted-on daemon does not.
-	svc.RecordDockerEvent(scopedA, events.Message{Type: events.ContainerEventType, Action: events.ActionStart, TimeNano: 1, Actor: events.Actor{ID: containerID, Attributes: map[string]string{"name": "web"}}})
-	svc.RecordDockerEvent(scopedB, events.Message{Type: events.ContainerEventType, Action: events.ActionStart, TimeNano: 2, Actor: events.Actor{ID: containerID, Attributes: map[string]string{"name": "web"}}})
+	svc.RecordDockerEvent(scopedA, events.Message{
+		Type: events.ContainerEventType, Action: events.ActionStart, TimeNano: 1,
+		Actor: events.Actor{ID: containerID, Attributes: map[string]string{"name": "web"}},
+	})
+	svc.RecordDockerEvent(scopedB, events.Message{
+		Type: events.ContainerEventType, Action: events.ActionStart, TimeNano: 2,
+		Actor: events.Actor{ID: containerID, Attributes: map[string]string{"name": "web"}},
+	})
 	// The daemon event writer batches rows and flushes on its own goroutine, so poll instead of
 	// assuming the flush lands within one interval: a loaded machine can delay it.
 	var rows []Event
@@ -136,7 +142,7 @@ func TestDaemonSuppressionIsScopedToEnvironment(t *testing.T) {
 	require.Eventually(t, func() bool {
 		rows = nil
 		daemonEnvironmentIDs = daemonEnvironmentIDs[:0]
-		if err := db.Find(&rows).Error; err != nil {
+		if findErr := db.Find(&rows).Error; findErr != nil {
 			return false
 		}
 		for _, row := range rows {
@@ -220,7 +226,10 @@ func TestSubscribeDockerHostEnvironmentEventsReconciles(t *testing.T) {
 		provider.setEnabledIDs([]string{dockerHostEnvironmentAInternal})
 		time.Sleep(2 * dockerHostEventReconcileInterval)
 		busB.Publish(events.Message{Type: events.ContainerEventType, Action: events.ActionStart, TimeNano: 3, Actor: events.Actor{ID: "container-b", Attributes: map[string]string{"name": "web"}}})
-		busA.Publish(events.Message{Type: events.ImageEventType, Action: events.ActionPull, TimeNano: 4, Actor: events.Actor{ID: "sha256:" + strings.Repeat("ab", 32), Attributes: map[string]string{"name": "nginx:latest"}}})
+		busA.Publish(events.Message{
+			Type: events.ImageEventType, Action: events.ActionPull, TimeNano: 4,
+			Actor: events.Actor{ID: "sha256:" + strings.Repeat("ab", 32), Attributes: map[string]string{"name": "nginx:latest"}},
+		})
 		synctest.Wait()
 		time.Sleep(daemonEventFlushInterval)
 		synctest.Wait()

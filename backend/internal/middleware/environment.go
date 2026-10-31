@@ -158,10 +158,7 @@ func (m *EnvironmentMiddleware) Handle(c *echo.Context, next echo.HandlerFunc) e
 		// environment is still scoped to that daemon: handlers read the target from the context to
 		// serve it in-process instead of forwarding to an agent that does not exist.
 		if resolution, resolveErr := m.resolver(ctx, envID); resolveErr == nil && resolution.DockerHost != "" {
-			c.SetRequest(req.WithContext(envcontext.WithTarget(ctx, envcontext.Target{
-				EnvironmentID: envID,
-				DockerHost:    resolution.DockerHost,
-			})))
+			scopeContextToEnvironmentInternal(c, req, envID, resolution.DockerHost)
 		}
 		return next(c)
 	}
@@ -180,22 +177,7 @@ func (m *EnvironmentMiddleware) Handle(c *echo.Context, next echo.HandlerFunc) e
 		}
 	}
 
-	// SECURITY: forwarded identity headers are always cleared first; only server-resolved values are sent.
-	req.Header.Del(HeaderIconCatalog)
-	if user != nil && user.Preferences.IconCatalog != nil && *user.Preferences.IconCatalog != "" {
-		req.Header.Set(HeaderIconCatalog, *user.Preferences.IconCatalog)
-	}
-	req.Header.Del(HeaderUpdateInitiatorID)
-	req.Header.Del(HeaderUpdateInitiatorName)
-	req.Header.Del(HeaderUpdateInitiatorDisplayName)
-	isContainerUpdate := req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/containers/") && strings.HasSuffix(req.URL.Path, "/update")
-	if isContainerUpdate && user != nil && user.ID != "" {
-		req.Header.Set(HeaderUpdateInitiatorID, user.ID)
-		req.Header.Set(HeaderUpdateInitiatorName, user.Username)
-		if user.DisplayName != nil {
-			req.Header.Set(HeaderUpdateInitiatorDisplayName, *user.DisplayName)
-		}
-	}
+	applyForwardedIdentityHeadersInternal(req, user)
 
 	resolution, err := m.resolver(ctx, envID)
 	if err != nil {
@@ -209,10 +191,7 @@ func (m *EnvironmentMiddleware) Handle(c *echo.Context, next echo.HandlerFunc) e
 	// daemon's Docker API, exactly like the local environment. Authorization is enforced by the
 	// regular route stack, whose env-scoped permissions resolve the same id from the request path.
 	if resolution.DockerHost != "" {
-		c.SetRequest(req.WithContext(envcontext.WithTarget(ctx, envcontext.Target{
-			EnvironmentID: envID,
-			DockerHost:    resolution.DockerHost,
-		})))
+		scopeContextToEnvironmentInternal(c, req, envID, resolution.DockerHost)
 		return next(c)
 	}
 
@@ -304,6 +283,12 @@ func (m *EnvironmentMiddleware) Handle(c *echo.Context, next echo.HandlerFunc) e
 	edge.SetAgentToken(proxyReq, accessToken)
 	edge.SetForwardedHeaders(proxyReq, c.RealIP(), req.Host)
 
+	if requestBody != nil {
+		if fullDuplexErr := http.NewResponseController(c.Response()).EnableFullDuplex(); fullDuplexErr != nil {
+			slog.DebugContext(ctx, "Failed to enable full duplex for proxied request", "error", fullDuplexErr)
+		}
+	}
+
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		netErr, isNetErr := errors.AsType[net.Error](err)
@@ -351,6 +336,36 @@ func (m *EnvironmentMiddleware) activeTunnel(ctx context.Context, envID, apiURL 
 	}
 	slog.InfoContext(ctx, "Recovered edge tunnel during request", "environmentId", envID)
 	return tunnel, false
+}
+
+// applyForwardedIdentityHeadersInternal rebuilds the identity headers a remote agent may trust.
+// SECURITY: every forwarded value is cleared first so only server-resolved values are sent.
+func applyForwardedIdentityHeadersInternal(req *http.Request, user *usertypes.Actor) {
+	req.Header.Del(HeaderIconCatalog)
+	if user != nil && user.Preferences.IconCatalog != nil && *user.Preferences.IconCatalog != "" {
+		req.Header.Set(HeaderIconCatalog, *user.Preferences.IconCatalog)
+	}
+	req.Header.Del(HeaderUpdateInitiatorID)
+	req.Header.Del(HeaderUpdateInitiatorName)
+	req.Header.Del(HeaderUpdateInitiatorDisplayName)
+	isContainerUpdate := req.Method == http.MethodPost && strings.Contains(req.URL.Path, "/containers/") && strings.HasSuffix(req.URL.Path, "/update")
+	if !isContainerUpdate || user == nil || user.ID == "" {
+		return
+	}
+	req.Header.Set(HeaderUpdateInitiatorID, user.ID)
+	req.Header.Set(HeaderUpdateInitiatorName, user.Username)
+	if user.DisplayName != nil {
+		req.Header.Set(HeaderUpdateInitiatorDisplayName, *user.DisplayName)
+	}
+}
+
+// scopeContextToEnvironmentInternal points the request at the daemon a docker-host environment
+// owns, so handlers serve it in-process instead of forwarding to an agent that does not exist.
+func scopeContextToEnvironmentInternal(c *echo.Context, req *http.Request, envID, dockerHost string) {
+	c.SetRequest(req.WithContext(envcontext.WithTarget(req.Context(), envcontext.Target{
+		EnvironmentID: envID,
+		DockerHost:    dockerHost,
+	})))
 }
 
 // proxyPermissionStatus returns http.StatusOK when the caller may perform the proxied request, mirroring local

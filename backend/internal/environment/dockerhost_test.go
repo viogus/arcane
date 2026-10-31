@@ -6,10 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/moby/moby/client"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
@@ -42,7 +41,7 @@ func TestEnvironmentService_EnvironmentEventBusServesOnlyDockerHostEnvironments(
 	t.Cleanup(server.Close)
 
 	dockerService := docker.NewDockerClientService(ctx, nil, &config.Config{DockerHost: "unix:///var/run/docker.sock"}, nil)
-	t.Cleanup(dockerService.Close)
+	t.Cleanup(func() { dockerService.Close(t.Context()) })
 	service := NewEnvironmentService(db, nil, dockerService, nil, nil, nil)
 
 	dockerHost := server.URL
@@ -167,9 +166,9 @@ func TestApplyDockerHostUpdateInternal(t *testing.T) {
 		updates := map[string]any{"docker_host": "tcp://192.168.2.33:6002", "is_edge": true}
 		require.NoError(t, applyDockerHostUpdateInternal(updates, agentEnv))
 		assert.Equal(t, "tcp://192.168.2.33:6002", updates["docker_host"])
-		assert.Equal(t, "", updates["api_url"])
-		assert.Nil(t, updates["access_token"])
-		assert.Equal(t, false, updates["is_edge"])
+		assert.Empty(t, updates["api_url"])
+		assert.Empty(t, updates["access_token"])
+		assert.Equal(t, false, updates["is_edge"], "is_edge must be cleared, not dropped")
 	})
 
 	t.Run("clearing the docker host returns the environment to the agent flow", func(t *testing.T) {
@@ -211,7 +210,7 @@ func TestApplyDockerHostUpdateInternal(t *testing.T) {
 	t.Run("docker-host environment is never marked as an edge environment", func(t *testing.T) {
 		updates := map[string]any{"is_edge": true}
 		require.NoError(t, applyDockerHostUpdateInternal(updates, dockerEnv))
-		assert.Equal(t, false, updates["is_edge"])
+		assert.Equal(t, false, updates["is_edge"], "is_edge must be cleared, not dropped")
 	})
 
 	t.Run("unrelated update on an agent environment with a token keeps the binding", func(t *testing.T) {

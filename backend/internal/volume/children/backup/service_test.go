@@ -31,7 +31,13 @@ import (
 
 func applyVolumeBackupMigrations(t *testing.T, gormDB *gorm.DB) {
 	t.Helper()
-	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql", "096_add_volume_backup_policy_environment.sql", "098_add_volume_backup_environment.sql"} {
+	for _, name := range []string{
+		"032_add_volume_backups.sql",
+		"073_add_backup_support.sql",
+		"087_add_volume_backup_remote_instance.sql",
+		"096_add_volume_backup_policy_environment.sql",
+		"098_add_volume_backup_environment.sql",
+	} {
 		migration, err := os.ReadFile("../../../../resources/migrations/sqlite/" + name)
 		require.NoError(t, err)
 		require.NoError(t, gormDB.Exec(strings.Split(string(migration), "-- +goose Down")[0]).Error)
@@ -104,7 +110,7 @@ func TestVolumeBackupPolicy_ScheduledRunCreatesActivity(t *testing.T) {
 	harness := flowtest.New(t, activity.NewActivityService(db, nil))
 	gate := runs.NewAdmission(harness.Runtime.Service(), t.Name())
 	require.NoError(t, gate.Register(harness.Runtime))
-	engine := backup.NewEngine(gate, nil)
+	engine := backup.NewEngine(gate, nil, false)
 	t.Cleanup(func() { require.NoError(t, engine.Stop(context.WithoutCancel(t.Context()))) })
 	service := NewService(Dependencies{DB: db, Engine: engine, AlreadyRunning: errors.New("a backup is already running for this volume")})
 	require.NoError(t, service.RegisterWorkflows(harness.Engine))

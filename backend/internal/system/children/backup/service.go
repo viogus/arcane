@@ -394,13 +394,13 @@ func (s *Service) remoteRepository(ctx context.Context, destinationID string) (b
 func (s *Service) recoveryKey(ctx context.Context, supplied string) (string, error) {
 	if strings.TrimSpace(supplied) != "" {
 		if err := backup.ValidateRecoveryKey(supplied); err != nil {
-			return "", err
+			return "", common.Classify(common.ErrValidation, err)
 		}
 		return supplied, nil
 	}
 	key, err := s.recoveryKeys.Get(ctx)
 	if errors.Is(err, backup.ErrRecoveryKeyNotConfigured) {
-		return "", errors.New("enter the recovery key or configure one in system backups")
+		return "", common.Classify(common.ErrValidation, errors.New("enter the recovery key or configure one in system backups"))
 	}
 	if err != nil {
 		return "", err
@@ -409,7 +409,7 @@ func (s *Service) recoveryKey(ctx context.Context, supplied string) (string, err
 }
 
 func (s *Service) CreateBackup(ctx context.Context, user usertypes.Actor, trigger string, request backuptypes.CreateSystemBackupRequest) (*backuptypes.SystemBackupRun, error) {
-	if rustic.Disabled() {
+	if s.config.BackupsDisabled {
 		return nil, rustic.ErrDisabled
 	}
 	lease, err := s.acquireRun(ctx)
@@ -426,7 +426,7 @@ func (s *Service) CreateBackup(ctx context.Context, user usertypes.Actor, trigge
 
 // prepareBackup resolves the run's destinations from its policy or destination enum, creates the run row, and records its checkpoint.
 func (s *Service) prepareBackup(ctx context.Context, trigger string, request backuptypes.CreateSystemBackupRequest) (*preparedSystemBackup, error) {
-	if rustic.Disabled() {
+	if s.config.BackupsDisabled {
 		return nil, rustic.ErrDisabled
 	}
 	if !s.SupportedDatabaseProvider() {
@@ -440,7 +440,7 @@ func (s *Service) prepareBackup(ctx context.Context, trigger string, request bac
 		if request.PolicyID != "" {
 			policy, policyErr := s.store.Policy(ctx, request.PolicyID)
 			if policyErr == nil && policy == nil {
-				return nil, errors.New("system backup policy not found")
+				return nil, common.Classify(common.ErrNotFound, errors.New("system backup policy not found"))
 			}
 			return policy, policyErr
 		}
@@ -462,17 +462,17 @@ func (s *Service) prepareBackup(ctx context.Context, trigger string, request bac
 				S3DestinationID: strings.TrimSpace(request.S3DestinationID),
 			}, nil
 		default:
-			return nil, errors.New("unknown system backup destination")
+			return nil, common.Classify(common.ErrValidation, errors.New("unknown system backup destination"))
 		}
 	}()
 	if err != nil {
 		return nil, err
 	}
 	if !selected.LocalEnabled && !selected.S3Enabled {
-		return nil, errors.New("select at least one system backup destination")
+		return nil, common.Classify(common.ErrValidation, errors.New("select at least one system backup destination"))
 	}
 	if selected.S3Enabled && selected.S3DestinationID == "" {
-		return nil, errors.New("select an S3 destination for the system backup")
+		return nil, common.Classify(common.ErrValidation, errors.New("select an S3 destination for the system backup"))
 	}
 	run := &backuptypes.SystemBackupRun{
 		ID:        "system-" + uuid.New().String(),
@@ -1581,7 +1581,7 @@ func (s *Service) projectsSetting(ctx context.Context) string {
 
 // StartBackup prepares a manual backup, then submits its workflow.
 func (s *Service) StartBackup(ctx context.Context, user usertypes.Actor, request backuptypes.CreateSystemBackupRequest) (*backuptypes.SystemBackupRun, error) {
-	if rustic.Disabled() {
+	if s.config.BackupsDisabled {
 		return nil, rustic.ErrDisabled
 	}
 	requester := backup.NewRequester(ctx, user, "0", authz.PermSystemBackupsManage)

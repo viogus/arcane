@@ -87,6 +87,7 @@ type Dependencies struct {
 	AcquireHelper    func(ctx context.Context, volumeName string) (string, func(), error)
 	Exec             func(ctx context.Context, containerID, execUser string, cmd []string) (string, string, error)
 	BackupVolumeName string
+	BackupsDisabled  bool
 	EncryptionKey    string
 }
 
@@ -326,7 +327,7 @@ func (s *Service) resolveBackupPlan(ctx context.Context, volumeName, trigger str
 }
 
 func (s *Service) CreateBackup(ctx context.Context, volumeName string, user usertypes.Actor, trigger string, request volume.CreateBackupRequest) (*volume.Backup, error) {
-	if rustic.Disabled() {
+	if s.deps.BackupsDisabled {
 		return nil, rustic.ErrDisabled
 	}
 	trigger = cmp.Or(trigger, backuptypes.VolumeBackupTriggerManual)
@@ -344,7 +345,7 @@ func (s *Service) CreateBackup(ctx context.Context, volumeName string, user user
 
 // CreateSystemManagedBackup runs the existing volume backup workflow with a transient centralized policy.
 func (s *Service) CreateSystemManagedBackup(ctx context.Context, volumeName string, user usertypes.Actor, trigger, policyID string, policy backuptypes.UpdateBackupPolicy) (*volume.Backup, error) {
-	if rustic.Disabled() {
+	if s.deps.BackupsDisabled {
 		return nil, rustic.ErrDisabled
 	}
 	if !strings.HasPrefix(policyID, backuptypes.SystemVolumePolicyPrefix) {
@@ -376,7 +377,7 @@ func (s *Service) CreateSystemManagedBackup(ctx context.Context, volumeName stri
 
 // prepareBackup admits the run, persists its row, and records plan (now carrying the row ID) as the checkpoint.
 func (s *Service) prepareBackup(ctx context.Context, volumeName, trigger, policyID string, plan *backupPlan) (*volume.Backup, *runs.Lease, error) {
-	if rustic.Disabled() {
+	if s.deps.BackupsDisabled {
 		return nil, nil, rustic.ErrDisabled
 	}
 	lease, err := s.acquireVolumeRun(ctx, volumeName)
@@ -572,7 +573,7 @@ func (s *Service) UploadBackup(ctx context.Context, backupID, s3DestinationID st
 		return nil, errors.New("volume backup has already been uploaded")
 	}
 	if strings.TrimSpace(s3DestinationID) == "" {
-		return nil, errors.New("select an S3 destination for the upload")
+		return nil, common.Classify(common.ErrValidation, errors.New("select an S3 destination for the upload"))
 	}
 	remoteRepository, err := s.remoteRusticRepository(ctx, s3DestinationID, "")
 	if err != nil {
@@ -967,7 +968,7 @@ func (s *Service) MigrateRepositoryPasswords(ctx context.Context, previousKey, n
 
 // StartBackup persists a running backup and submits its workflow.
 func (s *Service) StartBackup(ctx context.Context, environmentID, volumeName string, user usertypes.Actor, request volume.CreateBackupRequest) (volume.BackupEntry, error) {
-	if rustic.Disabled() {
+	if s.deps.BackupsDisabled {
 		return volume.BackupEntry{}, rustic.ErrDisabled
 	}
 	plan, err := s.resolveBackupPlan(ctx, volumeName, backuptypes.VolumeBackupTriggerManual, request, nil)
@@ -1164,7 +1165,8 @@ func (s *Service) runManualBackup(ctx context.Context, t flow.Task) (_ any, err 
 		return target.ID == input.VolumeName && len(target.RecoveryData) > 0
 	})
 	if !resuming {
-		lease, admitted, acquireErr := s.deps.Engine.AcquireRun(ctx, backup.VolumeAdmissionScope, volumeAdmissionIDInternal(envcontext.EnvironmentIDOrDefault(ctx), input.VolumeName), input.Checkpoint.BackupID)
+		admissionID := volumeAdmissionIDInternal(envcontext.EnvironmentIDOrDefault(ctx), input.VolumeName)
+		lease, admitted, acquireErr := s.deps.Engine.AcquireRun(ctx, backup.VolumeAdmissionScope, admissionID, input.Checkpoint.BackupID)
 		if acquireErr != nil {
 			return nil, acquireErr
 		}

@@ -103,7 +103,7 @@ func createWebhookRow(t *testing.T, db *database.DB, wh Webhook) {
 	require.NoError(t, db.Create(&wh).Error)
 }
 
-func summariesByID(t *testing.T, db *database.DB, service *WebhookService, environmentID string) map[string]string {
+func summariesByID(t *testing.T, service *WebhookService, environmentID string) map[string]string {
 	t.Helper()
 
 	summaries, err := service.ListWebhookSummaries(t.Context(), environmentID)
@@ -146,7 +146,7 @@ func TestListWebhookSummariesResolvesDockerHostContainerNameInProcess(t *testing
 		environmentService: environment.NewEnvironmentService(db, nil, dockerService, nil, nil, nil),
 	}
 
-	names := summariesByID(t, db, service, "env-docker-host")
+	names := summariesByID(t, service, "env-docker-host")
 
 	// "stale-ref" is what the proxied fallback would have returned, so resolving the real container
 	// name proves the lookup ran in-process against the environment's daemon.
@@ -194,7 +194,7 @@ func TestListWebhookSummariesFallsBackWhenDockerHostContainerMissing(t *testing.
 		environmentService: environment.NewEnvironmentService(db, nil, dockerService, nil, nil, nil),
 	}
 
-	names := summariesByID(t, db, service, "env-docker-host")
+	names := summariesByID(t, service, "env-docker-host")
 
 	assert.Equal(t, "missing-ref", names["wh-ref"], "a missing container falls back to the trimmed target ref")
 	assert.Equal(t, "cid-only", names["wh-id"], "without a ref the target id is used")

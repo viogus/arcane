@@ -9,12 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getarcaneapp/arcane/types/v2/dashboard"
 	dockercontainer "github.com/moby/moby/api/types/container"
 	dockerimage "github.com/moby/moby/api/types/image"
 	dockervolume "github.com/moby/moby/api/types/volume"
 	"github.com/stretchr/testify/require"
-
-	"github.com/getarcaneapp/arcane/types/v2/dashboard"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"

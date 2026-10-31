@@ -273,14 +273,14 @@ func TestSettingsService_UpdateSettings_EnvironmentTargetRoutesRegisteredKeysOnl
 // to the environment endpoint.
 const testEnvironmentSettingPublicKey = "featureSwarmEnabled"
 
-func environmentSettingValue(t *testing.T, settings []settings.PublicSetting, key string) string {
+func environmentSettingValue(t *testing.T, publicSettings []settings.PublicSetting, key string) string {
 	t.Helper()
-	for _, setting := range settings {
+	for _, setting := range publicSettings {
 		if setting.Key == key {
 			return setting.Value
 		}
 	}
-	t.Fatalf("setting %q not found in %d settings", key, len(settings))
+	t.Fatalf("setting %q not found in %d settings", key, len(publicSettings))
 	return ""
 }
 

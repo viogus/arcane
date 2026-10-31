@@ -6,10 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/getarcaneapp/arcane/types/v2/activity"
 	"github.com/samber/mo"
 	"github.com/stretchr/testify/require"
-
-	"github.com/getarcaneapp/arcane/types/v2/activity"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"

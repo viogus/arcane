@@ -402,8 +402,8 @@ func (h *ActivityHandler) runRemoteActivityStreamPoller(ctx context.Context, loc
 				pollCtx, cancelPoll := context.WithTimeout(ctx, activityStreamRemotePollTimeout)
 				defer cancelPoll()
 				var out base.Paginated[activity.Activity]
-				if err := h.environment.ProxyJSONRequestForEnvironment(pollCtx, currentEnvironment, http.MethodGet, path, nil, &out); err != nil {
-					return nil, handlerutil.TranslateRemoteProxyError(err)
+				if proxyErr := h.environment.ProxyJSONRequestForEnvironment(pollCtx, currentEnvironment, http.MethodGet, path, nil, &out); proxyErr != nil {
+					return nil, handlerutil.TranslateRemoteProxyError(proxyErr)
 				}
 				return &out, nil
 			})

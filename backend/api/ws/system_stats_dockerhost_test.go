@@ -95,7 +95,7 @@ func TestSystemStatsStreamsDockerHostEnvironmentStatsFromDockerAPI(t *testing.T)
 	containerService := container.NewContainerService(nil, dockerService, nil, nil, nil, nil, nil)
 	systemService := system.NewSystemService(
 		nil, dockerService, containerService,
-		nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, //nolint:govet // optional collaborators the stats path never touches
+		nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, // optional collaborators the stats path never touches
 		&config.Config{},
 	)
 

@@ -9,14 +9,13 @@ import (
 	"sync"
 	"testing"
 
+	swarmtypes "github.com/getarcaneapp/arcane/types/v2/swarm"
 	"github.com/libtnb/sqlite"
 	"github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/api/types/system"
 	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
-
-	swarmtypes "github.com/getarcaneapp/arcane/types/v2/swarm"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
@@ -146,8 +145,8 @@ func newSwarmDockerHostTestFixtureInternal(t *testing.T, state swarm.LocalNodeSt
 	}
 }
 
-func dockerHostTargetContextInternal(ctx context.Context, environmentID, dockerHost string) context.Context {
-	return envcontext.WithTarget(ctx, envcontext.Target{EnvironmentID: environmentID, DockerHost: dockerHost})
+func dockerHostTargetContextInternal(ctx context.Context, dockerHost string) context.Context {
+	return envcontext.WithTarget(ctx, envcontext.Target{EnvironmentID: "dh-1", DockerHost: dockerHost})
 }
 
 func TestSwarmService_IsEnabledForContext_DockerHostInactiveBeatsGlobalFlag(t *testing.T) {
@@ -156,7 +155,7 @@ func TestSwarmService_IsEnabledForContext_DockerHostInactiveBeatsGlobalFlag(t *t
 	require.NoError(t, fixture.kvService.SetBool(ctx, KVKeySwarmEnabled, true))
 
 	svc := NewSwarmService(fixture.docker, nil, fixture.kvService, nil, fixture.environmentService)
-	dockerHostCtx := dockerHostTargetContextInternal(ctx, "dh-1", fixture.server.URL)
+	dockerHostCtx := dockerHostTargetContextInternal(ctx, fixture.server.URL)
 
 	require.False(t, svc.IsEnabledForContext(dockerHostCtx),
 		"an inactive docker-host daemon must report disabled even when the manager flag is true")
@@ -168,7 +167,7 @@ func TestSwarmService_IsEnabledForContext_DockerHostActiveBeatsGlobalFlag(t *tes
 	require.NoError(t, fixture.kvService.SetBool(ctx, KVKeySwarmEnabled, false))
 
 	svc := NewSwarmService(fixture.docker, nil, fixture.kvService, nil, fixture.environmentService)
-	dockerHostCtx := dockerHostTargetContextInternal(ctx, "dh-1", fixture.server.URL)
+	dockerHostCtx := dockerHostTargetContextInternal(ctx, fixture.server.URL)
 
 	require.True(t, svc.IsEnabledForContext(dockerHostCtx),
 		"an active docker-host daemon must report enabled even when the manager flag is false")
@@ -193,7 +192,7 @@ func TestSwarmService_IsEnabledForContext_DockerHostUnreachableNeverUsesGlobalFl
 	require.NoError(t, fixture.kvService.SetBool(ctx, KVKeySwarmEnabled, true))
 
 	svc := NewSwarmService(fixture.docker, nil, fixture.kvService, nil, fixture.environmentService)
-	unreachableCtx := dockerHostTargetContextInternal(ctx, "dh-1", "http://127.0.0.1:1")
+	unreachableCtx := dockerHostTargetContextInternal(ctx, "http://127.0.0.1:1")
 
 	// The persisted flag describes the manager's own daemon, so it cannot answer for a docker-host
 	// environment whose daemon could not be inspected.
@@ -202,11 +201,11 @@ func TestSwarmService_IsEnabledForContext_DockerHostUnreachableNeverUsesGlobalFl
 }
 
 func TestSwarmService_SwarmLifecycle_DockerHostDoesNotTouchGlobalFlag(t *testing.T) {
-	fixture := newSwarmDockerHostTestFixtureInternal(t, swarm.LocalNodeStateActive, true)
+	fixture := newSwarmDockerHostTestFixtureInternal(t, swarm.LocalNodeStateInactive, false)
 	ctx := t.Context()
 
 	svc := NewSwarmService(fixture.docker, nil, fixture.kvService, nil, fixture.environmentService)
-	dockerHostCtx := dockerHostTargetContextInternal(ctx, "dh-1", fixture.server.URL)
+	dockerHostCtx := dockerHostTargetContextInternal(ctx, fixture.server.URL)
 
 	_, err := svc.InitSwarm(dockerHostCtx, swarmtypes.SwarmInitRequest{Spec: stdjson.RawMessage("{}")})
 	require.NoError(t, err)
@@ -219,6 +218,7 @@ func TestSwarmService_SwarmLifecycle_DockerHostDoesNotTouchGlobalFlag(t *testing
 	require.NoError(t, err)
 	require.False(t, flag, "swarm join against a docker-host must not set the manager's global flag")
 
+	fixture.daemon.setStateInternal(swarm.LocalNodeStateActive, true)
 	require.NoError(t, svc.LeaveSwarm(dockerHostCtx, swarmtypes.SwarmLeaveRequest{Force: true}))
 	flag, err = fixture.kvService.GetBool(ctx, KVKeySwarmEnabled, false)
 	require.NoError(t, err)
@@ -231,7 +231,7 @@ func TestSwarmService_SwarmLifecycle_DockerHostDoesNotTouchGlobalFlag(t *testing
 }
 
 func TestSwarmService_SwarmLifecycle_LocalEnvironmentKeepsPersistingGlobalFlag(t *testing.T) {
-	fixture := newSwarmDockerHostTestFixtureInternal(t, swarm.LocalNodeStateActive, true)
+	fixture := newSwarmDockerHostTestFixtureInternal(t, swarm.LocalNodeStateInactive, false)
 	ctx := t.Context()
 
 	svc := NewSwarmService(fixture.docker, nil, fixture.kvService, nil, fixture.environmentService)
@@ -242,11 +242,13 @@ func TestSwarmService_SwarmLifecycle_LocalEnvironmentKeepsPersistingGlobalFlag(t
 	require.NoError(t, err)
 	require.True(t, flag, "the local environment still persists the manager's swarm flag")
 
+	fixture.daemon.setStateInternal(swarm.LocalNodeStateActive, true)
 	require.NoError(t, svc.LeaveSwarm(ctx, swarmtypes.SwarmLeaveRequest{Force: true}))
 	flag, err = fixture.kvService.GetBool(ctx, KVKeySwarmEnabled, false)
 	require.NoError(t, err)
 	require.False(t, flag, "leaving the local swarm still clears the manager's swarm flag")
 
+	fixture.daemon.setStateInternal(swarm.LocalNodeStateInactive, false)
 	require.NoError(t, svc.JoinSwarm(ctx, swarmtypes.SwarmJoinRequest{JoinToken: "join-token"}))
 	flag, err = fixture.kvService.GetBool(ctx, KVKeySwarmEnabled, false)
 	require.NoError(t, err)

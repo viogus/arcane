@@ -115,7 +115,13 @@ func TestRenameVolumeRejectsInvalidAndProtectedNames(t *testing.T) {
 
 func applyVolumeBackupMigrations(t *testing.T, gormDB *gorm.DB) {
 	t.Helper()
-	for _, name := range []string{"032_add_volume_backups.sql", "073_add_backup_support.sql", "087_add_volume_backup_remote_instance.sql", "096_add_volume_backup_policy_environment.sql", "098_add_volume_backup_environment.sql"} {
+	for _, name := range []string{
+		"032_add_volume_backups.sql",
+		"073_add_backup_support.sql",
+		"087_add_volume_backup_remote_instance.sql",
+		"096_add_volume_backup_policy_environment.sql",
+		"098_add_volume_backup_environment.sql",
+	} {
 		migration, err := os.ReadFile("../../resources/migrations/sqlite/" + name)
 		require.NoError(t, err)
 		require.NoError(t, gormDB.Exec(strings.Split(string(migration), "-- +goose Down")[0]).Error)
@@ -226,7 +232,7 @@ func TestListBackupsIsolatesHistoryPerEnvironment(t *testing.T) {
 	require.NoError(t, store.Create(t.Context(), managerRunning))
 
 	_, err = store.Run(t.Context(), remoteRunning.ID)
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.ErrorIs(t, err, common.ErrNotFound)
 	run, err := store.Run(remoteCtx, remoteRunning.ID)
 	require.NoError(t, err)
 	require.Equal(t, remoteRunning.ID, run.ID)
@@ -282,7 +288,7 @@ func TestFailRunningByIDClosesResumedBackupWithoutEnvironment(t *testing.T) {
 
 	// Without an environment target the scoped lookup cannot see the row the reconciler resumes.
 	_, err = store.Run(t.Context(), resumed.ID)
-	require.ErrorIs(t, err, gorm.ErrRecordNotFound)
+	require.ErrorIs(t, err, common.ErrNotFound)
 	require.NoError(t, store.FailRunningByID(t.Context(), resumed.ID, "Backup did not run"))
 
 	var stored VolumeBackup

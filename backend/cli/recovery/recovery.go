@@ -73,7 +73,7 @@ func runRestoreInternal(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("inspect Arcane container: %w", err)
 	}
-	if rusticruntime.Disabled() {
+	if rusticruntime.DisabledFromEnv() {
 		// The helper stages every restore through Rustic, so a disabled engine has
 		// nothing to pull or run; fail before Arcane is stopped.
 		return rusticruntime.ErrDisabled

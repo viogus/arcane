@@ -481,8 +481,8 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 		return nil, validateCredentialTargetChangeErr
 	}
 
-	if err := applyDockerHostUpdateInternal(updates, current); err != nil {
-		return nil, err
+	if applyErr := applyDockerHostUpdateInternal(updates, current); applyErr != nil {
+		return nil, applyErr
 	}
 
 	updates["updated_at"] = new(time.Now())
@@ -502,7 +502,7 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 	// The environment's Docker endpoint may have changed, or it may no longer be a
 	// docker-host environment at all: drop the cached connection instead of leaking it.
 	if previousHost := current.DockerHostURL(); previousHost != "" && previousHost != updated.DockerHostURL() && s.dockerService != nil {
-		s.dockerService.CloseHostClient(previousHost)
+		s.dockerService.CloseHostClient(ctx, previousHost)
 	}
 
 	if _, ok := updates["access_token"]; ok {
@@ -522,7 +522,7 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 				// A disabled docker-host environment is no longer polled, so drop the keep-alive
 				// connection instead of holding it open until the environment changes again.
 				if host := updated.DockerHostURL(); host != "" && s.dockerService != nil {
-					s.dockerService.CloseHostClient(host)
+					s.dockerService.CloseHostClient(ctx, host)
 				}
 			}
 		}
@@ -635,7 +635,7 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, id string, u
 	s.invalidateEnvironmentCache(id)
 	// The environment is gone, so its cached Docker connection must not outlive it.
 	if host := env.DockerHostURL(); host != "" && s.dockerService != nil {
-		s.dockerService.CloseHostClient(host)
+		s.dockerService.CloseHostClient(ctx, host)
 	}
 	s.NotifyRuntimeStateChanged()
 
@@ -722,6 +722,7 @@ func (s *EnvironmentService) linkEnvironmentApiKey(ctx context.Context, envID, n
 			ApiKeyID:            &newApiKeyID,
 			ParentEnvironmentID: envRecord.ParentEnvironmentID,
 			SwarmNodeID:         envRecord.SwarmNodeID,
+			DockerHost:          envRecord.DockerHost,
 		}
 	}
 	s.remoteEnvs.mu.Unlock()
@@ -822,6 +823,9 @@ func (s *EnvironmentService) GetEnabledRegistryCredentials(ctx context.Context) 
 
 // SyncResourcesToEnvironment tracks a manual sync and attempts every resource group.
 func (s *EnvironmentService) SyncResourcesToEnvironment(ctx context.Context, environmentID string, user *usertypes.Actor, activityService activity.Service) (string, error) {
+	if _, err := s.GetEnvironmentByID(ctx, environmentID); err != nil {
+		return "", err
+	}
 	return activity.RunHandlerActivity(ctx, activityService, activity.HandlerOptions{
 		EnvironmentID:  environmentID,
 		Type:           activitytypes.TypeResourceAction,
@@ -1205,11 +1209,11 @@ func (s *EnvironmentService) SetScheduler(ctx context.Context, jobScheduler sche
 // SetEnvironmentJobsHooks injects the scheduler hooks that install or clear the cron jobs belonging
 // to one docker-host environment. Agent environments are untouched: their jobs run inside the agent.
 func (s *EnvironmentService) SetEnvironmentJobsHooks(
-	sync func(ctx context.Context, environmentID string) error,
-	forget func(ctx context.Context, environmentID string) error,
+	syncJobs func(ctx context.Context, environmentID string) error,
+	forgetJobs func(ctx context.Context, environmentID string) error,
 ) {
-	s.environmentJobsSync = sync
-	s.environmentJobsForget = forget
+	s.environmentJobsSync = syncJobs
+	s.environmentJobsForget = forgetJobs
 }
 
 // SetEnvironmentDataPurgeHook injects the cleanup that removes rows other domains scope to a
@@ -1276,8 +1280,8 @@ func (s *EnvironmentService) syncEnvironmentJobsInternal(ctx context.Context, en
 		s.forgetEnvironmentJobsInternal(ctx, environmentID)
 		return
 	}
-	if err := s.environmentJobsSync(s.jobs.Context(ctx), environmentID); err != nil {
-		slog.ErrorContext(ctx, "failed to sync environment jobs", "environment", environmentID, "error", err)
+	if syncErr := s.environmentJobsSync(s.jobs.Context(ctx), environmentID); syncErr != nil {
+		slog.ErrorContext(ctx, "failed to sync environment jobs", "environment", environmentID, "error", syncErr)
 	}
 	slog.DebugContext(ctx, "Synced environment jobs", "environment", environmentID)
 }
@@ -1670,6 +1674,7 @@ func ApplyEnvironmentRuntimeState(env environment.Environment) environment.Envir
 		LastPollAt:          pollState.LastPollAt,
 		EdgeMTLSCertificate: env.EdgeMTLSCertificate,
 		ApiKey:              env.ApiKey,
+		DockerHost:          env.DockerHost,
 	}
 }
 

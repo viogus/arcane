@@ -355,6 +355,7 @@ func ApplyPresentation(ctx context.Context, projectsDir, catalog string, records
 			IsArchived:         d.IsArchived,
 			HasBuildDirective:  d.HasBuildDirective,
 			RedeployDisabled:   d.RedeployDisabled,
+			DeployedHere:       d.DeployedHere,
 			ConfigurationError: projects.CheckProjectEnvAccess(ctx, projectsDir, records[i].Path),
 		})
 	}

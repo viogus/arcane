@@ -35,6 +35,62 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis"
 )
 
+// registerImageUpdateWatcherInternal hands the watcher the daemons this process serves and installs
+// its bus subscription, so a docker-host environment added at runtime gets its polling records.
+func registerImageUpdateWatcherInternal(
+	jobScheduler schedulertypes.JobScheduler,
+	jobService *job.JobService,
+	imageUpdateWatcher *scheduler.ImageUpdateWatcher,
+	environmentService *environment.EnvironmentService,
+) error {
+	if imageUpdateWatcher == nil {
+		return nil
+	}
+	imageUpdateWatcher.SetCoordinator(jobService.Coordinator())
+	// Image polling must reach every daemon this process serves itself, so hand the watcher the
+	// environment rows before it starts; it checkpoints one schedule per docker-host environment
+	// (see ImageUpdateWatcher.refreshScheduleInternal).
+	if environmentService != nil {
+		imageUpdateWatcher.SetEnvironmentProvider(environmentService)
+	}
+	// A docker-host environment added while the process runs is synced through the job service,
+	// which then asks the watcher to install its polling records.
+	jobService.SetBusWatcherScheduleRefresh(imageUpdateWatcher.RefreshSchedule)
+	return jobScheduler.RegisterBusWatcher(imageUpdateWatcher, true)
+}
+
+// startDockerHostEnvironmentWorkInternal installs the per-environment work a docker-host
+// environment needs once the scheduler is activated: cron records, image-polling schedules and the
+// daemon event log. All three are dropped before the scheduler runs, so they are installed here.
+func startDockerHostEnvironmentWorkInternal(
+	schedulerCtx context.Context,
+	startCtx context.Context,
+	environmentService *environment.EnvironmentService,
+	imageUpdateWatcher *scheduler.ImageUpdateWatcher,
+	eventService *event.EventService,
+) error {
+	if environmentService != nil {
+		if syncErr := environmentService.SyncDockerHostEnvironmentJobs(startCtx); syncErr != nil {
+			return fmt.Errorf("sync docker-host environment jobs: %w", syncErr)
+		}
+	}
+	// The watcher's own startup refresh can land before the coordinator accepts checkpoints, so ask
+	// for the per-environment image-polling schedules again now that the scheduler is activated.
+	if imageUpdateWatcher != nil {
+		imageUpdateWatcher.RefreshSchedule()
+	}
+	// A docker-host environment's daemon is watched here, not by an agent, so its events are
+	// recorded per environment once the environments are being served.
+	if eventService == nil || environmentService == nil {
+		return nil
+	}
+	eventService.SetDockerHostEventProvider(environmentService)
+	if _, startErr := concurrency.StartSupervised(schedulerCtx, "Docker host event log", eventService.SubscribeDockerHostEnvironmentEvents()); startErr != nil {
+		return fmt.Errorf("start docker host event log: %w", startErr)
+	}
+	return nil
+}
+
 func newJobScheduler(
 	appCtx context.Context,
 	lc fx.Lifecycle,
@@ -83,45 +139,15 @@ func newJobScheduler(
 				gitopsSync.RegisterAutoSyncJobsOnStartup(ctx)
 				gitopsSync.SubscribeProjectFileChanges(schedulerCtx)
 			}
-			if imageUpdateWatcher != nil {
-				imageUpdateWatcher.SetCoordinator(jobService.Coordinator())
-				// Image polling must reach every daemon this process serves itself, so hand the
-				// watcher the environment rows before it starts; it checkpoints one schedule per
-				// docker-host environment (see ImageUpdateWatcher.refreshScheduleInternal).
-				if environmentService != nil {
-					imageUpdateWatcher.SetEnvironmentProvider(environmentService)
-				}
-				// A docker-host environment added while the process runs is synced through the job
-				// service, which then asks the watcher to install its polling records.
-				jobService.SetBusWatcherScheduleRefresh(imageUpdateWatcher.RefreshSchedule)
-				if registerBusWatcherErr := jobScheduler.RegisterBusWatcher(imageUpdateWatcher, true); registerBusWatcherErr != nil {
-					return registerBusWatcherErr
-				}
+			if registerErr := registerImageUpdateWatcherInternal(jobScheduler, jobService, imageUpdateWatcher, environmentService); registerErr != nil {
+				return registerErr
 			}
 			if startSchedulerErr := jobScheduler.StartScheduler(ctx); startSchedulerErr != nil {
 				return fmt.Errorf("start scheduler: %w", startSchedulerErr)
 			}
 			jobService.Coordinator().Activate()
-			// Docker-host environments are served by this process against a remote daemon, so their
-			// own cron records are installed only now: installs are dropped before the scheduler runs.
-			if environmentService != nil {
-				if syncErr := environmentService.SyncDockerHostEnvironmentJobs(ctx); syncErr != nil {
-					return fmt.Errorf("sync docker-host environment jobs: %w", syncErr)
-				}
-			}
-			// Same reason: the watcher's own startup refresh can land before the coordinator accepts
-			// checkpoints, so ask for the per-environment image-polling schedules again now that the
-			// scheduler is activated.
-			if imageUpdateWatcher != nil {
-				imageUpdateWatcher.RefreshSchedule()
-			}
-			// A docker-host environment's daemon is watched here, not by an agent, so its events are
-			// recorded per environment once the environments are being served.
-			if eventService != nil && environmentService != nil {
-				eventService.SetDockerHostEventProvider(environmentService)
-				if _, startErr := concurrency.StartSupervised(schedulerCtx, "Docker host event log", eventService.SubscribeDockerHostEnvironmentEvents()); startErr != nil {
-					return fmt.Errorf("start docker host event log: %w", startErr)
-				}
+			if dockerHostErr := startDockerHostEnvironmentWorkInternal(schedulerCtx, ctx, environmentService, imageUpdateWatcher, eventService); dockerHostErr != nil {
+				return dockerHostErr
 			}
 			if analytics != nil {
 				if _, submitErr := jobService.Coordinator().Submit(ctx, schedulertypes.Request{JobID: analytics.Name(), EnvironmentID: "0", Trigger: "startup"}); submitErr != nil {

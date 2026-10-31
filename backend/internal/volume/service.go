@@ -90,12 +90,14 @@ func NewVolumeService(
 ) *VolumeService {
 	backupVolumeName := ""
 	encryptionKey := ""
+	backupsDisabled := false
 	workspaceMaxDepth := 50
 	workspaceMaxEntries := 10000
 	workspaceMaxFileSizeMB := workspacepkg.DefaultMaxFileSizeMB
 	if cfg != nil {
 		backupVolumeName = cfg.BackupVolumeName
 		encryptionKey = cfg.EncryptionKey
+		backupsDisabled = cfg.BackupsDisabled
 		workspaceMaxDepth = cfg.VolumeWorkspaceMaxDepth
 		workspaceMaxEntries = cfg.VolumeWorkspaceMaxEntries
 		workspaceMaxFileSizeMB = cfg.VolumeWorkspaceMaxFileSizeMB
@@ -127,6 +129,7 @@ func NewVolumeService(
 		AcquireHelper:    service.acquireVolumeHelper,
 		Exec:             service.execInContainer,
 		BackupVolumeName: backupVolumeName,
+		BackupsDisabled:  backupsDisabled,
 		EncryptionKey:    encryptionKey,
 	}
 	if containerService != nil {
@@ -232,7 +235,7 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 			entry := volumeBackupFromRecordInternal(record)
 			// Every writer — manual, scheduled, safety and system-managed — goes through this store, so
 			// stamping the environment here keeps one daemon's history out of another's.
-			entry.EnvironmentID = volumeBackupEnvironmentID(ctx)
+			entry.EnvironmentID = envcontext.EnvironmentIDOrDefault(ctx)
 			if err := s.db.WithContext(ctx).Create(entry).Error; err != nil {
 				return err
 			}
@@ -255,7 +258,7 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 		// clause one environment could read, fail or delete another environment's history.
 		Fail: func(ctx context.Context, backupID, message string) error {
 			return s.db.WithContext(ctx).Model(&VolumeBackup{}).
-				Where("id = ? AND environment_id = ?", backupID, volumeBackupEnvironmentID(ctx)).
+				Where("id = ? AND environment_id = ?", backupID, envcontext.EnvironmentIDOrDefault(ctx)).
 				Updates(map[string]any{"status": VolumeBackupStatusFailed, "error": message}).Error
 		},
 		// FailRunningByID closes a resumed backup's row. The reconciler that calls it runs before this
@@ -268,14 +271,17 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 		},
 		Delete: func(ctx context.Context, backupID string) error {
 			return s.db.WithContext(ctx).
-				Where("id = ? AND environment_id = ?", backupID, volumeBackupEnvironmentID(ctx)).
+				Where("id = ? AND environment_id = ?", backupID, envcontext.EnvironmentIDOrDefault(ctx)).
 				Delete(&VolumeBackup{}).Error
 		},
 		Run: func(ctx context.Context, backupID string) (*volumetypes.Backup, error) {
 			var entry VolumeBackup
 			if err := s.db.WithContext(ctx).
-				Where("id = ? AND environment_id = ?", backupID, volumeBackupEnvironmentID(ctx)).
+				Where("id = ? AND environment_id = ?", backupID, envcontext.EnvironmentIDOrDefault(ctx)).
 				First(&entry).Error; err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					return nil, common.Classify(common.ErrNotFound, errors.New("volume backup not found"))
+				}
 				return nil, err
 			}
 			return entry.recordInternal(), nil
@@ -283,7 +289,7 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 		Runs: func(ctx context.Context, backupIDs []string) ([]*volumetypes.Backup, error) {
 			var entries []VolumeBackup
 			if err := s.db.WithContext(ctx).
-				Where("id IN ? AND environment_id = ?", backupIDs, volumeBackupEnvironmentID(ctx)).
+				Where("id IN ? AND environment_id = ?", backupIDs, envcontext.EnvironmentIDOrDefault(ctx)).
 				Find(&entries).Error; err != nil {
 				return nil, err
 			}
@@ -296,7 +302,7 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 		Latest: func(ctx context.Context, policyID string) (*volumetypes.Backup, error) {
 			var entry VolumeBackup
 			err := s.db.WithContext(ctx).
-				Where("policy_id = ? AND environment_id = ?", policyID, volumeBackupEnvironmentID(ctx)).
+				Where("policy_id = ? AND environment_id = ?", policyID, envcontext.EnvironmentIDOrDefault(ctx)).
 				Order("created_at DESC").First(&entry).Error
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil, nil
@@ -323,18 +329,11 @@ func (s *VolumeService) backupStore() volumebackup.Store {
 		CountLocal: func(ctx context.Context) (int64, error) {
 			var count int64
 			err := s.db.WithContext(ctx).Model(&VolumeBackup{}).
-				Where("environment_id = ? AND local_snapshot_id <> ''", volumeBackupEnvironmentID(ctx)).
+				Where("environment_id = ? AND local_snapshot_id <> ''", envcontext.EnvironmentIDOrDefault(ctx)).
 				Count(&count).Error
 			return count, err
 		},
 	}
-}
-
-// volumeBackupEnvironmentID names the environment that owns the volume being operated on.
-// Requests for a docker-host environment carry that environment's target; everything else — the local
-// environment, agents serving their own API — is scoped to the local environment.
-func volumeBackupEnvironmentID(ctx context.Context) string {
-	return envcontext.EnvironmentIDOrDefault(ctx)
 }
 
 // listBackups pages one volume's backup history; both or neither management type selected means no type filter.
@@ -342,7 +341,7 @@ func (s *VolumeService) listBackups(ctx context.Context, volumeName string, para
 	// Two daemons can each have a volume called "app-data"; their histories must not mix.
 	query := s.db.WithContext(ctx).Model(&VolumeBackup{}).
 		Where("volume_name = ?", volumeName).
-		Where("environment_id = ?", volumeBackupEnvironmentID(ctx))
+		Where("environment_id = ?", envcontext.EnvironmentIDOrDefault(ctx))
 	var system, managed bool
 	for value := range strings.SplitSeq(params.Filters["type"], ",") {
 		switch backuptypes.ManagementType(strings.TrimSpace(value)) {
@@ -1090,7 +1089,7 @@ func (s *VolumeService) RenameVolume(ctx context.Context, oldName, newName strin
 	}
 
 	metadata := database.JSON{"action": "rename", "oldName": oldName, "newName": newName}
-	if logErr := s.eventService.LogVolumeEvent(ctx, event.EventTypeVolumeRename, newName, newName, user.ID, user.Username, volumeBackupEnvironmentID(ctx), metadata); logErr != nil {
+	if logErr := s.eventService.LogVolumeEvent(ctx, event.EventTypeVolumeRename, newName, newName, user.ID, user.Username, envcontext.EnvironmentIDOrDefault(ctx), metadata); logErr != nil {
 		slog.WarnContext(ctx, "could not log volume rename action", "oldVolume", oldName, "newVolume", newName, "error", logErr)
 	}
 
@@ -1108,7 +1107,7 @@ func (s *VolumeService) renameVolumeMetadata(ctx context.Context, oldName, newNa
 		// Two daemons can each have a volume with the same name: only this environment's history follows
 		// the rename, or another environment's rows would silently change resource name.
 		if err := tx.Model(&VolumeBackup{}).
-			Where("volume_name = ? AND environment_id = ?", oldName, volumeBackupEnvironmentID(ctx)).
+			Where("volume_name = ? AND environment_id = ?", oldName, envcontext.EnvironmentIDOrDefault(ctx)).
 			Update("volume_name", newName).Error; err != nil {
 			return fmt.Errorf("rename volume backup history: %w", err)
 		}
@@ -1120,7 +1119,7 @@ func (s *VolumeService) renameVolumeMetadata(ctx context.Context, oldName, newNa
 }
 
 func (s *VolumeService) logVolumeRenameError(ctx context.Context, oldName, newName string, user usertypes.Actor, step string, err error) {
-	s.eventService.LogErrorEvent(ctx, event.EventTypeVolumeError, "volume", oldName, oldName, user.ID, user.Username, volumeBackupEnvironmentID(ctx), err, database.JSON{
+	s.eventService.LogErrorEvent(ctx, event.EventTypeVolumeError, "volume", oldName, oldName, user.ID, user.Username, envcontext.EnvironmentIDOrDefault(ctx), err, database.JSON{
 		"action":  "rename",
 		"step":    step,
 		"oldName": oldName,

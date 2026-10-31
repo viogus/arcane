@@ -117,17 +117,18 @@ func newSwarmTestEnsureManagerInternal(dockerService *docker.DockerClientService
 			return err
 		}
 		if infoResult.Info.Swarm.LocalNodeState != swarm.LocalNodeStateActive {
-			return common.Classify(common.ErrSwarmNotEnabled, errors.New("Swarm mode is not enabled")) //nolint:staticcheck // Preserve the existing error message.
+			return common.Classify(common.ErrSwarmNotEnabled, errors.New("Swarm mode is not enabled"))
 		}
 		if !infoResult.Info.Swarm.ControlAvailable {
-			return common.Classify(common.ErrSwarmManagerRequired, errors.New("Swarm manager access required")) //nolint:staticcheck // Preserve the existing error message.
+			return common.Classify(common.ErrSwarmManagerRequired, errors.New("Swarm manager access required"))
 		}
 		return nil
 	}
 }
 
-func createSwarmDockerHostTestEnvironmentInternal(t *testing.T, db *database.DB, id, apiURL, dockerHost string) {
+func createSwarmDockerHostTestEnvironmentInternal(t *testing.T, db *database.DB, apiURL, dockerHost string) {
 	t.Helper()
+	const id = "dh-1"
 	now := time.Now()
 	require.NoError(t, db.Create(&environment.Environment{
 		ID: id, CreatedAt: now, UpdatedAt: &now,
@@ -153,14 +154,14 @@ func TestService_ListNodesPaginated_DockerHostSwarmInactiveServedInProcess(t *te
 	proxyServer := httptest.NewServer(proxy)
 	t.Cleanup(proxyServer.Close)
 
-	createSwarmDockerHostTestEnvironmentInternal(t, db, "dh-1", proxyServer.URL, daemonServer.URL)
+	createSwarmDockerHostTestEnvironmentInternal(t, db, proxyServer.URL, daemonServer.URL)
 
 	dockerSvc := &docker.DockerClientService{}
 	svc := NewService(dockerSvc, newSwarmTestEnsureManagerInternal(dockerSvc), nil, nil, nil, envSvc)
 
 	items, _, err := svc.ListNodesPaginated(ctx, "dh-1", pagination.QueryParams{Limit: -1})
 	require.Error(t, err)
-	require.True(t, errors.Is(err, common.ErrSwarmNotEnabled), "expected a classified ErrSwarmNotEnabled, got %v", err)
+	require.ErrorIs(t, err, common.ErrSwarmNotEnabled)
 	require.Nil(t, items)
 	require.Equal(t, 0, proxy.countInternal(), "docker-host requests must not be proxied to an agent")
 	require.True(t, daemon.sawPathSuffixInternal("/info"), "expected the environment's own daemon to be inspected")
@@ -180,14 +181,14 @@ func TestService_GetNode_DockerHostSwarmInactiveServedInProcess(t *testing.T) {
 	proxyServer := httptest.NewServer(proxy)
 	t.Cleanup(proxyServer.Close)
 
-	createSwarmDockerHostTestEnvironmentInternal(t, db, "dh-1", proxyServer.URL, daemonServer.URL)
+	createSwarmDockerHostTestEnvironmentInternal(t, db, proxyServer.URL, daemonServer.URL)
 
 	dockerSvc := &docker.DockerClientService{}
 	svc := NewService(dockerSvc, newSwarmTestEnsureManagerInternal(dockerSvc), nil, nil, nil, envSvc)
 
 	node, err := svc.GetNode(ctx, "dh-1", "node-1")
 	require.Error(t, err)
-	require.True(t, errors.Is(err, common.ErrSwarmNotEnabled), "expected a classified ErrSwarmNotEnabled, got %v", err)
+	require.ErrorIs(t, err, common.ErrSwarmNotEnabled)
 	require.Nil(t, node)
 	require.Equal(t, 0, proxy.countInternal(), "docker-host requests must not be proxied to an agent")
 	require.True(t, daemon.sawPathSuffixInternal("/info"), "expected the environment's own daemon to be inspected")
@@ -207,7 +208,7 @@ func TestService_GetJoinCandidates_DockerHostSwarmInactiveServedInProcess(t *tes
 	proxyServer := httptest.NewServer(proxy)
 	t.Cleanup(proxyServer.Close)
 
-	createSwarmDockerHostTestEnvironmentInternal(t, db, "dh-1", proxyServer.URL, daemonServer.URL)
+	createSwarmDockerHostTestEnvironmentInternal(t, db, proxyServer.URL, daemonServer.URL)
 
 	dockerSvc := &docker.DockerClientService{}
 	svc := NewService(dockerSvc, newSwarmTestEnsureManagerInternal(dockerSvc), nil, nil, nil, envSvc)
@@ -238,7 +239,7 @@ func TestService_ListNodesPaginated_DockerHostSwarmActiveServedInProcess(t *test
 	proxyServer := httptest.NewServer(proxy)
 	t.Cleanup(proxyServer.Close)
 
-	createSwarmDockerHostTestEnvironmentInternal(t, db, "dh-1", proxyServer.URL, daemonServer.URL)
+	createSwarmDockerHostTestEnvironmentInternal(t, db, proxyServer.URL, daemonServer.URL)
 
 	dockerSvc := &docker.DockerClientService{}
 	svc := NewService(dockerSvc, newSwarmTestEnsureManagerInternal(dockerSvc), nil, nil, nil, envSvc)

@@ -649,8 +649,8 @@ func (w *ImageUpdateWatcher) refreshSchedule(ctx context.Context) error {
 	w.dispatchMu.RLock()
 	provider := w.environmentProvider
 	w.dispatchMu.RUnlock()
-	if err := coordinator.Checkpoint(ctx, w.Name(), spec, schedule.Next(time.Now().In(w.location))); err != nil {
-		return err
+	if checkpointErr := coordinator.Checkpoint(ctx, w.Name(), spec, schedule.Next(time.Now().In(w.location))); checkpointErr != nil {
+		return checkpointErr
 	}
 	return w.checkpointEnvironmentSchedulesInternal(ctx, coordinator, provider)
 }

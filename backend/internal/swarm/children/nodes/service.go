@@ -574,9 +574,9 @@ func (s *Service) joinEnvironment(
 			return failed(describeSwarmJoinFailure(inProcessJoinErr, joinToken))
 		}
 	} else {
-		body, err := json.Marshal(joinRequest)
-		if err != nil {
-			return failed(err.Error())
+		body, marshalErr := json.Marshal(joinRequest)
+		if marshalErr != nil {
+			return failed(marshalErr.Error())
 		}
 		var joinResponse struct {
 			Success bool `json:"success"`

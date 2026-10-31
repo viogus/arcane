@@ -779,5 +779,4 @@ func TestEnvironmentMiddleware_LeavesManagerLocalPathsUnscopedForAgentEnvironmen
 
 	assert.Equal(t, http.StatusOK, recorder.Code)
 	assert.Empty(t, seenDockerHost)
-
 }

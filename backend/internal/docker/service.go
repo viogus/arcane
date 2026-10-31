@@ -163,15 +163,15 @@ func (s *DockerClientService) PingHost(ctx context.Context, host string) error {
 	pingCtx, cancel := context.WithTimeout(ctx, dockerClientNegotiationTimeout)
 	defer cancel()
 
-	if _, err := cli.Ping(pingCtx, client.PingOptions{}); err != nil {
-		return fmt.Errorf("failed to reach Docker host %s: %w", host, err)
+	if _, pingErr := cli.Ping(pingCtx, client.PingOptions{}); pingErr != nil {
+		return fmt.Errorf("failed to reach Docker host %s: %w", host, pingErr)
 	}
 	return nil
 }
 
 // CloseHostClient drops the cached client for an endpoint, so the next request
 // reconnects. Used when a docker-host environment changes or is removed.
-func (s *DockerClientService) CloseHostClient(host string) {
+func (s *DockerClientService) CloseHostClient(ctx context.Context, host string) {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return
@@ -183,7 +183,7 @@ func (s *DockerClientService) CloseHostClient(host string) {
 	s.hostMu.Unlock()
 
 	if ok {
-		closeDockerClient(context.Background(), cli, "docker-host environment removed")
+		closeDockerClient(ctx, cli, "docker-host environment removed")
 	}
 }
 
@@ -339,13 +339,13 @@ func (s *DockerClientService) DockerHost() string {
 }
 
 // Close closes the cached Docker client.
-func (s *DockerClientService) Close() {
+func (s *DockerClientService) Close(ctx context.Context) {
 	s.hostMu.Lock()
 	hostClients := s.hostClients
 	s.hostClients = nil
 	s.hostMu.Unlock()
 	for host, cli := range hostClients {
-		closeDockerClient(context.Background(), cli, "shutdown "+host)
+		closeDockerClient(ctx, cli, "shutdown "+host)
 	}
 
 	s.hostEventMu.Lock()

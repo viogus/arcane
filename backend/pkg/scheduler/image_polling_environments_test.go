@@ -7,13 +7,11 @@ import (
 	"testing"
 	"time"
 
+	schedulertypes "github.com/getarcaneapp/arcane/types/v2/scheduler"
+	"github.com/moby/moby/api/types/events"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.getarcane.app/streams/bus"
-
-	"github.com/moby/moby/api/types/events"
-
-	schedulertypes "github.com/getarcaneapp/arcane/types/v2/scheduler"
 
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/envcontext"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/jobcontext"

@@ -130,8 +130,11 @@ func snapshotCommand(label string, input CreateSnapshotInput) ([]string, error) 
 type Engine struct {
 	imageService *image.ImageService
 	admission    *runs.Admission
-	mu           sync.Mutex
-	repositories map[string]*sync.Mutex
+	// backupsDisabled reports ARCANE_BACKUPS_DISABLED: every entry point short-circuits to
+	// rustic.ErrDisabled instead of touching the helper image.
+	backupsDisabled bool
+	mu              sync.Mutex
+	repositories    map[string]*sync.Mutex
 	// held parks admission a manual start won until the run that won it takes it over.
 	held      map[scheduler.AdmissionKey]heldLease
 	authorize func(context.Context, backup.Requester) error
@@ -150,12 +153,13 @@ func NewRequester(ctx context.Context, requestedBy user.Actor, environmentID, pe
 }
 
 // NewEngine builds the backup engine on the shared admission gate.
-func NewEngine(admission *runs.Admission, imageService *image.ImageService) *Engine {
+func NewEngine(admission *runs.Admission, imageService *image.ImageService, backupsDisabled bool) *Engine {
 	return &Engine{
-		imageService: imageService,
-		admission:    admission,
-		repositories: make(map[string]*sync.Mutex),
-		held:         make(map[scheduler.AdmissionKey]heldLease),
+		imageService:    imageService,
+		admission:       admission,
+		backupsDisabled: backupsDisabled,
+		repositories:    make(map[string]*sync.Mutex),
+		held:            make(map[scheduler.AdmissionKey]heldLease),
 	}
 }
 
@@ -599,7 +603,7 @@ func (e *Engine) RekeyRepositories(ctx context.Context, dockerClient *client.Cli
 // Replicate copies one snapshot into another repository through a temporary volume, never the live data.
 // Rustic's native `copy` needs a TOML profile for the target, which the env-only Repository cannot express.
 func (e *Engine) Replicate(ctx context.Context, dockerClient *client.Client, from Repository, fromSnapshotID string, to Repository, password, label string, tags ...string) (Snapshot, error) {
-	if rustic.Disabled() {
+	if e.backupsDisabled {
 		return Snapshot{}, rustic.ErrDisabled
 	}
 	temporaryVolume := "arcane-rustic-copy-" + uuid.New().String()
@@ -629,7 +633,7 @@ func (e *Engine) Replicate(ctx context.Context, dockerClient *client.Client, fro
 }
 
 func (e *Engine) run(ctx context.Context, dockerClient *client.Client, repository Repository, password string, command []string, extraMounts ...mount.Mount) (string, error) {
-	if rustic.Disabled() {
+	if e.backupsDisabled {
 		return "", rustic.ErrDisabled
 	}
 	unlock, err := e.lockRepository(ctx, repository.ID)
@@ -644,7 +648,7 @@ func (e *Engine) run(ctx context.Context, dockerClient *client.Client, repositor
 func (e *Engine) runContainer(ctx context.Context, dockerClient *client.Client, repository Repository, password string, command []string, extraMounts ...mount.Mount) (string, error) {
 	// Check the kill switch before the inspect so a disabled engine never pulls
 	// the Rustic image or provisions its cache volume.
-	if rustic.Disabled() {
+	if e.backupsDisabled {
 		return "", rustic.ErrDisabled
 	}
 	if _, err := dockerClient.ImageInspect(ctx, rustic.DefaultImage); err != nil {

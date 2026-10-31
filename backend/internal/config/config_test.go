@@ -356,6 +356,34 @@ func TestConfig_AllowDowngrade(t *testing.T) {
 	})
 }
 
+func TestConfig_BackupsDisabled(t *testing.T) {
+	orig := os.Getenv("ARCANE_BACKUPS_DISABLED")
+	defer restoreEnv("ARCANE_BACKUPS_DISABLED", orig)
+
+	t.Run("defaults to false", func(t *testing.T) {
+		unsetEnv(t, "ARCANE_BACKUPS_DISABLED")
+
+		cfg := Load()
+		assert.False(t, cfg.BackupsDisabled)
+	})
+
+	t.Run("accepts the values the engine parser accepts", func(t *testing.T) {
+		for _, value := range []string{"1", "true", "yes", "on"} {
+			setEnv(t, "ARCANE_BACKUPS_DISABLED", value)
+
+			cfg := Load()
+			assert.True(t, cfg.BackupsDisabled, "%q should disable backups", value)
+		}
+	})
+
+	t.Run("leaves the engine enabled for other values", func(t *testing.T) {
+		setEnv(t, "ARCANE_BACKUPS_DISABLED", "off")
+
+		cfg := Load()
+		assert.False(t, cfg.BackupsDisabled)
+	})
+}
+
 func TestConfig_AllowCLIPasswordReset(t *testing.T) {
 	origAllowCLIPasswordReset := os.Getenv("ALLOW_CLI_PASSWORD_RESET")
 	defer restoreEnv("ALLOW_CLI_PASSWORD_RESET", origAllowCLIPasswordReset)

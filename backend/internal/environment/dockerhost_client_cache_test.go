@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
-	dockersvc "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
+	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 )
 
@@ -38,7 +38,7 @@ func TestEnvironmentService_DropsCachedDockerHostClientOnUpdateAndDelete(t *test
 	endpointA, pingsA := newPingServer()
 	endpointB, pingsB := newPingServer()
 
-	dockerService := dockersvc.NewDockerClientService(ctx, db, &config.Config{DockerHost: "tcp://127.0.0.1:1"}, nil)
+	dockerService := dockerInternal.NewDockerClientService(ctx, db, &config.Config{DockerHost: "tcp://127.0.0.1:1"}, nil)
 	svc := NewEnvironmentService(db, http.DefaultClient, dockerService, event.NewEventService(db, nil, nil), nil, nil)
 
 	now := time.Now()
@@ -106,7 +106,7 @@ func TestEnvironmentService_TestConnectionProbesCustomDockerHostAsDockerAPI(t *t
 	savedEndpoint := newDockerEndpoint()
 	editedEndpoint := newDockerEndpoint()
 
-	dockerService := dockersvc.NewDockerClientService(ctx, db, &config.Config{DockerHost: "tcp://127.0.0.1:1"}, nil)
+	dockerService := dockerInternal.NewDockerClientService(ctx, db, &config.Config{DockerHost: "tcp://127.0.0.1:1"}, nil)
 	svc := NewEnvironmentService(db, http.DefaultClient, dockerService, event.NewEventService(db, nil, nil), nil, nil)
 
 	now := time.Now()

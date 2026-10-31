@@ -15,7 +15,7 @@ type hubContextTestKey struct{}
 // target environment (and therefore the Docker daemon a docker-host environment
 // points at) while the hub producer lives on after the request ends.
 func TestNewHubContextPreservesRequestValues(t *testing.T) {
-	base, cancelBase := context.WithCancel(context.WithValue(context.Background(), hubContextTestKey{}, "environment-target"))
+	base, cancelBase := context.WithCancel(context.WithValue(t.Context(), hubContextTestKey{}, "environment-target"))
 	defer cancelBase()
 
 	hubCtx, cancelHub := newHubContext(base)
@@ -46,10 +46,9 @@ func TestNewHubContextPreservesRequestValues(t *testing.T) {
 func TestContainerStatsHubKeyScopesHubToEnvironment(t *testing.T) {
 	const containerID = "0123456789abcdef"
 
-	assert.NotEqual(t,
-		containerStatsHubKey("tyo-direct", containerID),
-		containerStatsHubKey("arm-direct", containerID))
-	assert.Equal(t,
-		containerStatsHubKey("tyo-direct", containerID),
-		containerStatsHubKey("tyo-direct", containerID))
+	tyoKey := containerStatsHubKey("tyo-direct", containerID)
+
+	assert.NotEqual(t, tyoKey, containerStatsHubKey("arm-direct", containerID))
+	assert.Contains(t, tyoKey, "tyo-direct", "the key must name the environment it belongs to")
+	assert.Contains(t, tyoKey, containerID, "the key must name the container it belongs to")
 }

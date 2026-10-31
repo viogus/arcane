@@ -15,6 +15,7 @@ import (
 
 	kit "go.getarcane.app/kit/pkg"
 
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/rustic"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/httpx"
 )
@@ -107,16 +108,22 @@ type Config struct {
 	DirPerm          os.FileMode `env:"DIR_PERM" default:"0755"`
 	GitWorkDir       string      `env:"GIT_WORK_DIR" default:"data/git"`
 	BackupVolumeName string      `env:"ARCANE_BACKUP_VOLUME_NAME" default:"arcane-backups"`
-	HTTPProxy        string      `env:"HTTP_PROXY" default:""`
-	HTTPSProxy       string      `env:"HTTPS_PROXY" default:""`
-	NoProxy          string      `env:"NO_PROXY" default:""`
-	Timezone         string      `env:"TZ" default:"Local"`
+	// BackupsDisabled switches the Rustic-backed backup engine off. Every backup and recovery entry
+	// point reports the engine as unavailable instead of pulling or running its helper image, so a
+	// host that never backs anything up does not pay for the engine. Accepts 1, true, yes and on.
+	BackupsDisabled bool   `env:"ARCANE_BACKUPS_DISABLED" default:"false"`
+	HTTPProxy       string `env:"HTTP_PROXY" default:""`
+	HTTPSProxy      string `env:"HTTPS_PROXY" default:""`
+	NoProxy         string `env:"NO_PROXY" default:""`
+	Timezone        string `env:"TZ" default:"Local"`
 }
 
 func Load() *Config {
 	cfg := &Config{}
 	loadFromEnv(cfg)
 	applyOptions(cfg)
+	// The switch accepts yes/on as well as true, so the engine's own parser decides.
+	cfg.BackupsDisabled = cfg.BackupsDisabled || rustic.DisabledFromEnv()
 	cfg.AgentMode = cfg.AgentMode || cfg.EdgeAgent
 	applyProxyDefaults(cfg)
 	applyWorkspaceDefaults(cfg)

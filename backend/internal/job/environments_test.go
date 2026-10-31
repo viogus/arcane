@@ -5,11 +5,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/getarcaneapp/arcane/types/v2/jobschedule"
 	schedulertypes "github.com/getarcaneapp/arcane/types/v2/scheduler"
 	settingstypes "github.com/getarcaneapp/arcane/types/v2/settings"
+	"github.com/stretchr/testify/require"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"

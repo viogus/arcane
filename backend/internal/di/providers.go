@@ -54,7 +54,7 @@ import (
 )
 
 func provideBackupEngine(lc fx.Lifecycle, admission *runs.Admission, imageService *image.ImageService, roles *role.RoleService, cfg *config.Config) *backup.Engine {
-	engine := backup.NewEngine(admission, imageService)
+	engine := backup.NewEngine(admission, imageService, cfg.BackupsDisabled)
 	engine.SetAuthorize(func(ctx context.Context, requester backuptypes.Requester) error {
 		if cfg.AgentMode && requester.UserID == "agent" && requester.APIKeyID == "" {
 			return nil
@@ -193,7 +193,7 @@ func provideDockerClientService(
 			if unsubscribe != nil {
 				unsubscribe()
 			}
-			service.Close()
+			service.Close(stopCtx)
 			return err
 		},
 	})

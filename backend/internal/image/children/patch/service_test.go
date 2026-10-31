@@ -124,7 +124,13 @@ func patchFeatureSettings(t *testing.T) (*settings.SettingsService, *database.DB
 	t.Helper()
 	gdb, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, gdb.AutoMigrate(&settings.SettingVariable{}, &settings.EnvironmentSetting{}, &vulnerability.VulnerabilityScanRecord{}, &vulnerability.VulnerabilityReportRecord{}, &ImagePatchRecord{}))
+	require.NoError(t, gdb.AutoMigrate(
+		&settings.SettingVariable{},
+		&settings.EnvironmentSetting{},
+		&vulnerability.VulnerabilityScanRecord{},
+		&vulnerability.VulnerabilityReportRecord{},
+		&ImagePatchRecord{},
+	))
 	db := &database.DB{DB: gdb}
 	svc, err := settings.NewSettingsService(t.Context(), db, &config.Config{})
 	if err == nil {

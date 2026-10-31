@@ -2120,6 +2120,7 @@ func (s *ProjectService) enrichProjectsWithUpdateInfo(
 			IsArchived:         d.IsArchived,
 			HasBuildDirective:  d.HasBuildDirective,
 			RedeployDisabled:   d.RedeployDisabled,
+			DeployedHere:       d.DeployedHere,
 			ConfigurationError: d.ConfigurationError,
 		})
 	}

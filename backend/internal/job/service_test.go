@@ -36,16 +36,6 @@ import (
 	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
 
-type fakeJobScheduler struct {
-	jobs               map[string]scheduler.Job
-	runtimeStates      map[string]scheduler.JobRuntimeState
-	rescheduled        []string
-	rescheduleContexts []context.Context
-	rescheduleErr      error
-	busWatcherRuns     []string
-	busWatcherContexts []context.Context
-}
-
 type fakeJob struct {
 	name string
 }
@@ -599,7 +589,7 @@ func (s *fakeJobSchedulerInternal) GetJobRuntimeState(jobID string) (scheduler.J
 	return state, ok
 }
 
-func (s *fakeJobSchedulerInternal) GetJobRuntimeStateFor(_ context.Context, _ string, jobID string) (scheduler.JobRuntimeState, bool) {
+func (s *fakeJobSchedulerInternal) GetJobRuntimeStateFor(_ context.Context, _, jobID string) (scheduler.JobRuntimeState, bool) {
 	state, ok := s.runtimeStates[jobID]
 	return state, ok
 }

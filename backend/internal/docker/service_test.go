@@ -48,7 +48,7 @@ func TestDockerClientService_GetClientPinsEffectiveAPIVersion(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			server := newDockerPingTestServer(t, func() string { return tt.pingAPIVersion })
 			svc := newDockerClientServiceForTest(t, server.URL)
-			t.Cleanup(svc.Close)
+			t.Cleanup(func() { svc.Close(t.Context()) })
 
 			cli, err := svc.GetClient(t.Context())
 			require.NoError(t, err)
@@ -199,7 +199,7 @@ func TestDockerClientService_PublishesDaemonImageEvents(t *testing.T) {
 		}
 	})
 	svc := newDockerClientServiceForTest(t, server.URL)
-	t.Cleanup(svc.Close)
+	t.Cleanup(func() { svc.Close(t.Context()) })
 	eventCh, unsubscribe := svc.EventBus().Subscribe(events.ImageEventType)
 	t.Cleanup(unsubscribe)
 	stop, err := concurrency.StartSupervised(t.Context(), "Docker event watcher", func(ctx context.Context) error {
@@ -240,7 +240,7 @@ func TestDockerClientService_EventActorStopCancelsAndJoinsStream(t *testing.T) {
 	})
 
 	service := newDockerClientServiceForTest(t, server.URL)
-	t.Cleanup(service.Close)
+	t.Cleanup(func() { service.Close(t.Context()) })
 
 	eventsCh, unsubscribe := service.EventBus().Subscribe(events.ImageEventType)
 	t.Cleanup(unsubscribe)
@@ -312,7 +312,7 @@ func TestDockerClientService_WatchEventsResumesFromLastEventAfterRefresh(t *test
 		}
 	})
 	svc := newDockerClientServiceForTest(t, server.URL)
-	t.Cleanup(svc.Close)
+	t.Cleanup(func() { svc.Close(t.Context()) })
 	stop, err := concurrency.StartSupervised(t.Context(), "Docker event watcher", func(ctx context.Context) error {
 		svc.WatchEvents(ctx)
 		return nil
@@ -349,7 +349,7 @@ func TestDockerClientService_EngineCachesUntilClientChanges(t *testing.T) {
 		}
 	})
 	svc := newDockerClientServiceForTest(t, server.URL)
-	t.Cleanup(svc.Close)
+	t.Cleanup(func() { svc.Close(t.Context()) })
 
 	first, err := svc.Engine(t.Context())
 	require.NoError(t, err)
@@ -366,7 +366,7 @@ func TestDockerClientService_EngineCachesUntilClientChanges(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), versionCalls.Load())
 
-	svc.Close()
+	svc.Close(t.Context())
 	_, err = svc.Engine(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, int32(3), versionCalls.Load())
@@ -437,7 +437,7 @@ func TestDockerClientService_HostEventBusIsolatesEndpoints(t *testing.T) {
 	remoteServer := newDockerEventStreamServerForTestInternal(t)
 
 	service := newDockerClientServiceForTest(t, managerServer.URL)
-	t.Cleanup(service.Close)
+	t.Cleanup(func() { service.Close(t.Context()) })
 
 	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
