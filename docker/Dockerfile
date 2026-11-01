@@ -71,6 +71,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 RUN mkdir -p /build/rootfs/app/data /build/rootfs/builds
 
+# Files the distroless base normally provides and a scratch runtime needs: a minimal account
+# table and a world-writable /tmp.
+RUN mkdir -p /build/lean-rootfs/tmp /build/lean-rootfs/etc \
+    && chmod 1777 /build/lean-rootfs/tmp \
+    && printf 'root:x:0:0:root:/root:/bin/sh\nnonroot:x:65532:65532:nonroot:/app/data:/bin/sh\n' > /build/lean-rootfs/etc/passwd \
+    && printf 'root:x:0:\nnonroot:x:65532:\n' > /build/lean-rootfs/etc/group
+
 # Stage 3: Hardened Production Image
 FROM ${ARCANE_RUNTIME_BASE_IMAGE} AS runner-hardened
 
@@ -103,5 +110,47 @@ EXPOSE 3552
 VOLUME ["/app/data"]
 
 LABEL com.getarcaneapp.arcane="true"
+
+CMD ["./arcane"]
+
+# Stage 4: Lean Production Image
+#
+# The same static binary on an empty base: no distroless runtime (glibc, libcrypto, libcurl,
+# ~34 MB unpacked), no shell. The publish workflow selects this stage with --target runner-lean
+# and builds it with -tags timetzdata, so the binary carries its own zoneinfo. Volume helpers
+# still pull ghcr.io/getarcaneapp/tools at runtime.
+FROM scratch AS runner-lean
+
+ARG TARGETARCH
+
+ENV GIN_MODE=release \
+    PORT=3552 \
+    ENVIRONMENT=production \
+    ARCANE_IN_CONTAINER=true \
+    PATH=/app:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    ROCR_VISIBLE_DEVICES=all \
+    HIP_VISIBLE_DEVICES=all \
+    ONEAPI_DEVICE_SELECTOR=level_zero:*,opencl:* \
+    LD_LIBRARY_PATH=/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/opt/rocm/lib:/opt/intel/oneapi/lib:/opt/intel/oneapi/lib/intel64:/usr/lib64:/usr/lib:/lib64:/lib
+
+WORKDIR /app
+
+# The container starts as "root", but arcane drops to the requested PUID and PGID after the
+# runtime is initialized.
+USER 0:0
+
+COPY --from=backend-builder --chown=65532:65532 /build/rootfs/app/ /app/
+COPY --from=backend-builder --chown=65532:65532 /build/rootfs/builds/ /builds/
+COPY --from=backend-builder --chown=65532:65532 /build/lean-rootfs/ /
+COPY --from=ghcr.io/getarcaneapp/base:distroless /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=backend-builder --chown=65532:65532 /build/arcane .
+
+EXPOSE 3552
+VOLUME ["/app/data"]
+
+LABEL com.getarcaneapp.arcane="true" \
+      com.getarcaneapp.arcane.base="scratch"
 
 CMD ["./arcane"]

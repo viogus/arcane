@@ -35,20 +35,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The lean stages put the same static binary on scratch instead of the distroless base,
+          # which drops about 34 MB unpacked (glibc, libcrypto, libcurl, …). timetzdata keeps
+          # zoneinfo inside the binary because the scratch image ships no /usr/share/zoneinfo.
           - image: arcane
             dockerfile: docker/Dockerfile
+            target: runner-lean
+            build_tags: timetzdata
             arch: amd64
             runner: ubuntu-latest
           - image: arcane
             dockerfile: docker/Dockerfile
+            target: runner-lean
+            build_tags: timetzdata
             arch: arm64
             runner: ubuntu-24.04-arm
           - image: arcane-agent
             dockerfile: docker/Dockerfile-agent
+            target: agent-lean
+            build_tags: exclude_frontend,timetzdata
             arch: amd64
             runner: ubuntu-latest
           - image: arcane-agent
             dockerfile: docker/Dockerfile-agent
+            target: agent-lean
+            build_tags: exclude_frontend,timetzdata
             arch: arm64
             runner: ubuntu-24.04-arm
     steps:
@@ -77,11 +88,13 @@ jobs:
           platforms: linux/${{ matrix.arch }}
           push: true
           provenance: false
+          target: ${{ matrix.target }}
           tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ matrix.arch }}
           build-args: |
             VERSION=${{ inputs.version }}
             REVISION=${{ github.sha }}
             BUILD_TIME=${{ steps.buildtime.outputs.value }}
+            BUILD_TAGS=${{ matrix.build_tags }}
           cache-from: type=gha,scope=${{ matrix.image }}-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ matrix.arch }}
 
