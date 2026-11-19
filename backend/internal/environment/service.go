@@ -724,6 +724,21 @@ func (s *EnvironmentService) linkEnvironmentApiKey(ctx context.Context, envID, n
 	return nil
 }
 
+// DockerHostForEnvironment returns the Docker API endpoint the manager uses for an environment it
+// serves in-process, or "" for the local environment and for agent-backed environments. Background
+// work uses it to scope a run to the daemon it belongs to.
+func (s *EnvironmentService) DockerHostForEnvironment(ctx context.Context, environmentID string) string {
+	environmentID = strings.TrimSpace(environmentID)
+	if environmentID == "" || environmentID == LocalEnvironmentID {
+		return ""
+	}
+	env, err := s.GetEnvironmentByIDCached(ctx, environmentID)
+	if err != nil || env == nil {
+		return ""
+	}
+	return env.DockerHostURL()
+}
+
 func (s *EnvironmentService) GetDB() *database.DB {
 	return s.db
 }
