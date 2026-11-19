@@ -6,13 +6,14 @@ upstream's and lives at [getarcane.app](https://getarcane.app).
 
 ## Branches
 
-| Branch | Tracks          | Notes                                                              |
-| ------ | --------------- | ------------------------------------------------------------------ |
-| `main` | upstream 2.17.x | Maintenance line; still the branch the 2.x images were built from. |
-| `v3`   | upstream 3.1.x  | Current line. Carries the fork features below.                     |
+| Branch | Tracks          | Notes                                                                          |
+| ------ | --------------- | ------------------------------------------------------------------------------ |
+| `main` | upstream 3.1.x  | Current line. Carries the fork features below.                                 |
+| `v3`   | same as `main`  | Working name kept for the v3 line while the fork migrated off the 2.x `main`.  |
+| `2.x`  | upstream 2.17.x | Frozen maintenance line, the former `main`. Only versioned images are updated. |
 
-The fork never merges `v3` into `main`, so a 2.x deployment is not forced onto v3 by
-accident.
+`main` moved to the v3 line once the v3 images were published. 2.x deployments stay on the
+`2.x` branch and its versioned images.
 
 ## Images
 
@@ -30,10 +31,10 @@ accident.
   `.github/workflows/publish.yml` on GitHub-hosted runners:
 
   ```bash
-  gh workflow run publish.yml --ref v3 -f version=3.1.0+cdf.1 -f move_latest=true
+  gh workflow run publish.yml -f version=3.1.0+cdf.2 -f move_latest=true
   ```
 
-  `--ref` matters: without it the workflow builds the default branch.
+  `--ref` defaults to `main`; pass `--ref 2.x` to build the frozen 2.x line.
 
 ## Deploying
 

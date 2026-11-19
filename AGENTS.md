@@ -29,8 +29,8 @@ Arcane is a Docker management platform.
 
 ## Fork specifics
 
-This is the viogus fork. `main` tracks upstream 2.17.x and `v3` tracks upstream 3.1.x; the fork
-never merges `v3` into `main`. Fork features live in the v3 line: docker-host environments (the
+This is the viogus fork. `main` tracks upstream 3.1.x (the v3 line; the `v3` branch holds the
+same commits) and `2.x` is the frozen 2.17.x maintenance line. Fork features live in the v3 line: docker-host environments (the
 manager serves a Docker API endpoint in-process through `pkg/envcontext`), volume backup history
 and policies scoped by `environment_id`, per-environment daemon event streams, and the
 `ARCANE_BACKUPS_DISABLED` kill switch. Images are published by `.github/workflows/publish.yml` as
