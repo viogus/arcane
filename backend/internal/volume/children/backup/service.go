@@ -240,8 +240,8 @@ func (s *Service) RemovePolicies(ctx context.Context, volumeName string) {
 }
 
 // RenamePolicies moves a renamed volume's backup policies inside the caller's transaction.
-func (s *Service) RenamePolicies(tx *gorm.DB, oldName, newName string) error {
-	return s.policies.Rename(tx, oldName, newName)
+func (s *Service) RenamePolicies(ctx context.Context, tx *gorm.DB, oldName, newName string) error {
+	return s.policies.Rename(ctx, tx, oldName, newName)
 }
 
 func (s *Service) List(ctx context.Context, volumeName string, params pagination.QueryParams) ([]types.VolumeBackup, pagination.Response, error) {
