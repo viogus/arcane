@@ -35,31 +35,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # The lean stages put the same static binary on scratch instead of the distroless base,
-          # which drops about 34 MB unpacked (glibc, libcrypto, libcurl, …). timetzdata keeps
-          # zoneinfo inside the binary because the scratch image ships no /usr/share/zoneinfo.
+          # v3 ships a distroless runtime stage (runner-hardened / agent) that the fork publishes
+          # as-is; the lean scratch stages are not part of the v3 tree yet.
           - image: arcane
             dockerfile: docker/Dockerfile
-            target: runner-lean
-            build_tags: timetzdata
+            target: runner-hardened
+            build_tags: ''
             arch: amd64
             runner: ubuntu-latest
           - image: arcane
             dockerfile: docker/Dockerfile
-            target: runner-lean
-            build_tags: timetzdata
+            target: runner-hardened
+            build_tags: ''
             arch: arm64
             runner: ubuntu-24.04-arm
           - image: arcane-agent
             dockerfile: docker/Dockerfile-agent
-            target: agent-lean
-            build_tags: exclude_frontend,timetzdata
+            target: agent
+            build_tags: exclude_frontend
             arch: amd64
             runner: ubuntu-latest
           - image: arcane-agent
             dockerfile: docker/Dockerfile-agent
-            target: agent-lean
-            build_tags: exclude_frontend,timetzdata
+            target: agent
+            build_tags: exclude_frontend
             arch: arm64
             runner: ubuntu-24.04-arm
     steps:
