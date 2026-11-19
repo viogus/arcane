@@ -21,7 +21,7 @@ concurrency:
 jobs:
   go-tests:
     name: Go Tests (${{ matrix.module.name }})
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -92,7 +92,7 @@ jobs:
 
   go-linter:
     name: Go Linter (${{ matrix.module.name }})
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -130,7 +130,7 @@ jobs:
 
   frontend-linter:
     name: Frontend Linter
-    runs-on: depot-ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -167,7 +167,7 @@ jobs:
 
   e2e-tests:
     name: E2E Tests (${{ matrix.database.name }})
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ubuntu-latest
     # Passing runs finish in about 17 minutes; a broken stack must not grind through retries for hours.
     timeout-minutes: 45
     env:
@@ -244,7 +244,7 @@ jobs:
 
   cli-e2e-tests:
     name: CLI E2E Tests
-    runs-on: depot-ubuntu-24.04-4
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
