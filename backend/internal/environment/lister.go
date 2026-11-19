@@ -188,6 +188,14 @@ func (l *Lister) ApplyRuntimeState(env types.Environment) types.Environment {
 		return env
 	}
 
+	// Direct (docker-host) environments have no agent tunnel to report on, so the
+	// tunnel registry would otherwise mark every one of them offline even though
+	// the health checker keeps their stored status current.
+	if env.ApiUrl == "" && env.DockerHost != nil && *env.DockerHost != "" {
+		env.Connected = new(env.Status == string(EnvironmentStatusOnline))
+		return env
+	}
+
 	runtimeState, connected := l.tunnels.RuntimeState(env.ID).Get()
 	return types.Environment{ //exhaustruct:enforce
 		ID:         env.ID,
