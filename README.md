@@ -23,6 +23,13 @@
   <img width="1685" alt="Arcane v3 dashboard" src=".github/assets/arcane-dash-v3-dark.jpg" />
 </picture>
 
+## Fork notes
+
+This repository is the **viogus fork** of Arcane: it publishes its own images
+(`ghcr.io/viogus/arcane`, `ghcr.io/viogus/arcane-agent`), runs a `v3` line alongside the 2.x
+`main` branch, and adds docker-host environments plus environment-scoped backups. Start with
+[FORK.md](./FORK.md) for images, deployment and the 2.x → 3.x upgrade notes.
+
 ## Documentation
 
 For setup instructions, configuration details, and development guides, visit the **[official documentation site](https://getarcane.app)**.
