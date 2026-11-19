@@ -1,8 +1,11 @@
 name: CI
 
 on:
+  # The fork keeps its v3 line on its own branch, so it runs here on push as well as in PRs.
+  push:
+    branches: [main, v3]
   pull_request:
-    branches: [main, 'release/**', 'breaking/**']
+    branches: [main, v3, 'release/**', 'breaking/**']
 
 permissions:
   contents: read
