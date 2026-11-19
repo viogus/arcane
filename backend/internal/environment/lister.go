@@ -190,9 +190,10 @@ func (l *Lister) ApplyRuntimeState(env types.Environment) types.Environment {
 
 	runtimeState, connected := l.tunnels.RuntimeState(env.ID).Get()
 	return types.Environment{ //exhaustruct:enforce
-		ID:     env.ID,
-		Name:   env.Name,
-		ApiUrl: env.ApiUrl,
+		ID:         env.ID,
+		Name:       env.Name,
+		ApiUrl:     env.ApiUrl,
+		DockerHost: env.DockerHost,
 		Status: func() string {
 			switch {
 			case connected && l.tunnels.Readiness(env.ID).State == agent.ReadinessNotReady:
