@@ -46,12 +46,6 @@ jobs:
         with:
           tool: just
 
-      - name: Set up Depot CLI
-        if: matrix.module.gcc
-        uses: depot/setup-action@91bc8495a33ebfc504ffc89e5674379ccf23c29c # v1.7.2
-        with:
-          configure-docker: true
-
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
