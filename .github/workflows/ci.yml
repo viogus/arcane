@@ -171,7 +171,7 @@ jobs:
     # Passing runs finish in about 17 minutes; a broken stack must not grind through retries for hours.
     timeout-minutes: 45
     env:
-      PLAYWRIGHT_DOCKER_IMAGE_REPOSITORY: g7r5wqb57k.registry.depot.dev/mirrors/playwright
+      PLAYWRIGHT_DOCKER_IMAGE_REPOSITORY: mcr.microsoft.com/playwright
     permissions:
       contents: read
       actions: write
@@ -204,11 +204,6 @@ jobs:
           node-version: 26
           cache: false
           run-install: false
-
-      - name: Set up Depot CLI
-        uses: depot/setup-action@91bc8495a33ebfc504ffc89e5674379ccf23c29c # v1.7.2
-        with:
-          configure-docker: true
 
       - name: Install E2E test dependencies
         run: vp -C tests install
@@ -279,11 +274,6 @@ jobs:
           path: ~/go/pkg/mod
           key: arcane-go-${{ runner.os }}-${{ github.job }}-${{ hashFiles('go.work.sum', '*/go.sum') }}
           restore-keys: arcane-go-${{ runner.os }}-${{ github.job }}-
-
-      - name: Set up Depot CLI
-        uses: depot/setup-action@91bc8495a33ebfc504ffc89e5674379ccf23c29c # v1.7.2
-        with:
-          configure-docker: true
 
       - name: Install Playwright test dependencies
         run: vp -C tests install
