@@ -60,8 +60,9 @@ func TestValidateEnvironmentTargetInternal(t *testing.T) {
 		require.Error(t, validateEnvironmentTargetInternal(env))
 	})
 
-	t.Run("agent environment still needs an API URL", func(t *testing.T) {
-		require.Error(t, validateEnvironmentTargetInternal(&Environment{Name: "agent"}))
+	t.Run("agent environment needs no explicit API URL", func(t *testing.T) {
+		// Create generates an agent endpoint when the caller omits one.
+		require.NoError(t, validateEnvironmentTargetInternal(&Environment{Name: "agent"}))
 		require.NoError(t, validateEnvironmentTargetInternal(&Environment{Name: "agent", ApiUrl: "http://agent:3553"}))
 	})
 }

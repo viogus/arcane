@@ -68,13 +68,11 @@ func NormalizeDockerHost(value string) (string, error) {
 }
 
 // validateEnvironmentTargetInternal rejects ambiguous or malformed connection settings on create.
-// An environment points at either an agent API URL or a Docker API endpoint, never both.
+// An environment points at either an agent API URL or a Docker API endpoint, never both; an agent
+// environment needs no API URL here because create generates one when the caller omits it.
 func validateEnvironmentTargetInternal(env *Environment) error {
 	host := env.DockerHostURL()
 	if host == "" {
-		if strings.TrimSpace(env.ApiUrl) == "" {
-			return invalidTargetErrorf("either an API URL or a Docker host is required")
-		}
 		return nil
 	}
 
