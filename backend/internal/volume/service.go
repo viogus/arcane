@@ -135,6 +135,7 @@ func NewVolumeService(p VolumeServiceParams) *VolumeService {
 		AcquireHelper:    service.acquireVolumeHelper,
 		Exec:             service.execInContainer,
 		BackupVolumeName: backupVolumeName,
+		BackupsDisabled:  p.Config.BackupsDisabled,
 		EncryptionKey:    cmp.Or(p.Config.EncryptionKey, legacyDefaultEncryptionKey),
 		StopContainer:    p.ContainerService.StopContainer,
 		StartContainer:   p.ContainerService.StartContainer,

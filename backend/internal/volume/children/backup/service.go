@@ -44,6 +44,7 @@ import (
 	activitylib "getarcane.dev/arcane/v3/pkg/activity"
 	"getarcane.dev/arcane/v3/pkg/authz"
 	"getarcane.dev/arcane/v3/pkg/pagination"
+	"getarcane.dev/arcane/v3/pkg/rustic"
 	s3util "getarcane.dev/arcane/v3/pkg/s3"
 	"getarcane.dev/arcane/v3/pkg/volumes"
 	"getarcane.dev/types/v3"
@@ -91,6 +92,7 @@ type (
 		Admission        *runs.Admission
 		BackupVolumeName string
 		EncryptionKey    string
+		BackupsDisabled  bool
 	}
 
 	Service struct {
@@ -100,8 +102,8 @@ type (
 		flow     *flow.Engine
 		// backupWorkflow runs manual backups that StartBackup accepted.
 		backupWorkflow *flow.Workflow
-		deps           Dependencies
 		rekeyed        sync.Map
+		deps           Dependencies
 	}
 
 	// backupPlan is one run's resolved destinations; it doubles as the run's recovery checkpoint.
@@ -310,6 +312,9 @@ func (s *Service) resolveBackupPlan(ctx context.Context, volumeName, trigger str
 }
 
 func (s *Service) CreateBackup(ctx context.Context, volumeName string, user types.Actor, trigger string, request types.CreateVolumeBackupRequest) (*types.VolumeBackup, error) {
+	if s.deps.BackupsDisabled {
+		return nil, rustic.ErrDisabled
+	}
 	trigger = cmp.Or(trigger, types.VolumeBackupTriggerManual)
 	plan, err := s.resolveBackupPlan(ctx, volumeName, trigger, request, nil)
 	if err != nil {
@@ -325,6 +330,9 @@ func (s *Service) CreateBackup(ctx context.Context, volumeName string, user type
 
 // CreateSystemManagedBackup runs the existing volume backup workflow with a transient centralized policy.
 func (s *Service) CreateSystemManagedBackup(ctx context.Context, volumeName string, user types.Actor, trigger, policyID string, policy types.UpdateBackupPolicy) (*types.VolumeBackup, error) {
+	if s.deps.BackupsDisabled {
+		return nil, rustic.ErrDisabled
+	}
 	if !strings.HasPrefix(policyID, types.SystemVolumePolicyPrefix) {
 		return nil, common.Classify(common.ErrBadRequest, errors.New("invalid system-managed volume backup policy id"))
 	}
