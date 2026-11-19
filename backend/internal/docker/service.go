@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -269,6 +270,13 @@ func (s *DockerClientService) HostForContext(ctx context.Context) string {
 		return ""
 	}
 	return host
+}
+
+// ResolveHostForContext returns the daemon endpoint a request must use: the environment target when
+// the request carries one (a docker-host environment), and the manager's own daemon otherwise. It is
+// for the calls that hand a host to the compose/CLI layer, which cannot read the request context.
+func (s *DockerClientService) ResolveHostForContext(ctx context.Context) string {
+	return cmp.Or(s.HostForContext(ctx), s.DockerHost())
 }
 
 // GetHostClient returns a cached Docker client for an explicit endpoint. A docker-host environment

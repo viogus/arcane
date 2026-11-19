@@ -965,7 +965,7 @@ func (s *VolumeService) ListVolumesPaginated(ctx context.Context, params paginat
 	paginationResp := pagination.BuildResponse(result.TotalCount, result.TotalAvailable, effectiveParams)
 	slog.DebugContext(
 		ctx, "volume service: listed volumes",
-		"dockerHost", s.dockerService.DockerHost(),
+		"dockerHost", s.dockerService.ResolveHostForContext(ctx),
 		"requestedSort", params.Sort,
 		"requestedOrder", params.Order,
 		"effectiveSort", effectiveParams.Sort,

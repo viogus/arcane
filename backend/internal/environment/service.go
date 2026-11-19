@@ -724,6 +724,25 @@ func (s *EnvironmentService) linkEnvironmentApiKey(ctx context.Context, envID, n
 	return nil
 }
 
+// ListDockerHostEnvironments returns every enabled docker-host environment the manager serves
+// in-process, keyed by environment id. Background work uses it to watch those daemons.
+func (s *EnvironmentService) ListDockerHostEnvironments(ctx context.Context) (map[string]string, error) {
+	var records []Environment
+	if err := s.db.WithContext(ctx).
+		Where("enabled = ?", true).
+		Where("docker_host IS NOT NULL AND docker_host <> ''").
+		Find(&records).Error; err != nil {
+		return nil, fmt.Errorf("failed to list docker host environments: %w", err)
+	}
+	hosts := make(map[string]string, len(records))
+	for i := range records {
+		if host := records[i].DockerHostURL(); host != "" {
+			hosts[records[i].ID] = host
+		}
+	}
+	return hosts, nil
+}
+
 // DockerHostForEnvironment returns the Docker API endpoint the manager uses for an environment it
 // serves in-process, or "" for the local environment and for agent-backed environments. Background
 // work uses it to scope a run to the daemon it belongs to.
