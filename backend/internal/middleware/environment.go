@@ -199,7 +199,7 @@ func (m *EnvironmentMiddleware) Handle(c *echo.Context, next echo.HandlerFunc) e
 // serveInProcess re-dispatches an environment-scoped request against the manager's own routes with
 // the docker-host daemon as its target, instead of forwarding it to an agent that does not exist.
 func (m *EnvironmentMiddleware) serveInProcess(c *echo.Context, req *http.Request, envID, dockerHost, suffix string) error {
-	target, err := url.Parse("/api" + suffix)
+	target, err := url.Parse("/api/agents/" + url.PathEscape(envID) + suffix)
 	if err != nil {
 		return writeProxyError(c, http.StatusInternalServerError, "Invalid environment path")
 	}

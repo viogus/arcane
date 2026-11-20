@@ -91,9 +91,11 @@ func TestEnvironmentMiddleware_ServesDockerHostEnvironmentInProcess(t *testing.T
 	api := attachMiddleware(router, middleware)
 
 	var seenTarget envcontext.Target
-	api.GET("/containers", func(c *echo.Context) error {
+	var seenID string
+	api.GET("/agents/:id/containers", func(c *echo.Context) error {
 		target, _ := envcontext.TargetFromContext(c.Request().Context())
 		seenTarget = target
+		seenID = c.Param("id")
 		return c.JSON(http.StatusOK, map[string]any{"success": true, "query": c.QueryParams().Get("all")})
 	})
 
@@ -102,6 +104,7 @@ func TestEnvironmentMiddleware_ServesDockerHostEnvironmentInProcess(t *testing.T
 
 	require.Equal(t, http.StatusOK, recorder.Code)
 	assert.Contains(t, recorder.Body.String(), `"query":"1"`, "the query string survives the re-dispatch")
+	assert.Equal(t, "env-dh", seenID, "the re-dispatch keeps the environment id in the route")
 	assert.Equal(t, envcontext.Target{EnvironmentID: "env-dh", DockerHost: "tcp://192.168.2.33:2375"}, seenTarget)
 }
 
@@ -115,7 +118,7 @@ func TestEnvironmentMiddleware_DockerHostEnvironmentNeedsNoTunnel(t *testing.T) 
 
 	router := echo.New()
 	api := attachMiddleware(router, middleware)
-	api.GET("/containers", func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) })
+	api.GET("/agents/:id/containers", func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) })
 
 	recorder := httptest.NewRecorder()
 	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/agents/env-dh/containers", http.NoBody))
@@ -134,7 +137,7 @@ func TestEnvironmentMiddleware_RejectsDisabledDockerHostEnvironment(t *testing.T
 	router := echo.New()
 	api := attachMiddleware(router, middleware)
 	served := false
-	api.GET("/containers", func(c *echo.Context) error {
+	api.GET("/agents/:id/containers", func(c *echo.Context) error {
 		served = true
 		return c.NoContent(http.StatusOK)
 	})

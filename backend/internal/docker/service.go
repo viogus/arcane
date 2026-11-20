@@ -451,6 +451,9 @@ func (s *DockerClientService) WatchEvents(ctx context.Context) {
 
 func (s *DockerClientService) ListCoalesced[T any](ctx context.Context, group *singleflight.Group, key string, op func(context.Context, *client.Client) (T, error)) (T, error) {
 	var zero T
+	// Never coalesce requests aimed at different daemons: a docker-host environment
+	// and the manager's own daemon can list at the same time during fan-out.
+	key = s.HostForContext(ctx) + "\x00" + key
 
 	ch := group.DoChan(key, func() (any, error) {
 		return s.Call(context.WithoutCancel(ctx), op)
@@ -483,8 +486,17 @@ func (s *DockerClientService) Call[T any](ctx context.Context, op func(context.C
 	return op(apiCtx, dockerClient)
 }
 
+func (s *DockerClientService) inventoryForContext(ctx context.Context) *dockerInventory {
+	// The inventory is fed by the manager's event stream, so it only describes the
+	// manager's own daemon. A docker-host target must always query its own daemon.
+	if s.HostForContext(ctx) != "" {
+		return nil
+	}
+	return s.inventory.Load()
+}
+
 func (s *DockerClientService) ListContainers(ctx context.Context, live bool) ([]container.Summary, error) {
-	inventory := s.inventory.Load()
+	inventory := s.inventoryForContext(ctx)
 	if inventory != nil && !live {
 		if cached := inventory.containers.Load(); cached != nil {
 			return *cached, nil
@@ -503,7 +515,7 @@ func (s *DockerClientService) ListContainers(ctx context.Context, live bool) ([]
 }
 
 func (s *DockerClientService) ListImages(ctx context.Context) ([]image.Summary, error) {
-	inventory := s.inventory.Load()
+	inventory := s.inventoryForContext(ctx)
 	if inventory != nil {
 		if cached := inventory.images.Load(); cached != nil {
 			return *cached, nil

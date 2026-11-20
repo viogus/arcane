@@ -35,9 +35,9 @@ export function createBaseEnvironmentOverview(environment: Environment): Dashboa
 }
 
 export function getRoleBadge(environment: Environment): { text: string; variant: 'primary' | 'gray' } {
-	return environment.id === LOCAL_DOCKER_ENVIRONMENT_ID
-		? { text: m.manager(), variant: 'primary' }
-		: { text: m.agent(), variant: 'gray' };
+	if (environment.id === LOCAL_DOCKER_ENVIRONMENT_ID) return { text: m.manager(), variant: 'primary' };
+	if (environment.dockerHost?.trim()) return { text: m.environments_docker_host_label(), variant: 'gray' };
+	return { text: m.agent(), variant: 'gray' };
 }
 
 export function getResolvedStatusLabel(environment: Environment): string {
@@ -54,6 +54,7 @@ export function getResolvedStatusLabel(environment: Environment): string {
 }
 
 export function getAgentTransportLabel(environment: Environment): string {
+	if (environment.dockerHost?.trim()) return m.environments_docker_host_label();
 	const transport = environment.connected ? environment.agentTransport : undefined;
 	switch (transport ?? environment.lastAgentTransport) {
 		case 'websocket':
