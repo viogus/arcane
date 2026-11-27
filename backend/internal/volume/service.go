@@ -1001,13 +1001,14 @@ func (s *VolumeService) ListVolumesPaginated(ctx context.Context, params paginat
 	}
 
 	enrichedVolumes := enrichVolumesWithUsageData(volResult.volumes, usageVolumes)
-	if allowedCompose, unrestricted, permErr := middleware.AllowedComposeProjects(ctx, s.db, types.LocalDockerEnvironmentID, authz.PermVolumesList); permErr != nil {
+	envID := envcontext.EnvironmentIDOrDefault(ctx)
+	if allowedCompose, unrestricted, permErr := middleware.AllowedComposeProjects(ctx, s.db, envID, authz.PermVolumesList); permErr != nil {
 		return nil, pagination.Response{}, types.VolumeUsageCounts{}, permErr
 	} else if !unrestricted {
 		ps, _ := middleware.PermissionsFromContext(ctx)
 		enrichedVolumes = slices.DeleteFunc(enrichedVolumes, func(v mobyVolume.Volume) bool {
 			return !middleware.ComposeResourcePermitted(ps, middleware.ComposeResourceAccessInput{
-				EnvID:          types.LocalDockerEnvironmentID,
+				EnvID:          envID,
 				Permission:     authz.PermVolumesList,
 				ResourceType:   authz.ResourceTypeVolume,
 				ResourceID:     v.Name,

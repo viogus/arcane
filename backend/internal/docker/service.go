@@ -231,13 +231,16 @@ func (s *DockerClientService) RefreshClient(ctx context.Context) error {
 }
 
 func (s *DockerClientService) Engine(ctx context.Context) (compat.EngineCompatibilityInfo, error) {
-	s.mu.Lock()
-	if s.engineClient != nil && s.engineClient == s.Client {
-		engine := s.engine
+	isLocal := s.HostForContext(ctx) == ""
+	if isLocal {
+		s.mu.Lock()
+		if s.engineClient != nil && s.engineClient == s.Client {
+			engine := s.engine
+			s.mu.Unlock()
+			return engine, nil
+		}
 		s.mu.Unlock()
-		return engine, nil
 	}
-	s.mu.Unlock()
 
 	return s.Call(ctx, func(ctx context.Context, dockerClient *mobyClient.Client) (compat.EngineCompatibilityInfo, error) {
 		version, err := dockerClient.ServerVersion(ctx, mobyClient.ServerVersionOptions{})
@@ -250,10 +253,12 @@ func (s *DockerClientService) Engine(ctx context.Context) (compat.EngineCompatib
 		}
 
 		engine := compat.DetectEngineCompatibility(version, info.Info)
-		s.mu.Lock()
-		s.engine = engine
-		s.engineClient = dockerClient
-		s.mu.Unlock()
+		if isLocal {
+			s.mu.Lock()
+			s.engine = engine
+			s.engineClient = dockerClient
+			s.mu.Unlock()
+		}
 		return engine, nil
 	})
 }
@@ -582,8 +587,10 @@ func (s *DockerClientService) GetDiskUsage(ctx context.Context) (mobyClient.Disk
 		}
 	}
 	return s.ListCoalesced(ctx, &s.diskUsageFlight, fmt.Sprintf("%p", inventory), func(ctx context.Context, dockerClient *mobyClient.Client) (mobyClient.DiskUsageResult, error) {
-		s.diskUsageMu.Lock()
-		defer s.diskUsageMu.Unlock()
+		if inventory != nil {
+			s.diskUsageMu.Lock()
+			defer s.diskUsageMu.Unlock()
+		}
 		if err := ctx.Err(); err != nil {
 			return mobyClient.DiskUsageResult{}, err
 		}

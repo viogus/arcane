@@ -32,6 +32,7 @@ import (
 	"getarcane.dev/arcane/v3/internal/event"
 	"getarcane.dev/arcane/v3/internal/middleware"
 	"getarcane.dev/arcane/v3/pkg/authz"
+	"getarcane.dev/arcane/v3/pkg/envcontext"
 	"getarcane.dev/arcane/v3/pkg/handlerutil"
 	"getarcane.dev/arcane/v3/pkg/httpx"
 	"getarcane.dev/arcane/v3/pkg/pagination"
@@ -469,13 +470,14 @@ func (s *NetworkService) ListNetworksPaginated(ctx context.Context, params pagin
 		return nil, pagination.Response{}, types.NetworkUsageCounts{}, err
 	}
 
-	if allowedCompose, unrestricted, permErr := middleware.AllowedComposeProjects(ctx, s.db, types.LocalDockerEnvironmentID, authz.PermNetworksList); permErr != nil {
+	envID := envcontext.EnvironmentIDOrDefault(ctx)
+	if allowedCompose, unrestricted, permErr := middleware.AllowedComposeProjects(ctx, s.db, envID, authz.PermNetworksList); permErr != nil {
 		return nil, pagination.Response{}, types.NetworkUsageCounts{}, permErr
 	} else if !unrestricted {
 		ps, _ := middleware.PermissionsFromContext(ctx)
 		networkList.Items = slices.DeleteFunc(networkList.Items, func(n mobyNetwork.Summary) bool {
 			return !middleware.ComposeResourcePermitted(ps, middleware.ComposeResourceAccessInput{
-				EnvID:          types.LocalDockerEnvironmentID,
+				EnvID:          envID,
 				Permission:     authz.PermNetworksList,
 				ResourceType:   authz.ResourceTypeNetwork,
 				ResourceID:     n.ID,

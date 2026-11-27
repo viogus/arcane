@@ -63,6 +63,7 @@ import (
 	"getarcane.dev/arcane/v3/internal/settings"
 	"getarcane.dev/arcane/v3/internal/upload"
 	"getarcane.dev/arcane/v3/pkg/authz"
+	"getarcane.dev/arcane/v3/pkg/envcontext"
 	"getarcane.dev/arcane/v3/pkg/handlerutil"
 	"getarcane.dev/arcane/v3/pkg/httpx"
 	"getarcane.dev/arcane/v3/pkg/iconcatalog"
@@ -2895,7 +2896,7 @@ func (s *ProjectService) ListAllProjects(ctx context.Context) ([]Project, error)
 func (s *ProjectService) ListProjects(ctx context.Context, params pagination.QueryParams) ([]types.Project, pagination.Response, error) {
 	updatesFilter := strings.TrimSpace(params.Filters["updates"])
 	query := s.db.WithContext(ctx).Model(&Project{})
-	allowedIDs := middleware.AllowedProjectIDs(ctx, types.LocalDockerEnvironmentID, authz.PermProjectsList)
+	allowedIDs := middleware.AllowedProjectIDs(ctx, envcontext.EnvironmentIDOrDefault(ctx), authz.PermProjectsList)
 	if allowedIDs != nil {
 		if len(allowedIDs) == 0 {
 			return []types.Project{}, pagination.BuildResponse(0, 0, params), nil
@@ -4279,8 +4280,9 @@ func (s *ProjectService) StreamProjectLogs(ctx context.Context, projectID string
 }
 
 func (s *ProjectService) GetProjectStatusCounts(ctx context.Context) (types.ProjectStatusCounts, error) {
+	envID := envcontext.EnvironmentIDOrDefault(ctx)
 	query := s.db.WithContext(ctx).Model(&Project{})
-	if allowedIDs := middleware.AllowedProjectIDs(ctx, types.LocalDockerEnvironmentID, authz.PermProjectsList); allowedIDs != nil {
+	if allowedIDs := middleware.AllowedProjectIDs(ctx, envID, authz.PermProjectsList); allowedIDs != nil {
 		if len(allowedIDs) == 0 {
 			return types.ProjectStatusCounts{}, nil
 		}
@@ -4294,7 +4296,7 @@ func (s *ProjectService) GetProjectStatusCounts(ctx context.Context) (types.Proj
 	if snapshot.Err != nil {
 		return types.ProjectStatusCounts{}, fmt.Errorf("failed to list containers for project update count: %w", snapshot.Err)
 	}
-	allowedCompose, unrestricted, err := middleware.AllowedComposeProjects(ctx, s.db, types.LocalDockerEnvironmentID, authz.PermProjectsList)
+	allowedCompose, unrestricted, err := middleware.AllowedComposeProjects(ctx, s.db, envID, authz.PermProjectsList)
 	if err != nil {
 		return types.ProjectStatusCounts{}, err
 	}
@@ -4376,7 +4378,7 @@ func (s *ProjectService) GetProjectTags(ctx context.Context, projectID string) (
 
 func (s *ProjectService) ListProjectTagOptions(ctx context.Context) ([]types.ProjectTagOption, error) {
 	query := s.db.WithContext(ctx).Model(&ProjectTag{})
-	if allowedIDs := middleware.AllowedProjectIDs(ctx, types.LocalDockerEnvironmentID, authz.PermProjectsList); allowedIDs != nil {
+	if allowedIDs := middleware.AllowedProjectIDs(ctx, envcontext.EnvironmentIDOrDefault(ctx), authz.PermProjectsList); allowedIDs != nil {
 		if len(allowedIDs) == 0 {
 			return []types.ProjectTagOption{}, nil
 		}
@@ -4398,7 +4400,7 @@ func (s *ProjectService) ListProjectTagOptions(ctx context.Context) ([]types.Pro
 
 func (s *ProjectService) ListProjectReferences(ctx context.Context) ([]types.ProjectReference, error) {
 	query := s.db.WithContext(ctx).Model(&Project{})
-	if allowedIDs := middleware.AllowedProjectIDs(ctx, types.LocalDockerEnvironmentID, authz.PermProjectsList); allowedIDs != nil {
+	if allowedIDs := middleware.AllowedProjectIDs(ctx, envcontext.EnvironmentIDOrDefault(ctx), authz.PermProjectsList); allowedIDs != nil {
 		if len(allowedIDs) == 0 {
 			return []types.ProjectReference{}, nil
 		}

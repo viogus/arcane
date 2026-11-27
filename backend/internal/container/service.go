@@ -56,6 +56,7 @@ import (
 	"getarcane.dev/arcane/v3/pkg/authz"
 	"getarcane.dev/arcane/v3/pkg/containerlabel"
 	"getarcane.dev/arcane/v3/pkg/dhi"
+	"getarcane.dev/arcane/v3/pkg/envcontext"
 	"getarcane.dev/arcane/v3/pkg/handlerutil"
 	"getarcane.dev/arcane/v3/pkg/httpx"
 	"getarcane.dev/arcane/v3/pkg/iconcatalog"
@@ -2098,11 +2099,12 @@ func (s *ContainerService) ListContainersPaginated(
 	}
 
 	dockerContainers = FilterExcludedContainers(dockerContainers, includeInternal, includeHidden)
-	if allowedCompose, unrestricted := s.allowedComposeProjects(ctx, types.LocalDockerEnvironmentID, authz.PermContainersList); !unrestricted {
+	envID := envcontext.EnvironmentIDOrDefault(ctx)
+	if allowedCompose, unrestricted := s.allowedComposeProjects(ctx, envID, authz.PermContainersList); !unrestricted {
 		ps, _ := middleware.PermissionsFromContext(ctx)
 		dockerContainers = slices.DeleteFunc(slices.Clone(dockerContainers), func(dc mobyContainer.Summary) bool {
 			return !middleware.ContainerPermitted(ps, middleware.ContainerAccessInput{
-				EnvID:          types.LocalDockerEnvironmentID,
+				EnvID:          envID,
 				Permission:     authz.PermContainersList,
 				ContainerID:    dc.ID,
 				Names:          dc.Names,

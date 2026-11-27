@@ -1155,13 +1155,14 @@ func (s *ImageService) ListImagesPaginated(ctx context.Context, params paginatio
 		return nil, pagination.Response{}, err
 	}
 
-	if allowedRefs, unrestricted, permErr := middleware.AllowedProjectImageRefs(ctx, s.db, types.LocalDockerEnvironmentID, authz.PermImagesList); permErr != nil {
+	envID := envcontext.EnvironmentIDOrDefault(ctx)
+	if allowedRefs, unrestricted, permErr := middleware.AllowedProjectImageRefs(ctx, s.db, envID, authz.PermImagesList); permErr != nil {
 		return nil, pagination.Response{}, permErr
 	} else if !unrestricted {
 		ps, _ := middleware.PermissionsFromContext(ctx)
 		dockerImages = slices.DeleteFunc(slices.Clone(dockerImages), func(img mobyImage.Summary) bool {
 			return !middleware.ImagePermitted(ps, middleware.ImageAccessInput{
-				EnvID:       types.LocalDockerEnvironmentID,
+				EnvID:       envID,
 				Permission:  authz.PermImagesList,
 				ImageID:     img.ID,
 				RepoTags:    img.RepoTags,
